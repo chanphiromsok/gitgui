@@ -880,6 +880,93 @@ fn many_branches_are_checked_together_and_each_gets_its_own_answer() {
     }
 }
 
+/// Three squash-merged branches and two open ones, all off `main`.
+fn squashed_and_open() -> (TempRepo, Vec<String>) {
+    let repo = trunk();
+    for n in 0..3 {
+        repo.git(&["checkout", "-q", "-b", &format!("done-{n}"), "main"]);
+        write(&repo, &format!("done{n}.txt"), &format!("{n}\n"));
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-q", "-m", &format!("feat: finished piece {n} of the work")]);
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["merge", "-q", "--squash", &format!("done-{n}")]);
+        repo.git(&["commit", "-q", "-m", &format!("feat: piece {n} (#{})", 100 + n)]);
+    }
+    for n in 0..2 {
+        repo.git(&["checkout", "-q", "-b", &format!("open-{n}"), "main"]);
+        write(&repo, &format!("open{n}.txt"), "x\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-q", "-m", &format!("wip: open work {n} that nobody merged")]);
+        repo.git(&["checkout", "-q", "main"]);
+    }
+    let names = (0..3).map(|n| format!("done-{n}")).chain((0..2).map(|n| format!("open-{n}"))).collect();
+    (repo, names)
+}
+
+#[test]
+fn a_scan_of_branches_that_have_not_moved_asks_git_nothing_and_a_moved_branch_is_checked_alone() {
+    use std::sync::atomic::AtomicBool;
+    let (repo, names) = squashed_and_open();
+    let git = GitCli::new(repo.path());
+    let tips = |repo: &TempRepo| -> Vec<BranchTip> { names.iter().map(|name| tip(repo, name)).collect() };
+    let targets = [tip(&repo, "main"), BranchTip { name: "origin/main".into(), id: rev(&repo, "main") }];
+    let cache = gitgui_core::ScanCache::default();
+    let go = AtomicBool::new(false);
+    assert!(cache.lookup(&tips(&repo), &targets).is_none(), "nothing is known before the first scan");
+
+    let first = git.merge_clues_cached(&tips(&repo), &targets, &cache, &go).unwrap();
+    assert_eq!(first, git.merge_clues(&tips(&repo), &targets).unwrap(), "the same answer as without a cache");
+    assert_eq!(first.clues.len(), 3);
+    assert_eq!((cache.pairs_checked(), cache.targets_scanned()), (5, 1), "each branch once, against one trunk (two names)");
+
+    // Refreshing with nothing moved: the answer is known without running git at all.
+    for _ in 0..50 {
+        assert_eq!(cache.lookup(&tips(&repo), &targets).as_ref(), Some(&first));
+        assert_eq!(git.merge_clues_cached(&tips(&repo), &targets, &cache, &go).unwrap(), first);
+    }
+    assert_eq!((cache.pairs_checked(), cache.targets_scanned()), (5, 1), "50 more scans asked git nothing");
+    assert_eq!(cache.len(), 5, "one answer per branch is kept, however often it scans");
+
+    // One branch moves: only it is checked again, and the trunk is not read again.
+    repo.git(&["checkout", "-q", "open-0"]);
+    write(&repo, "open0.txt", "more\n");
+    repo.git(&["commit", "-q", "-am", "wip: more open work on the first one"]);
+    repo.git(&["checkout", "-q", "main"]);
+    assert!(cache.lookup(&tips(&repo), &targets).is_none());
+    let again = git.merge_clues_cached(&tips(&repo), &targets, &cache, &go).unwrap();
+    assert_eq!(again.clues.len(), 3);
+    assert_eq!((cache.pairs_checked(), cache.targets_scanned()), (6, 1));
+    assert_eq!(cache.len(), 5, "the moved branch's old answer was dropped");
+}
+
+#[test]
+fn a_cancelled_scan_stops_without_asking_git_and_says_what_it_left_unchecked() {
+    use std::sync::atomic::AtomicBool;
+    let (repo, names) = squashed_and_open();
+    let branches: Vec<BranchTip> = names.iter().map(|name| tip(&repo, name)).collect();
+    let cache = gitgui_core::ScanCache::default();
+    let scan = GitCli::new(repo.path()).merge_clues_cached(&branches, &[tip(&repo, "main")], &cache, &AtomicBool::new(true)).unwrap();
+    assert_eq!((scan.clues.len(), scan.unchecked), (0, 5));
+    assert_eq!(cache.pairs_checked(), 0);
+    assert!(cache.lookup(&branches, &[tip(&repo, "main")]).is_none(), "nothing unchecked is taken as an answer");
+}
+
+#[test]
+fn a_squash_of_a_very_large_change_is_still_recognized() {
+    // The diffs are streamed from one git process into the next; they never sit in memory here.
+    let repo = trunk();
+    repo.git(&["checkout", "-q", "-b", "big"]);
+    write(&repo, "big.txt", &numbered(200_000));
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "chore: add a very large generated file"]);
+    repo.git(&["checkout", "-q", "main"]);
+    repo.git(&["merge", "-q", "--squash", "big"]);
+    repo.git(&["commit", "-q", "-m", "chore: the large file (#9)"]);
+    let found = clues(&repo, "big", &["main"]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!((found[0].evidence, found[0].pr), (Evidence::SamePatch, Some(9)));
+}
+
 #[test]
 fn the_working_tree_stages_unstages_diffs_and_commits() {
     let repo = merged_repo("worktree");

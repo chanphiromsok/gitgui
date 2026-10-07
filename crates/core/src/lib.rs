@@ -13,7 +13,7 @@ pub mod tree;
 pub mod worktree;
 
 pub use actions::{CheckoutTarget, Operation, Outcome};
-pub use backend::{Backend, Error, GitCli, LogOptions};
+pub use backend::{Backend, Error, GitCli, LogOptions, ScanCache};
 pub use graph::{Half, LaneLayout, Lineage, Row, Stroke};
 pub use hosting::{Host, WebRemote, web_remote};
 pub use group::{Placed, descendants, group_by_parent};

@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::process::{Command as Process, Stdio};
@@ -76,11 +75,19 @@ pub trait Backend {
 /// Backend that runs the user's own `git`, so their config, hooks and credential helpers apply.
 pub struct GitCli {
     root: PathBuf,
+    /// Run git at a lower CPU priority, for work nobody is waiting on (the merge scan).
+    low_priority: bool,
 }
 
 impl GitCli {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self { root: root.into(), low_priority: false }
+    }
+
+    /// The same repository, with git run at a lower CPU priority so background work gives way to
+    /// the window and to the user's own programs.
+    pub fn in_background(&self) -> Self {
+        Self { root: self.root.clone(), low_priority: true }
     }
 
     pub fn root(&self) -> &Path {
@@ -113,7 +120,38 @@ impl GitCli {
         let mut process = Process::new("git");
         // A viewer must not take `index.lock`; it would make the user's own `git add` fail.
         process.arg("--no-optional-locks").arg("-C").arg(&self.root).args(args);
+        if self.low_priority {
+            lower_priority(&mut process);
+        }
         process
+    }
+
+    /// Runs `first`, feeds its output straight into `second`, and returns what `second` printed. The
+    /// output of `first` never passes through this process, so a huge `git log -p` costs no memory here.
+    fn pipeline(&self, first: &[&str], second: &[&str]) -> Result<Vec<u8>, Error> {
+        let mut producer = self.command(first);
+        producer.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut producer = producer.spawn().map_err(Error::Spawn)?;
+        let between = producer.stdout.take().expect("stdout was piped");
+        let mut consumer = self.command(second);
+        consumer.stdin(Stdio::from(between)).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let consumer = match consumer.spawn() {
+            Ok(consumer) => consumer,
+            Err(err) => {
+                let _ = producer.kill();
+                let _ = producer.wait();
+                return Err(Error::Spawn(err));
+            }
+        };
+        let output = consumer.wait_with_output().map_err(Error::Spawn)?;
+        let status = producer.wait().map_err(Error::Spawn)?;
+        if !status.success() {
+            return Err(Error::Git { status: status.code(), stderr: String::new() });
+        }
+        if !output.status.success() {
+            return Err(Error::Git { status: output.status.code(), stderr: String::from_utf8_lossy(&output.stderr).into_owned() });
+        }
+        Ok(output.stdout)
     }
 
     /// Where `origin` points, else the first remote; `None` with no remotes.
@@ -166,25 +204,6 @@ impl GitCli {
         Ok(String::from_utf8_lossy(&out).lines().map(str::to_owned).collect())
     }
 
-    /// Runs git with `input` on its standard input.
-    fn pipe(&self, args: &[&str], input: Vec<u8>) -> Result<Vec<u8>, Error> {
-        let mut process = self.command(args);
-        process.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = process.spawn().map_err(Error::Spawn)?;
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        // Written from another thread so a long input cannot fill the pipe while we wait on the output.
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-        let output = child.wait_with_output().map_err(Error::Spawn)?;
-        let _ = writer.join();
-        if output.status.success() {
-            Ok(output.stdout)
-        } else {
-            Err(Error::Git { status: output.status.code(), stderr: String::from_utf8_lossy(&output.stderr).into_owned() })
-        }
-    }
-
     fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
         self.command(&["merge-base", "--is-ancestor", ancestor, descendant])
             .output()
@@ -216,21 +235,20 @@ impl GitCli {
 
     /// The patch id of everything `tip` changed since `base`, or `None` when it changed nothing.
     fn branch_patch_id(&self, base: &str, tip: &str) -> Option<String> {
-        let diff = self.run(&["diff", "--no-color", "--no-ext-diff", base, tip]).ok()?;
-        if diff.is_empty() {
-            return None;
-        }
-        let out = self.pipe(&["patch-id", "--stable"], diff).ok()?;
+        // An empty diff gives no patch id at all.
+        let out = self.pipeline(&["diff", "--no-color", "--no-ext-diff", base, tip], &["patch-id", "--stable"]).ok()?;
         String::from_utf8_lossy(&out).split_whitespace().next().map(str::to_owned)
     }
 
     /// The patch id of each of the target's newest commits. Done once per target, not once per branch.
     fn scan_target(&self, target: &str) -> Option<TargetScan> {
         let limit = format!("--max-count={SCAN_COMMITS}");
-        let log = self
-            .run(&["log", "-p", "--no-merges", "--no-color", "--no-ext-diff", "--no-decorate", &limit, target])
+        let out = self
+            .pipeline(
+                &["log", "-p", "--no-merges", "--no-color", "--no-ext-diff", "--no-decorate", &limit, target],
+                &["patch-id", "--stable"],
+            )
             .ok()?;
-        let out = self.pipe(&["patch-id", "--stable"], log).ok()?;
         let patches = String::from_utf8_lossy(&out)
             .lines()
             .filter_map(|line| {
@@ -299,17 +317,251 @@ impl GitCli {
             .output()
             .is_ok_and(|output| output.status.success())
     }
+
+    /// [`Backend::merge_clues`], keeping what it learns in `cache` and asking git only about the branch
+    /// and trunk pairs the cache has no answer for. Git runs at a lower priority, on at most half the
+    /// cores. Setting `cancel` stops it soon after (it finishes the git command it is in); what it has
+    /// worked out by then is kept in the cache, so the scan that replaces it does not repeat it.
+    pub fn merge_clues_cached(
+        &self,
+        branches: &[BranchTip],
+        targets: &[BranchTip],
+        cache: &ScanCache,
+        cancel: &AtomicBool,
+    ) -> Result<MergeScan, Error> {
+        for tip in branches.iter().chain(targets) {
+            check_rev(&tip.id)?;
+        }
+        let git = self.in_background();
+        let targets = unique_targets(targets);
+        let deadline = Instant::now() + MERGE_SCAN_BUDGET;
+        let next = AtomicUsize::new(0);
+        let found: Mutex<Vec<(usize, MergeClue)>> = Mutex::new(Vec::new());
+        let unchecked = AtomicUsize::new(0);
+
+        let check_pair = |branch: &BranchTip, target: &BranchTip| -> Option<MergeClue> {
+            if git.is_ancestor(&branch.id, &target.id) {
+                return Some(MergeClue {
+                    branch: branch.name.clone(),
+                    into: target.name.clone(),
+                    commit: None,
+                    evidence: Evidence::Contained,
+                    pr: None,
+                });
+            }
+            let base = git.merge_base(&branch.id, &target.id)?;
+            let slot = cache.target_slot(&target.id);
+            let scan = slot.get_or_init(|| {
+                cache.targets_scanned.fetch_add(1, Ordering::Relaxed);
+                git.scan_target(&target.id).map(Arc::new)
+            });
+            git.squash_clue(branch, target, &base, scan.as_deref())
+        };
+        let check = |branch: &BranchTip| -> Option<Option<MergeClue>> {
+            resolve(branch, &targets, |key| {
+                if let Some(known) = cache.pair(key) {
+                    return Some(known);
+                }
+                if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    return None;
+                }
+                let target = targets.iter().find(|t| t.name == key.target && t.id == key.target_id)?;
+                let answer = check_pair(branch, target);
+                cache.pairs_checked.fetch_add(1, Ordering::Relaxed);
+                cache.keep(key.clone(), answer.clone());
+                Some(answer)
+            })
+        };
+
+        std::thread::scope(|scope| {
+            for _ in 0..scan_threads().min(branches.len()).max(1) {
+                scope.spawn(|| {
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(branch) = branches.get(at) else { break };
+                        match check(branch) {
+                            Some(Some(clue)) => found.lock().expect("no panic while holding the lock").push((at, clue)),
+                            Some(None) => {}
+                            None => {
+                                unchecked.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // A cancelled scan's inputs are already out of date: they say nothing about what to keep.
+        if !cancel.load(Ordering::Relaxed) {
+            cache.prune(branches, &targets);
+        }
+        let mut found = found.into_inner().expect("no panic while holding the lock");
+        found.sort_by_key(|(at, _)| *at);
+        Ok(MergeScan { clues: found.into_iter().map(|(_, clue)| clue).collect(), unchecked: unchecked.into_inner() })
+    }
 }
 
+/// Makes `process` run at a lower CPU priority (nice 10), so it gives way to the window and to other
+/// programs. Nothing changes where that is not possible.
+#[cfg(unix)]
+fn lower_priority(process: &mut Process) {
+    use std::os::unix::process::CommandExt;
+    unsafe extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    }
+    const PRIO_PROCESS: i32 = 0;
+    // SAFETY: runs in the child between fork and exec, and only makes one system call, which is
+    // async-signal-safe; its result is ignored, so a refusal changes nothing.
+    unsafe {
+        process.pre_exec(|| {
+            setpriority(PRIO_PROCESS, 0, 10);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn lower_priority(_process: &mut Process) {}
+
 /// How long `merge_clues` may work, how many of a trunk's newest commits it fingerprints, and how many
-/// branches it checks at once.
+/// branches it checks at once at most.
 const MERGE_SCAN_BUDGET: Duration = Duration::from_secs(25);
 const SCAN_COMMITS: usize = 500;
-const SCAN_THREADS: usize = 8;
+const MOST_SCAN_THREADS: usize = 6;
+
+/// How many branches the scan checks at once: half the cores (each check runs git processes one after
+/// another), so a scan never takes the whole machine.
+fn scan_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, MOST_SCAN_THREADS)
+}
 
 /// The patch id of each recent commit on a trunk, newest first, mapped to the commit.
 struct TargetScan {
     patches: HashMap<String, String>,
+}
+
+/// One branch checked against one trunk, each at the commit it pointed at. What git says about the pair
+/// cannot change while neither moves, so the answer is kept.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PairKey {
+    branch: String,
+    branch_id: String,
+    target: String,
+    target_id: String,
+}
+
+impl PairKey {
+    fn of(branch: &BranchTip, target: &BranchTip) -> Self {
+        Self { branch: branch.name.clone(), branch_id: branch.id.clone(), target: target.name.clone(), target_id: target.id.clone() }
+    }
+}
+
+type TargetSlot = Arc<OnceLock<Option<Arc<TargetScan>>>>;
+
+/// What earlier merge scans of one repository found, so the next scan only asks git about branches and
+/// trunks that have moved since. Refreshing, or any operation that reads the repository again, then
+/// costs nothing when the branches are where they were.
+///
+/// It holds an answer per branch and trunk pair plus each trunk's fingerprints, and after each
+/// complete scan only what that scan was about, so it stays small.
+#[derive(Default)]
+pub struct ScanCache {
+    pairs: Mutex<HashMap<PairKey, Option<MergeClue>>>,
+    /// Each trunk's fingerprints, by commit. Shared by scans running at the same time, so a scan that
+    /// replaces a cancelled one waits for the trunk being read instead of reading it a second time.
+    targets: Mutex<HashMap<String, TargetSlot>>,
+    /// Pairs worked out with git, and trunks fingerprinted, over this cache's life.
+    pairs_checked: AtomicUsize,
+    targets_scanned: AtomicUsize,
+}
+
+impl ScanCache {
+    /// How many branch and trunk pairs have been asked of git, over this cache's life.
+    pub fn pairs_checked(&self) -> usize {
+        self.pairs_checked.load(Ordering::Relaxed)
+    }
+
+    /// How many trunks have been fingerprinted (`git log -p`), over this cache's life.
+    pub fn targets_scanned(&self) -> usize {
+        self.targets_scanned.load(Ordering::Relaxed)
+    }
+
+    /// How many answers are kept.
+    pub fn len(&self) -> usize {
+        self.pairs.lock().map_or(0, |pairs| pairs.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The whole scan of `branches` against `targets`, when every answer it needs is already known.
+    pub fn lookup(&self, branches: &[BranchTip], targets: &[BranchTip]) -> Option<MergeScan> {
+        let targets = unique_targets(targets);
+        let pairs = self.pairs.lock().ok()?;
+        let mut clues = Vec::new();
+        for branch in branches {
+            if let Some(clue) = resolve(branch, &targets, |key| pairs.get(key).cloned())? {
+                clues.push(clue);
+            }
+        }
+        Some(MergeScan { clues, unchecked: 0 })
+    }
+
+    fn pair(&self, key: &PairKey) -> Option<Option<MergeClue>> {
+        self.pairs.lock().ok()?.get(key).cloned()
+    }
+
+    fn keep(&self, key: PairKey, answer: Option<MergeClue>) {
+        if let Ok(mut pairs) = self.pairs.lock() {
+            pairs.insert(key, answer);
+        }
+    }
+
+    fn target_slot(&self, id: &str) -> TargetSlot {
+        let mut targets = self.targets.lock().expect("no panic while holding the lock");
+        targets.entry(id.to_owned()).or_default().clone()
+    }
+
+    /// Forgets everything that is not about these branches and trunks.
+    fn prune(&self, branches: &[BranchTip], targets: &[&BranchTip]) {
+        let branches: HashSet<(&str, &str)> = branches.iter().map(|b| (b.name.as_str(), b.id.as_str())).collect();
+        let tips: HashSet<(&str, &str)> = targets.iter().map(|t| (t.name.as_str(), t.id.as_str())).collect();
+        if let Ok(mut pairs) = self.pairs.lock() {
+            pairs.retain(|key, _| {
+                branches.contains(&(key.branch.as_str(), key.branch_id.as_str()))
+                    && tips.contains(&(key.target.as_str(), key.target_id.as_str()))
+            });
+        }
+        let ids: HashSet<&str> = targets.iter().map(|t| t.id.as_str()).collect();
+        if let Ok(mut scans) = self.targets.lock() {
+            scans.retain(|id, _| ids.contains(id.as_str()));
+        }
+    }
+}
+
+/// Two names for one commit (a branch and its remote) are one target.
+fn unique_targets(targets: &[BranchTip]) -> Vec<&BranchTip> {
+    let mut seen = HashSet::new();
+    targets.iter().filter(|t| seen.insert(t.id.as_str())).collect()
+}
+
+/// The answer for one branch: the first trunk, in order, that it was merged into. `answer` gives what is
+/// known about one pair, or `None` when that pair could not be checked; the whole answer is then `None`.
+fn resolve(
+    branch: &BranchTip,
+    targets: &[&BranchTip],
+    mut answer: impl FnMut(&PairKey) -> Option<Option<MergeClue>>,
+) -> Option<Option<MergeClue>> {
+    for target in targets {
+        if branch.id == target.id || branch.name == target.name {
+            continue;
+        }
+        if let Some(clue) = answer(&PairKey::of(branch, target))? {
+            return Some(Some(clue));
+        }
+    }
+    Some(None)
 }
 
 // Records start with 0x1e and fields are split by 0x1f, so subjects and names can hold anything else.
@@ -384,63 +636,7 @@ impl Backend for GitCli {
     }
 
     fn merge_clues(&self, branches: &[BranchTip], targets: &[BranchTip]) -> Result<MergeScan, Error> {
-        for tip in branches.iter().chain(targets) {
-            check_rev(&tip.id)?;
-        }
-        // Two names for one commit (a branch and its remote) are one target.
-        let mut seen = HashSet::new();
-        let targets: Vec<&BranchTip> = targets.iter().filter(|t| seen.insert(t.id.as_str())).collect();
-        let scans: Vec<OnceLock<Option<Arc<TargetScan>>>> = targets.iter().map(|_| OnceLock::new()).collect();
-
-        let deadline = Instant::now() + MERGE_SCAN_BUDGET;
-        let next = AtomicUsize::new(0);
-        let found: Mutex<Vec<(usize, MergeClue)>> = Mutex::new(Vec::new());
-        let unchecked = AtomicUsize::new(0);
-
-        let check = |branch: &BranchTip| -> Option<MergeClue> {
-            for (t, target) in targets.iter().enumerate() {
-                if branch.id == target.id || branch.name == target.name {
-                    continue;
-                }
-                if Instant::now() >= deadline {
-                    unchecked.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
-                if self.is_ancestor(&branch.id, &target.id) {
-                    return Some(MergeClue {
-                        branch: branch.name.clone(),
-                        into: target.name.clone(),
-                        commit: None,
-                        evidence: Evidence::Contained,
-                        pr: None,
-                    });
-                }
-                let Some(base) = self.merge_base(&branch.id, &target.id) else { continue };
-                let scan = scans[t].get_or_init(|| self.scan_target(&target.id).map(Arc::new));
-                if let Some(clue) = self.squash_clue(branch, target, &base, scan.as_deref()) {
-                    return Some(clue);
-                }
-            }
-            None
-        };
-
-        std::thread::scope(|scope| {
-            for _ in 0..SCAN_THREADS.min(branches.len()).max(1) {
-                scope.spawn(|| {
-                    loop {
-                        let at = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(branch) = branches.get(at) else { break };
-                        if let Some(clue) = check(branch) {
-                            found.lock().expect("no panic while holding the lock").push((at, clue));
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut found = found.into_inner().expect("no panic while holding the lock");
-        found.sort_by_key(|(at, _)| *at);
-        Ok(MergeScan { clues: found.into_iter().map(|(_, clue)| clue).collect(), unchecked: unchecked.into_inner() })
+        self.merge_clues_cached(branches, targets, &ScanCache::default(), &AtomicBool::new(false))
     }
 
     fn file_diff(&self, id: &str, file: &FileChange, context: u32) -> Result<FileDiff, Error> {
