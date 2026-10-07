@@ -116,7 +116,7 @@ Left to right: **projects** | **graph** | **file pane**. Both dividers drag to r
 - **Right-click** a branch badge or a commit: checkout, rename, delete, merge into current, rebase current onto, push, new branch / tag here, cherry-pick, copy name / SHA / message.
   Anything that rewrites history, deletes, or reaches a remote asks first. Nothing is forced: no force-push, no `reset --hard`, and an unmerged branch is deleted only after a second, explicit yes.
   A merge, rebase or cherry-pick that meets conflicts stops and the banner offers **Abort**, which puts everything back.
-- **File pane** (click a commit): overview, and the changed files as a **tree or flat list** with a filter. A file opens as a **unified or split** diff; **Show more lines** (on the toolbar or beside any hunk) widens the unchanged lines around every change: 25, 100, 400, then the whole file; **Collapse** goes back to 3. Your choice of **Tree / Flat** and **Unified / Split** is saved as soon as you make it (also in Settings…) and is used the next time the app starts. **Expand** (Cmd-E) gives it the whole area.
+- **File pane** (click a commit): overview, and the changed files as a **tree or flat list** with a filter. A file opens as a **unified or split** diff; **Show more lines** (on the toolbar or beside any hunk) widens the unchanged lines around every change: 25, 100, 400, then the whole file; **Collapse** goes back to 3. Long lines scroll sideways (shift + wheel, or a trackpad swipe), and a **minimap** strip on the right shows where the changes are: click or drag it to jump. Your choice of **Tree / Flat** and **Unified / Split** is saved as soon as you make it (also in Settings…) and is used the next time the app starts. **Expand** (Cmd-E) gives it the whole area.
 - **Filter bar** above the graph: show the *current branch*, *local* branches or *all*; *hide merged* branches; show or hide *stashes* (a stash shows where the commit it was made on does); search (Cmd-F) by message, author, branch or id, `path:` for commits touching a file, `code:` for commits adding or removing text. Enter goes to the next match.
 - **Syntax highlighting** in diffs (tree-sitter, 21 languages including PHP). Each line is colored from the whole file it came from, so hunks that start mid-string still color right.
 - **Themes** (Settings): Zed's theme format. gitgui Dark, One Dark and One Light are built in; themes installed in Zed show up, or drop a Zed theme file in `<data folder>/themes/`.
@@ -143,7 +143,7 @@ They do not check how anything looks.
 ## Known gaps
 
 - Comments are one line each and local only. Syncing with GitHub/GitLab review comments is not built.
-- No word-level highlight inside changed lines; long lines are clipped, not scrolled.
+- No word-level highlight inside changed lines.
 - Divider positions and folded groups are not remembered between launches.
 - The merge scan looks at each trunk's newest 500 commits and gives up after 25 s (it says how many branches it skipped; the next refresh carries on from there). It remembers its answers, so a refresh only re-checks branches and trunks that moved.
 - Menu items from Sourcetree not built: *Create Archive*, *Unselect in Branches Dropdown* (there is no branch dropdown yet).

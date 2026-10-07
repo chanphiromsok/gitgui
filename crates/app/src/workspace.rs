@@ -231,6 +231,12 @@ pub struct FileState {
     pub list: ListState,
     /// Unchanged lines shown around each change; more after "Show more lines".
     pub context: u32,
+    /// Where the changes are, for the strip beside the diff.
+    pub minimap: crate::minimap::Minimap,
+    /// Where that strip was drawn last, so a click on it knows which row it means.
+    pub minimap_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// The longest line, in columns (a tab is four), to make the diff wide enough to scroll sideways.
+    pub max_cols: usize,
 }
 
 impl FileState {
@@ -247,6 +253,9 @@ impl FileState {
             // Rows this far past the edge are built ahead of the scroll; more only costs frame time.
             list: ListState::new(0, ListAlignment::Top, px(120.)),
             context: DIFF_CONTEXT,
+            minimap: Default::default(),
+            minimap_bounds: Default::default(),
+            max_cols: 0,
         }
     }
 
@@ -255,6 +264,15 @@ impl FileState {
     pub fn rebuild(&mut self, mode: Mode, keep_scroll: bool) {
         let top = self.list.logical_scroll_top();
         self.rows = display_rows(&self.diff, mode, &self.comments, self.composing);
+        self.minimap = crate::minimap::build(&self.diff, &self.rows, crate::diff_view::LINE_H);
+        self.max_cols = self
+            .diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .map(|line| line.text.chars().count() + 3 * line.text.matches('\t').count())
+            .max()
+            .unwrap_or(0);
         self.list.reset(self.rows.len());
         if keep_scroll {
             self.list.scroll_to(top);

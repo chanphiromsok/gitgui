@@ -13,6 +13,7 @@ mod graph;
 mod icons;
 mod layout;
 mod menu;
+mod minimap;
 mod pane;
 mod preview;
 mod rows;

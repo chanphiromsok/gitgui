@@ -1866,3 +1866,56 @@ async fn show_more_lines_widens_the_context_around_each_change_and_collapse_goes
     cx.run_until_parked();
     assert_eq!((context(cx), lines(cx)), (3, 8), "collapsed back");
 }
+
+#[gpui::test]
+async fn long_lines_scroll_sideways_and_the_minimap_jumps_to_a_block(cx: &mut TestAppContext) {
+    let fx = bare_fixture("minimap");
+    let long = "x".repeat(300);
+    let text = |a: &str, b: &str| -> String {
+        (1..=400).map(|n| match n { 20 => format!("{a}\n"), 380 => format!("{b}\n"), _ => format!("line {n} {long}\n") }).collect()
+    };
+    commit_file(&fx, "wide.txt", &text("before one", "before two"), "base");
+    commit_file(&fx, "wide.txt", &text("after one", "after two"), "change twice");
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "change twice");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| ws.set_diff_context(Some(crate::workspace::WHOLE_FILE), cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+
+    // The rows are as wide as the longest line, not as wide as the pane.
+    let pane = cx.debug_bounds("minimap").expect("the minimap is drawn");
+    let rows = cx.debug_bounds("diff-list").expect("the rows are drawn");
+    assert!(rows.size.width > px(300. * 7.), "wide enough for 300 columns, was {:?}", rows.size.width);
+    assert!(rows.size.width > pane.origin.x, "wider than the area it sits in, so it scrolls sideways");
+
+    // A sideways scroll over the code moves it.
+    let before = cx.debug_bounds("diff-list").unwrap().origin.x;
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: point(pane.origin.x - px(300.), pane.origin.y + px(200.)),
+        delta: gpui::ScrollDelta::Pixels(point(px(-250.), px(0.))),
+        ..Default::default()
+    });
+    draw(cx, &ws);
+    let after = cx.debug_bounds("diff-list").unwrap().origin.x;
+    assert!(after < before - px(100.), "the code moved left: {before:?} → {after:?}");
+
+    // Two changes, far apart: two ticks (a removed line and an added one each, merged by split view or not).
+    let ticks = ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().minimap.marks.len());
+    assert_eq!(ticks, 4, "removed + added at each of the two places");
+
+    let top = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().list.logical_scroll_top().item_ix);
+    assert_eq!(top(cx), 0);
+    // Clicking near the bottom of the strip goes to the second change.
+    let below = point(pane.center().x, pane.origin.y + pane.size.height * 0.93);
+    click(cx, MouseButton::Left, below);
+    draw(cx, &ws);
+    assert!(top(cx) > 300, "jumped to near the end, row {}", top(cx));
+    // And near the top goes back.
+    click(cx, MouseButton::Left, point(pane.center().x, pane.origin.y + pane.size.height * 0.02));
+    draw(cx, &ws);
+    assert!(top(cx) < 30, "back near the start, row {}", top(cx));
+}

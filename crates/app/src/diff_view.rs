@@ -5,19 +5,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gitgui_core::{DiffLine, FileStatus, LineKind};
 use gitgui_store::{Comment, Side};
-use gpui::{AnyElement, Context, ElementId, FontWeight, SharedString, StyledText, Window, div, list, prelude::*, px, rgb};
+use gpui::{
+    AnyElement, Context, ElementId, FontWeight, ListOffset, MouseButton, SharedString, StyledText, Window, canvas, div, list,
+    prelude::*, px, relative, rgb, rgba,
+};
 
 use crate::changes::WORKTREE;
 use crate::detail::{deleted_tag, stats, status_color};
 use crate::icons;
 use crate::rows::{Anchor, DisplayRow, Mode, Notice, anchor_of};
 use crate::preview::{self, Images, Preview};
+use crate::minimap::MarkKind;
 use crate::syntax::{FileColors, Span};
 use crate::ui::{self, MONO, button};
 use crate::workspace::{Phase, WHOLE_FILE, Workspace};
 use crate::theme::t;
 
-const LINE_H: f32 = 20.0;
+pub const LINE_H: f32 = 20.0;
+/// How wide one character of the code font is at the diff's text size; a little over, so the longest
+/// line is never cut off.
+const CHAR_W: f32 = 7.4;
+const MINIMAP_W: f32 = 14.;
+/// A comment stays readable however wide the code beside it is.
+const CARD_MAX_W: f32 = 760.;
 
 fn side_name(side: Side) -> &'static str {
     match side {
@@ -92,9 +102,7 @@ impl Workspace {
             Phase::Loading => centered_text("Loading diff…", t().muted),
             Phase::Failed(message) => centered_text(message.clone(), t().removed),
             Phase::Ready(()) => {
-                let diff = list(file.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx)))
-                    .size_full()
-                    .into_any_element();
+                let diff = self.diff_body(file, mode, cx);
                 match &file.images {
                     // A picture: before and after, then (for an SVG) its text diff below.
                     Some(images) => div()
@@ -118,6 +126,103 @@ impl Workspace {
             .child(toolbar)
             .child(div().flex_1().min_h_0().bg(rgb(t().editor_bg)).child(body))
             .into_any_element()
+    }
+
+    /// The rows, wide enough for the longest line and scrolling sideways when that is wider than the
+    /// pane, with the minimap over the right edge.
+    fn diff_body(&self, file: &crate::workspace::FileState, mode: Mode, cx: &mut Context<Self>) -> AnyElement {
+        // Gutters and the "+" cell, then the code. In split view each side has its own.
+        let side = |gutter_cols: f32| 18. + (gutter_cols + 3. + file.max_cols as f32) * CHAR_W + 24.;
+        let width = match mode {
+            Mode::Unified => side(11.),
+            Mode::Split => 2. * side(5.),
+        };
+        let rows = list(file.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx))).size_full();
+        let scrolling = div()
+            .id("diff-x")
+            .size_full()
+            .overflow_x_scroll()
+            .child(div().debug_selector(|| "diff-list".to_owned()).h_full().w(px(width)).min_w_full().child(rows));
+        div().size_full().relative().child(scrolling).child(self.minimap(file, cx)).into_any_element()
+    }
+
+    /// A strip down the right edge: a tick for every run of changed rows and a box for what is in view.
+    /// Click or drag on it to go there.
+    fn minimap(&self, file: &crate::workspace::FileState, cx: &mut Context<Self>) -> AnyElement {
+        let map = &file.minimap;
+        let total = map.total().max(1.);
+        let theme = t();
+        let color = |kind: MarkKind| match kind {
+            MarkKind::Added => theme.added,
+            MarkKind::Removed => theme.removed,
+            MarkKind::Changed => theme.modified,
+            MarkKind::Comment => theme.accent,
+        };
+        // What is in view, from the list's real pixel positions.
+        let viewport = file.list.viewport_bounds().size.height;
+        let content = (file.list.max_offset_for_scrollbar().height + viewport).max(px(1.));
+        let top = (-file.list.scroll_px_offset_for_scrollbar().y / content).clamp(0., 1.);
+        let height = (viewport / content).clamp(0., 1.);
+
+        let bounds = file.minimap_bounds.clone();
+        div()
+            .id("minimap")
+            .debug_selector(|| "minimap".to_owned())
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(px(MINIMAP_W))
+            .bg(rgba(0x00000030))
+            .border_l_1()
+            .border_color(rgb(t().border))
+            .cursor_pointer()
+            .occlude()
+            .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+            .children(map.marks.iter().map(|mark| {
+                div()
+                    .absolute()
+                    .left(px(3.))
+                    .right(px(3.))
+                    .top(relative(mark.top / total))
+                    .h(relative(mark.height / total))
+                    .min_h(px(2.))
+                    .rounded_sm()
+                    .bg(rgb(color(mark.kind)))
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(relative(top))
+                    .h(relative(height))
+                    .min_h(px(10.))
+                    .bg(rgba(0xffffff1c))
+                    .border_y_1()
+                    .border_color(rgba(0xffffff44)),
+            )
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| this.minimap_jump(event.position.y, cx)))
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if event.dragging() {
+                    this.minimap_jump(event.position.y, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// Scrolls the diff so the row at height `y` (a window position over the minimap) is mid-screen.
+    fn minimap_jump(&mut self, y: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(file) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()) else { return };
+        let bounds = file.minimap_bounds.get();
+        if bounds.size.height <= px(0.) {
+            return;
+        }
+        let fraction = (y - bounds.origin.y) / bounds.size.height;
+        let target = file.minimap.row_at(fraction);
+        let visible = (file.list.viewport_bounds().size.height / px(LINE_H)) as usize;
+        file.list.scroll_to(ListOffset { item_ix: target.saturating_sub(visible / 2), offset_in_item: px(0.) });
+        cx.notify();
     }
 
     fn render_diff_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -155,6 +260,7 @@ impl Workspace {
             .pr_3()
             .child(
                 div()
+                    .max_w(px(CARD_MAX_W))
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(t().accent))
@@ -440,6 +546,7 @@ fn comment_card(ix: usize, comment: &Comment, mode: Mode, cx: &mut Context<Works
         .pr_3()
         .child(
             div()
+                .max_w(px(CARD_MAX_W))
                 .rounded_md()
                 .border_1()
                 .border_color(rgb(t().border))
