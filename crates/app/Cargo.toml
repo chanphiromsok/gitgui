@@ -9,6 +9,10 @@ license.workspace = true
 name = "gitgui-app"
 path = "src/main.rs"
 
+# The old `objc` macros test a `cargo-clippy` feature this crate does not have; tell rustc that is expected.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [dependencies]
 gitgui-core = { path = "../core" }
 gitgui-store = { path = "../store" }

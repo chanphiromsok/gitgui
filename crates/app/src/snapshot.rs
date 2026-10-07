@@ -8,9 +8,7 @@ use std::path::Path;
 
 use gpui::Window;
 
-// The old `objc` macros mention a `cargo-clippy` cfg this crate does not declare.
 #[cfg(target_os = "macos")]
-#[allow(unexpected_cfgs)]
 pub fn save(window: &Window, path: &Path) -> Result<(), String> {
     use std::ffi::c_void;
 
