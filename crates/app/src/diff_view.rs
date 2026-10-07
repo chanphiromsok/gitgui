@@ -14,7 +14,7 @@ use crate::rows::{Anchor, DisplayRow, Mode, Notice, anchor_of};
 use crate::preview::{self, Images, Preview};
 use crate::syntax::{FileColors, Span};
 use crate::ui::{self, MONO, button};
-use crate::workspace::{Phase, Workspace};
+use crate::workspace::{Phase, WHOLE_FILE, Workspace};
 use crate::theme::t;
 
 const LINE_H: f32 = 20.0;
@@ -67,6 +67,25 @@ impl Workspace {
                     n => format!("{n} comments on this file"),
                 }),
             )
+            .when(!file.diff.binary && !file.diff.hunks.is_empty(), |bar| {
+                bar.child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(
+                            button("more-context", if file.context >= WHOLE_FILE { "Whole file" } else { "Show more lines" })
+                                .debug_selector(|| "more-context".to_owned())
+                                .on_click(cx.listener(|this, _, _, cx| this.more_context(cx))),
+                        )
+                        .when(file.context != 3, |group| {
+                            group.child(
+                                button("less-context", "Collapse")
+                                    .debug_selector(|| "less-context".to_owned())
+                                    .on_click(cx.listener(|this, _, _, cx| this.set_diff_context(None, cx))),
+                            )
+                        }),
+                )
+            })
             .child(div().flex().gap_1().child(toggle("mode-unified", "Unified", Mode::Unified)).child(toggle("mode-split", "Split", Mode::Split)));
 
         let body: AnyElement = match &file.phase {
@@ -110,7 +129,7 @@ impl Workspace {
         let comments = repo.commit.as_ref().is_some_and(|commit| commit.id != WORKTREE);
 
         match row {
-            DisplayRow::Hunk(h) => hunk_header(&file.diff.hunks[h].header),
+            DisplayRow::Hunk(h) => hunk_header(h, &file.diff.hunks[h].header, file.context < WHOLE_FILE, cx),
             DisplayRow::Line { hunk, line } => {
                 let line = &file.diff.hunks[hunk].lines[line];
                 unified_line(ix, line, file.colors.of(line), comments, cx)
@@ -235,18 +254,33 @@ fn centered_text(text: impl Into<SharedString>, color: u32) -> AnyElement {
     div().size_full().flex().items_center().justify_center().text_color(rgb(color)).child(text.into()).into_any_element()
 }
 
-fn hunk_header(header: &str) -> AnyElement {
+fn hunk_header(h: usize, header: &str, can_expand: bool, cx: &mut Context<Workspace>) -> AnyElement {
     div()
         .w_full()
         .h(px(LINE_H + 4.))
         .px_3()
         .flex()
         .items_center()
+        .gap_3()
         .bg(rgb(t().hunk_bg))
         .text_color(rgb(t().hunk_fg))
         .font_family(MONO)
         .text_xs()
-        .child(SharedString::from(header.to_owned()))
+        .child(div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().child(SharedString::from(header.to_owned())))
+        .when(can_expand, |row| {
+            // More unchanged lines around every change, like "expand" beside a hunk on GitHub.
+            row.child(
+                div()
+                    .id(("hunk-more", h))
+                    .flex_none()
+                    .px_1p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(t().element_hover)))
+                    .on_click(cx.listener(|this, _, _, cx| this.more_context(cx)))
+                    .child("↕ Show more lines"),
+            )
+        })
         .into_any_element()
 }
 

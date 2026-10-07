@@ -1823,3 +1823,46 @@ async fn the_pull_rebase_button_asks_then_pulls_and_keeps_history_straight(cx: &
     let merges = Command::new("git").arg("-C").arg(fx.repo()).args(["rev-list", "--merges", "--count", "HEAD"]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&merges.stdout).trim(), "0", "no merge commit");
 }
+
+#[gpui::test]
+async fn show_more_lines_widens_the_context_around_each_change_and_collapse_goes_back(cx: &mut TestAppContext) {
+    let fx = bare_fixture("more-context");
+    let numbered = |changed: Option<usize>| -> String {
+        (1..=100).map(|n| if Some(n) == changed { "CHANGED\n".to_owned() } else { format!("line {n}\n") }).collect()
+    };
+    commit_file(&fx, "long.txt", &numbered(None), "base");
+    commit_file(&fx, "long.txt", &numbered(Some(50)), "edit the middle");
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "edit the middle");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let lines = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().diff.line_count());
+    let context = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().context);
+    assert_eq!((context(cx), lines(cx)), (3, 8), "3 lines around one changed line: 3 + removed + added + 3");
+
+    // The toolbar button asks for more.
+    let at = center_of(cx, "more-context".to_owned());
+    click(cx, MouseButton::Left, at);
+    cx.run_until_parked();
+    assert_eq!(context(cx), 25);
+    assert_eq!(lines(cx), 52, "25 + removed + added + 25");
+
+    ws.update(cx, |ws, cx| ws.more_context(cx));
+    cx.run_until_parked();
+    assert_eq!(context(cx), 100);
+    assert_eq!(lines(cx), 101, "the whole file: a hundred lines, one of them shown twice (removed and added)");
+    ws.update(cx, |ws, cx| ws.more_context(cx));
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| ws.more_context(cx));
+    cx.run_until_parked();
+    assert_eq!(context(cx), crate::workspace::WHOLE_FILE);
+
+    draw(cx, &ws);
+    let at = center_of(cx, "less-context".to_owned());
+    click(cx, MouseButton::Left, at);
+    cx.run_until_parked();
+    assert_eq!((context(cx), lines(cx)), (3, 8), "collapsed back");
+}

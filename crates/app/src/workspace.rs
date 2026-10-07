@@ -36,6 +36,8 @@ use crate::theme::{self, Theme, t};
 
 const LOAD_LIMIT: usize = 20_000;
 const DIFF_CONTEXT: u32 = 3;
+/// "Whole file": more context than any file has lines.
+pub const WHOLE_FILE: u32 = 1_000_000;
 
 pub enum Phase<T> {
     Loading,
@@ -227,6 +229,8 @@ pub struct FileState {
     pub composing: Option<Anchor>,
     pub rows: Vec<DisplayRow>,
     pub list: ListState,
+    /// Unchanged lines shown around each change; more after "Show more lines".
+    pub context: u32,
 }
 
 impl FileState {
@@ -242,6 +246,7 @@ impl FileState {
             rows: Vec::new(),
             // Rows this far past the edge are built ahead of the scroll; more only costs frame time.
             list: ListState::new(0, ListAlignment::Top, px(120.)),
+            context: DIFF_CONTEXT,
         }
     }
 
@@ -1064,6 +1069,17 @@ impl Workspace {
         repo.file = Some(file);
         cx.notify();
 
+        self.load_file(index, DIFF_CONTEXT, false, cx);
+    }
+
+    /// Reads the open file's diff with `context` unchanged lines around each change, colors it, and
+    /// shows it. `keep_scroll` keeps the place in the list (for showing more lines).
+    fn load_file(&mut self, index: usize, context: u32, keep_scroll: bool, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        let Some(commit) = repo.commit.as_ref() else { return };
+        let Phase::Ready(view) = &commit.phase else { return };
+        let Some(change) = view.files.get(index).cloned() else { return };
+        let (path, id) = (repo.project.path.clone(), commit.id.clone());
         let read_path = path.clone();
         let read_id = id.clone();
         let read_change = change.clone();
@@ -1089,7 +1105,7 @@ impl Workspace {
                 // coloring, so each line is colored knowing what comes before it, or a picture).
                 let (diff, old, new) = match &work {
                     Some(work) => {
-                        let diff = match git.work_diff(work, DIFF_CONTEXT) {
+                        let diff = match git.work_diff(work, context) {
                             Ok(diff) => diff,
                             Err(err) => return Some(Err(err)),
                         };
@@ -1100,7 +1116,7 @@ impl Workspace {
                         (diff, old, new)
                     }
                     None => {
-                        let diff = match git.file_diff(&read_id, &read_change, DIFF_CONTEXT) {
+                        let diff = match git.file_diff(&read_id, &read_change, context) {
                             Ok(diff) => diff,
                             Err(err) => return Some(Err(err)),
                         };
@@ -1146,20 +1162,52 @@ impl Workspace {
                 let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == path) else { return };
                 let mode = repo.mode;
                 let still_open = repo.commit.as_ref().is_some_and(|commit| commit.id == id);
-                let Some(file) = repo.file.as_mut().filter(|file| still_open && file.index == index) else { return };
+                let Some(file) =
+                    repo.file.as_mut().filter(|file| still_open && file.index == index && file.context == context)
+                else {
+                    return;
+                };
                 match result {
                     Ok((diff, colors, images)) => {
                         file.diff = diff;
                         file.colors = colors;
                         file.images = images;
                         file.phase = Phase::Ready(());
-                        file.rebuild(mode, false);
+                        file.rebuild(mode, keep_scroll);
                     }
                     Err(err) => file.phase = Phase::Failed(err.to_string().into()),
                 }
                 cx.notify();
             },
         );
+    }
+
+
+    /// Shows more unchanged lines around every change in the open file: 25, then 100, then 400, then the
+    /// whole file. `None` goes back to the usual 3.
+    pub fn set_diff_context(&mut self, step: Option<u32>, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        let Some(file) = repo.file.as_mut() else { return };
+        let context = step.unwrap_or(DIFF_CONTEXT);
+        if file.context == context || !matches!(file.phase, Phase::Ready(())) {
+            return;
+        }
+        file.context = context;
+        let index = file.index;
+        self.cancel_file_load();
+        self.load_file(index, context, true, cx);
+    }
+
+    /// The next amount of context after "Show more lines".
+    pub fn more_context(&mut self, cx: &mut Context<Self>) {
+        let Some(current) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()).map(|file| file.context) else { return };
+        let next = match current {
+            0..=24 => 25,
+            25..=99 => 100,
+            100..=399 => 400,
+            _ => WHOLE_FILE,
+        };
+        self.set_diff_context(Some(next), cx);
     }
 
     /// Stops a background read of a file that is about to be closed or replaced.
