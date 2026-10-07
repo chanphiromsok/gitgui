@@ -85,7 +85,7 @@ Left to right: **projects** | **graph** | **file pane**. Both dividers drag to r
   - Stashes are one `stash@{n}` commit; an *Uncommitted Changes* row sits on top.
 - **Grouping** (Settings… / Cmd-,, on by default): a pull request's commits are listed one level in under it, with a guide line, and fold away with the chevron on the merge's dot in the graph. *Compact graph* (Settings) narrows the lanes and thins the lines.
   Squash-merged branches go under their squash commit.
-- **Already merged?** A background scan marks branches that are merged even when git cannot tell (squash and rebase merges): *squash-merged into release/1.0.0 · #37*, and *squash of feat/x* on the commit that carries it.
+- **Already merged?** A background scan marks branches that are merged even when git cannot tell (squash and rebase merges): *squash-merged into release/1.0.0 · #37*, and *squash of branch feat/x* on the commit that carries it.
   Evidence, strongest first: identical changes in one trunk commit; the same pull request number; a trunk commit repeating the branch's commit messages. The last two are shown in italics as guesses.
 - **Pull requests** link to their page: *#42 ↗* beside a merge or squash commit, in its details, and *Open Pull Request / Open Commit in Browser* on right-click (GitHub, GitLab and Bitbucket remotes).
 - **Right-click** a branch badge or a commit: checkout, rename, delete, merge into current, rebase current onto, push, new branch / tag here, cherry-pick, copy name / SHA / message.

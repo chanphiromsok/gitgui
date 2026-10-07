@@ -628,7 +628,7 @@ async fn a_squash_merged_branch_is_noted_and_goes_under_its_squash_commit(cx: &m
     assert_eq!(clues.len(), 1);
     assert_eq!((clues[0].evidence, clues[0].pr), (gitgui_core::Evidence::SamePatch, Some(7)));
     // On the squash commit: where it came from. On the branch tip: where it went.
-    assert!(notes.iter().any(|(i, t)| *i == 0 && t.contains("squash of feat/x") && t.contains("#7")), "{notes:?}");
+    assert!(notes.iter().any(|(i, t)| *i == 0 && t.contains("squash of branch feat/x") && t.contains("#7")), "{notes:?}");
     assert!(notes.iter().any(|(i, t)| *i == 1 && t.contains("squash-merged into main")), "{notes:?}");
     // And the commit icon on the squash commit is a pull request.
     assert_eq!(ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {

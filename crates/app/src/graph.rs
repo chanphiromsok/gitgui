@@ -69,7 +69,7 @@ pub enum Dot {
     Uncommitted,
 }
 
-/// A line of text beside a commit about a merge: "squash-merged into release/1.0.0", "squash of feat/x".
+/// A line of text beside a commit about a merge: "squash-merged into release/1.0.0", "squash of branch feat/x".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Note {
     pub text: SharedString,
@@ -321,7 +321,7 @@ fn fork_names(row: &Row, names: &[Option<String>]) -> Vec<String> {
 }
 
 /// Puts what the merge scan found next to the commits it is about: on the branch's tip, "merged into
-/// release/1.0.0", and on the commit that carries the branch's changes, "squash of feat/x".
+/// release/1.0.0", and on the commit that carries the branch's changes, "squash of branch feat/x".
 pub fn apply_clues(entries: &mut [Entry], clues: &[MergeClue]) {
     for entry in entries.iter_mut() {
         entry.notes.clear();
@@ -351,8 +351,8 @@ pub fn apply_clues(entries: &mut [Entry], clues: &[MergeClue]) {
             }
             if clue.commit.is_some() && entry.commit == clue.commit {
                 entry.notes.push(Note {
-                    text: format!("← squash of {}{pr}", clue.branch).into(),
-                    detail: format!("This commit carries the changes of {}. {how}", clue.branch).into(),
+                    text: format!("squash of branch {}{pr}", clue.branch).into(),
+                    detail: format!("This one commit holds all the changes of the branch {} (a squash merge), and the branch was merged into {} through it. {how}", clue.branch, clue.into).into(),
                     probable: clue.evidence.is_probable(),
                     jump: None,
                 });
