@@ -36,6 +36,7 @@ actions!(
     gitgui,
     [
         OpenFolder,
+        CloneRepository,
         OpenSettings,
         Refresh,
         FindCommits,
@@ -58,6 +59,7 @@ fn main() {
         text_input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("secondary-o", OpenFolder, None),
+            KeyBinding::new("secondary-shift-o", CloneRepository, None),
             KeyBinding::new("secondary-,", OpenSettings, None),
             KeyBinding::new("secondary-r", Refresh, None),
             KeyBinding::new("secondary-f", FindCommits, None),
@@ -92,6 +94,12 @@ fn main() {
 
         let target = workspace.clone();
         cx.on_action(move |_: &OpenFolder, cx| target.update(cx, |this, cx| this.open_folder(cx)));
+        let target = workspace.clone();
+        cx.on_action(move |_: &CloneRepository, cx| {
+            if let Some(window) = cx.active_window() {
+                window.update(cx, |_, window, cx| target.update(cx, |this, cx| this.start_clone(window, cx))).ok();
+            }
+        });
         let target = workspace.clone();
         cx.on_action(move |_: &OpenSettings, cx| target.update(cx, |this, cx| this.open_settings(cx)));
         let target = workspace.clone();
@@ -154,6 +162,7 @@ fn main() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("Open Folder…", OpenFolder),
+                    MenuItem::action("Clone Repository…", CloneRepository),
                     MenuItem::action("Refresh", Refresh),
                     MenuItem::separator(),
                     MenuItem::action("Close Window", CloseWindow),

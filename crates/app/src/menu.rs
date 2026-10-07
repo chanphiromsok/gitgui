@@ -51,6 +51,8 @@ pub enum Action {
     /// Make a tag at this commit.
     CreateTag(String),
     CherryPick(String),
+    /// Clone a repository by address (typed in the dialog) into the dialog's folder.
+    Clone,
     Copy { text: String, what: &'static str },
     /// Open a page (a pull request, a commit) in the browser.
     OpenUrl(String),
@@ -78,6 +80,8 @@ pub struct Dialog {
     pub danger: bool,
     /// A name to type, and what it starts as.
     pub prompt: Option<String>,
+    /// A folder shown under the text field, with a button to change it (where a clone goes).
+    pub folder: Option<std::path::PathBuf>,
     pub action: Action,
 }
 
@@ -113,6 +117,8 @@ impl Notice {
 pub(crate) fn explain(error: &Error) -> String {
     let text = match error {
         Error::Git { stderr, .. } => stderr.trim().to_owned(),
+        // A message already written for the person to read.
+        Error::Parse(message) => message.clone(),
         other => other.to_string(),
     };
     let text: String = text.lines().filter(|l| !l.trim().is_empty()).take(6).collect::<Vec<_>>().join(" ");
@@ -362,7 +368,7 @@ impl Workspace {
                 false,
                 Some(String::new()),
             ),
-            Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) => return,
+            Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) => return,
         };
         if let Some(initial) = &prompt {
             let initial = initial.clone();
@@ -371,7 +377,7 @@ impl Workspace {
                 input.focus(window);
             });
         }
-        self.dialog = Some(Dialog { title: title.into(), body: body.into(), confirm: confirm.into(), danger, prompt, action });
+        self.dialog = Some(Dialog { title: title.into(), body: body.into(), confirm: confirm.into(), danger, prompt, folder: None, action });
         cx.notify();
     }
 
@@ -429,7 +435,112 @@ impl Workspace {
                 self.run(format!("Tagging {shown}…"), format!("Tagged {shown} as {typed}."), None, move |git| git.create_tag(&typed, &at).map(Outcome::Done), cx);
             }
             Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) => {}
+            Action::Clone => {
+                let folder = dialog.folder.unwrap_or_else(|| self.clone_folder());
+                self.clone_repo(typed, folder, cx);
+            }
         }
+    }
+
+    // ---- cloning ------------------------------------------------------------------------------
+
+    /// Where a clone goes: the folder the last one went into, else the home folder.
+    pub(crate) fn clone_folder(&self) -> std::path::PathBuf {
+        self.settings
+            .clone_dir
+            .clone()
+            .filter(|dir| dir.is_dir())
+            .or_else(|| std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    }
+
+    /// Asks for the address of a repository to clone (the clipboard's, when it holds one) and the folder it
+    /// goes into.
+    pub fn start_clone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return self.say(Notice::warn("Another operation is still running."), cx);
+        }
+        let pasted = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .map(|text| text.trim().to_owned())
+            .filter(|text| gitgui_core::clone::check_url(text).is_ok())
+            .unwrap_or_default();
+        self.dialog_input.update(cx, |input, cx| {
+            input.set_text(&pasted, cx);
+            input.focus(window);
+        });
+        self.dialog = Some(Dialog {
+            title: "Clone a repository".into(),
+            body: "Paste the address of a repository: https://github.com/owner/repo.git, or git@github.com:owner/repo.git for ssh. \
+                   It is cloned into the folder below and opened here. Git asks for no password: a private repository needs \
+                   a credential helper or an ssh key you already use."
+                .into(),
+            confirm: "Clone".into(),
+            danger: false,
+            prompt: Some(pasted),
+            folder: Some(self.clone_folder()),
+            action: Action::Clone,
+        });
+        cx.notify();
+    }
+
+    /// Clones as the dialog's Clone button would, with the address and folder given.
+    #[cfg(test)]
+    pub(crate) fn start_clone_for_test(&mut self, url: String, folder: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.clone_repo(url, folder, cx);
+    }
+
+    /// Picks another folder for the clone in the open dialog.
+    pub fn choose_clone_folder(&mut self, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else { return };
+            let Some(folder) = paths.into_iter().next() else { return };
+            this.update(cx, |this, cx| {
+                if let Some(dialog) = this.dialog.as_mut() {
+                    dialog.folder = Some(folder);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Clones `url` into a folder of its name inside `folder` in the background, then opens it.
+    pub(crate) fn clone_repo(&mut self, url: String, folder: std::path::PathBuf, cx: &mut Context<Self>) {
+        let url = url.trim().to_owned();
+        if let Err(error) = gitgui_core::clone::check_url(&url) {
+            return self.fail(explain(&error), cx);
+        }
+        let Some(name) = gitgui_core::clone::repo_name(&url) else {
+            return self.fail("Could not tell a folder name from that address.", cx);
+        };
+        self.settings.clone_dir = Some(folder.clone());
+        self.save_settings();
+        self.busy = Some(format!("Cloning {name}…").into());
+        cx.notify();
+        self.spawn_load(
+            cx,
+            move || gitgui_core::clone::clone(&url, &folder, &name).map(|dest| (dest, name)),
+            move |this, result, cx| {
+                this.busy = None;
+                match result {
+                    Ok((dest, name)) => {
+                        this.add_folder(&dest, cx);
+                        this.notice = Some(Notice::info(format!("Cloned {name} into {}.", dest.display())));
+                        cx.notify();
+                    }
+                    Err(error) => this.fail(explain(&error), cx),
+                }
+            },
+        );
     }
 
     // ---- doing it -----------------------------------------------------------------------------
@@ -610,6 +721,27 @@ impl Workspace {
                 .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(dialog.title.clone()))
                 .child(div().text_color(rgb(t().text)).child(dialog.body.clone()))
                 .when(dialog.prompt.is_some(), |panel| panel.child(self.dialog_input.clone()))
+                .when_some(dialog.folder.clone(), |panel, folder| {
+                    panel.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(div().flex_none().text_color(rgb(t().muted)).child("Into"))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .font_family(crate::ui::MONO)
+                                    .child(SharedString::from(folder.display().to_string())),
+                            )
+                            .child(button("dialog-folder", "Change…").on_click(cx.listener(|this, _, _, cx| this.choose_clone_folder(cx)))),
+                    )
+                })
                 .child(
                     div()
                         .flex()

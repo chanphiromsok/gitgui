@@ -90,6 +90,8 @@ pub struct Settings {
     pub file_layout: FileLayout,
     /// A file's diff unified or split. Remembered from one launch to the next.
     pub diff_mode: DiffMode,
+    /// The folder new clones go into; where the last clone went.
+    pub clone_dir: Option<PathBuf>,
     /// The project that was open last, to open again on the next start.
     pub last_project: Option<PathBuf>,
     /// Which commits in the graph show their author's picture.
@@ -123,6 +125,7 @@ impl Default for Settings {
             graph_scale: 100,
             graph_faces: GraphFaces::Tips,
             last_project: None,
+            clone_dir: None,
         }
     }
 }

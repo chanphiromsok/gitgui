@@ -2019,3 +2019,58 @@ async fn pictures_in_the_graph_are_for_branch_tips_unless_the_setting_says_other
     assert!(on_line >= 1 && on_line < all, "the selected line's commits only: {on_line} of {all}");
     draw(cx, &ws);
 }
+
+#[gpui::test]
+async fn cloning_by_address_makes_the_folder_adds_the_project_and_opens_it(cx: &mut TestAppContext) {
+    let source = merged_pr("clone-source");
+    let app = bare_fixture("clone-app");
+    let target = app.0.join("clones");
+    let url = format!("file://{}", source.repo().display());
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(app.data())), cx));
+    draw(cx, &ws);
+    // The sidebar button asks for an address and a folder.
+    let at = center_of(cx, "clone-repo".to_owned());
+    click(cx, MouseButton::Left, at);
+    let (title, folder) = ws.read_with(cx, |ws, _| {
+        let d = ws.dialog.as_ref().expect("a dialog asks for the address");
+        (d.title.to_string(), d.folder.clone())
+    });
+    assert!(title.contains("Clone"), "{title}");
+    assert!(folder.is_some(), "it says where the clone will go");
+
+    // Nothing typed: it waits. A bad address is refused with a reason, and nothing runs.
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.dialog.is_some()), "an empty address does not go through");
+    ws.update(cx, |ws, cx| ws.dialog_input.update(cx, |input, cx| input.set_text("ext::sh -c touch% /tmp/pwned", cx)));
+    ws.update(cx, |ws, cx| {
+        ws.dialog.as_mut().unwrap().folder = Some(target.clone());
+        ws.confirm_dialog(cx)
+    });
+    cx.run_until_parked();
+    let warn = ws.read_with(cx, |ws, _| ws.notice.as_ref().map(|n| (n.warn, n.text.to_string())));
+    assert!(warn.is_some_and(|(warn, text)| warn && text.contains("address")), "refused with a reason");
+    assert!(ws.read_with(cx, |ws, _| ws.repo.is_none() && ws.projects.is_empty()));
+    assert!(!std::path::Path::new("/tmp/pwned").exists());
+
+    // A good address: cloned into <folder>/<name>, added to the sidebar and opened.
+    ws.update(cx, |ws, cx| {
+        let url = url.clone();
+        let target = target.clone();
+        ws.start_clone_for_test(url, target, cx)
+    });
+    cx.run_until_parked();
+    let dest = target.join("repo");
+    assert!(dest.join(".git").exists(), "the repository is on disk at {}", dest.display());
+    let real = dest.canonicalize().unwrap();
+    assert_eq!(ws.read_with(cx, |ws, _| ws.repo.as_ref().map(|r| r.project.path.clone())), Some(real.clone()));
+    assert!(ws.read_with(cx, |ws, _| ws.projects.iter().any(|p| p.path == real)));
+    assert!(!summaries(&ws, cx).is_empty(), "its history shows");
+    assert_eq!(Store::at(app.data()).settings().unwrap().clone_dir, Some(target.clone()), "the folder is remembered");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| !n.warn && n.text.contains("Cloned"))));
+
+    // The same address again: the folder is there, so nothing is overwritten.
+    ws.update(cx, |ws, cx| ws.start_clone_for_test(url.clone(), target.clone(), cx));
+    cx.run_until_parked();
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.warn && n.text.contains("already exists"))));
+}

@@ -11,7 +11,7 @@ A fast Git GUI in Rust, on GPUI, for reading history on repositories that work t
 - **Where did this branch start?** Each branch is one coloured line down to its fork point, with the current branch ringed.
 - **Slow on big histories.** It scrolls 10,000-line diffs and thousands of commits smoothly, and refreshes do not re-scan.
 
-Also: a **Pull (rebase)** button, a Graph size setting, author pictures (Gravatar, and GitHub through `gh` for plain-email authors), Tree/Flat file list, Unified/Split diff (both remembered), line comments, and right-click checkout, merge, rebase, push and more, always asking before anything destructive. Feature inventory and architecture: `docs/feature-spec.md`.
+Also: a **Pull (rebase)** button, the last project reopens at start, a Graph size setting, author pictures (Gravatar, and GitHub through `gh` for plain-email authors), Tree/Flat file list, Unified/Split diff (both remembered), line comments, and right-click checkout, merge, rebase, push and more, always asking before anything destructive. Feature inventory and architecture: `docs/feature-spec.md`.
 
 ## Build and run
 
@@ -100,7 +100,7 @@ and `cargo run -p gitgui-app -- [PATH]` for the window.
 
 Left to right: **projects** | **graph** | **file pane**. Both dividers drag to resize.
 
-- **Projects:** *Open Folder…* (Cmd-O) adds a repository (a folder inside one adds the repo). Kept between launches; hover a row and click × to remove.
+- **Projects:** *Clone…* (Cmd-Shift-O) clones from an https, ssh (`git@host:owner/repo.git`) or git address into a folder you pick, then opens it; it uses the credentials your git already has and never asks for a password. *Open Folder…* (Cmd-O) adds a repository (a folder inside one adds the repo). Kept between launches; hover a row and click × to remove.
 - **Local changes** list under the open project, staged and not: click one to see its diff, hover for **+** / **−** to stage or unstage (or a whole group). The box below commits what is staged (or everything, when nothing is), Enter to commit.
 - **Graph:** Sourcetree-style table.
   - Each branch is one line with one color from its tip down to the commit it was branched from. Lines are not bent into their parent early, so the fork point is visible.

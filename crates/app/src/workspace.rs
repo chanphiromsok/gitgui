@@ -709,7 +709,7 @@ impl Workspace {
         .detach();
     }
 
-    fn fail(&mut self, message: impl std::fmt::Display, cx: &mut Context<Self>) {
+    pub(crate) fn fail(&mut self, message: impl std::fmt::Display, cx: &mut Context<Self>) {
         self.notice = Some(Notice::warn(message.to_string()));
         cx.notify();
     }
@@ -1446,7 +1446,7 @@ impl Workspace {
         self.store.as_ref().map(Store::dir)
     }
 
-    fn save_settings(&mut self) {
+    pub(crate) fn save_settings(&mut self) {
         if let Some(store) = &self.store
             && let Err(err) = store.save_settings(&self.settings)
         {
@@ -1916,16 +1916,26 @@ impl Workspace {
             .bg(rgb(t().panel))
             .child(
                 div()
-                    .h(px(34.))
                     .flex_none()
                     .px_3()
+                    .py_2()
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap_2()
                     .border_b_1()
                     .border_color(rgb(t().border))
                     .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().muted)).child("PROJECTS"))
-                    .child(button("open-folder", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx)))),
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(button("open-folder", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))))
+                            .child(
+                                button("clone-repo", "Clone…")
+                                    .debug_selector(|| "clone-repo".to_owned())
+                                    .on_click(cx.listener(|this, _, window, cx| this.start_clone(window, cx))),
+                            ),
+                    ),
             )
             .child(div().id("projects").flex_1().overflow_y_scroll().children(rows).when(self.projects.is_empty(), |list| {
                 list.child(
@@ -1996,7 +2006,13 @@ impl Workspace {
                     .items_center()
                     .gap_3()
                     .child(div().text_color(rgb(t().muted)).child("Pick a project, or open a folder to see its history."))
-                    .child(button("open-folder-empty", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx)))),
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(button("open-folder-empty", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))))
+                            .child(button("clone-empty", "Clone Repository…").on_click(cx.listener(|this, _, window, cx| this.start_clone(window, cx)))),
+                    ),
             );
         };
         match &repo.phase {
