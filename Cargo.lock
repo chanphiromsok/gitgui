@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "gitgui-app"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "gitgui-core",
  "gitgui-store",
@@ -2090,18 +2090,18 @@ dependencies = [
 
 [[package]]
 name = "gitgui-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "gitgui-core",
 ]
 
 [[package]]
 name = "gitgui-core"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "gitgui-store"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
