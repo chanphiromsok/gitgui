@@ -288,6 +288,10 @@ pub fn file_row(
 }
 
 /// "(Deleted)" after the name of a file the commit removed.
+pub fn added_tag() -> impl IntoElement {
+    div().flex_none().text_xs().text_color(rgb(t().added)).child("(New file)")
+}
+
 pub fn deleted_tag() -> impl IntoElement {
     div().flex_none().text_xs().text_color(rgb(t().removed)).child("(Deleted)")
 }

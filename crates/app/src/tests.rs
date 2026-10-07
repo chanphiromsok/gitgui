@@ -1541,6 +1541,8 @@ async fn flat_and_split_are_remembered_for_the_next_start(cx: &mut TestAppContex
         ws.repo.as_ref().unwrap().file_rows.iter().all(|row| matches!(row, gitgui_core::TreeRow::File { .. }))
     });
     assert!(flat, "no folder rows in a flat list");
+    // (A new file has one side only, so it is shown as one column; this commit changes an existing file.)
+    select(&ws, cx, "feat: x2");
     ws.update(cx, |ws, cx| ws.open_file(0, cx));
     cx.run_until_parked();
     let has_pairs = ws.read_with(cx, |ws, _| {
@@ -1886,22 +1888,24 @@ async fn long_lines_scroll_sideways_and_the_minimap_jumps_to_a_block(cx: &mut Te
     cx.run_until_parked();
     draw(cx, &ws);
 
-    // The rows are as wide as the longest line, not as wide as the pane.
+    // A line longer than the pane can be scrolled to: the code has more to show than fits.
     let pane = cx.debug_bounds("minimap").expect("the minimap is drawn");
-    let rows = cx.debug_bounds("diff-list").expect("the rows are drawn");
-    assert!(rows.size.width > px(300. * 7.), "wide enough for 300 columns, was {:?}", rows.size.width);
-    assert!(rows.size.width > pane.origin.x, "wider than the area it sits in, so it scrolls sideways");
+    let fits = ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        (file.content_w.get(), f32::from(file.diff_bounds.get().size.width))
+    });
+    assert!(fits.0 > fits.1, "300 columns are wider than the pane: {fits:?}");
 
     // A sideways scroll over the code moves it.
-    let before = cx.debug_bounds("diff-list").unwrap().origin.x;
+    let x = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().scroll_x.get());
+    assert_eq!(x(cx), 0.);
     cx.simulate_event(gpui::ScrollWheelEvent {
         position: point(pane.origin.x - px(300.), pane.origin.y + px(200.)),
         delta: gpui::ScrollDelta::Pixels(point(px(-250.), px(0.))),
         ..Default::default()
     });
     draw(cx, &ws);
-    let after = cx.debug_bounds("diff-list").unwrap().origin.x;
-    assert!(after < before - px(100.), "the code moved left: {before:?} → {after:?}");
+    assert!(x(cx) > 100., "the code moved: {}", x(cx));
 
     // Two changes, far apart: two ticks (a removed line and an added one each, merged by split view or not).
     let ticks = ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().minimap.marks.len());
@@ -2199,4 +2203,63 @@ async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_win
     ws.update(cx, |ws, cx| ws.back(cx));
     draw(cx, &ws);
     assert_eq!(cx.debug_bounds("diff-list").unwrap().origin.x, before_x, "the sidebar and graph come back");
+}
+
+#[gpui::test]
+async fn hidden_panels_leave_a_strip_that_brings_them_back_and_the_file_list_resizes(cx: &mut TestAppContext) {
+    use crate::workspace::{FILES_MAX, FILES_MIN, Panel};
+    let fx = merged_pr("panels");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "feat: x2");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let list_x = |cx: &mut VisualTestContext| cx.debug_bounds("diff-list").unwrap();
+    let narrow = list_x(cx).size.width;
+
+    // The file list's divider drags it wider and narrower, within limits.
+    ws.update(cx, |ws, cx| ws.begin_resize(Splitter::Files, cx));
+    let left = ws.read_with(cx, |ws, _| ws.files_left.get());
+    drag_to(&ws, cx, left + 330., Some(MouseButton::Left));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.files_width), 330.);
+    drag_to(&ws, cx, left + 5., Some(MouseButton::Left));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.files_width), FILES_MIN);
+    drag_to(&ws, cx, left + 5000., Some(MouseButton::Left));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.files_width), FILES_MAX);
+    ws.update(cx, |ws, cx| ws.end_resize(cx));
+    ws.update(cx, |ws, cx| ws.begin_resize(Splitter::Files, cx));
+    drag_to(&ws, cx, left + 230., Some(MouseButton::Left));
+    ws.update(cx, |ws, cx| ws.end_resize(cx));
+
+    // Hide the graph: the file pane takes the width, a strip stands where the graph was, and pointing at the
+    // strip slides the graph in over the code until the pointer leaves.
+    ws.update(cx, |ws, cx| ws.toggle_graph_hidden(cx));
+    draw(cx, &ws);
+    assert!(list_x(cx).size.width > narrow * 1.25, "the code has the graph's room too");
+    assert!(cx.debug_bounds("graph-rail").is_some(), "a strip stands where the graph was");
+    assert_eq!(ws.read_with(cx, |ws, _| ws.peek), None);
+    ws.update(cx, |ws, cx| ws.peek_panel(Panel::Graph, cx));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("graph-peek").is_some(), "the graph is shown over the code");
+    ws.update(cx, |ws, cx| ws.unpeek(Panel::Graph, cx));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.peek), None);
+    // Unpeeking something that is not showing does nothing.
+    ws.update(cx, |ws, cx| ws.peek_panel(Panel::Files, cx));
+    ws.update(cx, |ws, cx| ws.unpeek(Panel::Graph, cx));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.peek), Some(Panel::Files));
+    ws.update(cx, |ws, cx| ws.toggle_graph_hidden(cx));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.peek), None, "showing a panel puts the peek away");
+
+    // The same for the file list and the sidebar.
+    ws.update(cx, |ws, cx| ws.toggle_files_visible(cx));
+    ws.update(cx, |ws, cx| ws.toggle_sidebar(cx));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("files-rail").is_some() && cx.debug_bounds("sidebar-rail").is_some());
+    ws.update(cx, |ws, cx| ws.peek_panel(Panel::Files, cx));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("files-peek").is_some());
+    ws.update(cx, |ws, cx| ws.peek_panel(Panel::Sidebar, cx));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("sidebar-peek").is_some());
 }

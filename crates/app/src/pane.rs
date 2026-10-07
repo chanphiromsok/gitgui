@@ -8,10 +8,9 @@ use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::
 use crate::changes::WORKTREE;
 use crate::detail::file_row;
 use crate::ui::{MONO, button};
-use crate::workspace::{Phase, Workspace};
+use crate::workspace::{Panel, Phase, Splitter, Workspace};
 use crate::theme::t;
 
-const FILES_WIDTH: f32 = 230.0;
 
 impl Workspace {
     /// `width` is used beside the graph; in full view the pane fills the area instead.
@@ -19,6 +18,8 @@ impl Workspace {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Some(commit) = repo.commit.as_ref() else { return div().into_any_element() };
         let expanded = repo.expanded;
+        // Beside the graph unless the graph is hidden (by hand, or in full view): then the pane fills the area.
+        let fill = expanded || self.graph_hidden;
         // The working tree's files are listed in the sidebar, under the project.
         let work = commit.id == WORKTREE;
         let files_visible = repo.files_visible && !work;
@@ -41,9 +42,20 @@ impl Workspace {
             .gap_2()
             .border_b_1()
             .border_color(rgb(t().border))
+            // With the graph hidden its header, and the sidebar button in it, is gone: keep one here.
+            .when(self.graph_hidden && !expanded, |header| header.child(self.sidebar_button(cx)))
+            .when(!expanded, |header| {
+                header.child(
+                    button("toggle-graph", "Graph")
+                        .debug_selector(|| "toggle-graph".to_owned())
+                        .when(!self.graph_hidden, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_graph_hidden(cx))),
+                )
+            })
             .when(!work, |header| {
                 header.child(
                     button("toggle-files", "Files")
+                        .debug_selector(|| "toggle-files".to_owned())
                         .when(files_visible, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_files_visible(cx))),
                 )
@@ -70,6 +82,14 @@ impl Workspace {
             Phase::Failed(message) => text_panel(message.clone(), t().removed),
             Phase::Ready(_) => {
                 let files = files_visible.then(|| self.render_files_column(cx));
+                let files_divider = files_visible.then(|| self.splitter("files-divider", Splitter::Files, cx));
+                // Hidden, the file list can be reached by pointing at the left edge of the code.
+                let files_hidden = !files_visible && !work && repo.file.is_some();
+                let files_rail = files_hidden.then(|| self.rail("files-rail", Panel::Files, None, cx));
+                let files_peek = (files_hidden && self.peek == Some(Panel::Files)).then(|| {
+                    let content = self.render_files_column(cx);
+                    self.peeking("files-peek", Panel::Files, 0., self.files_width, content, cx)
+                });
                 let content = if repo.file.is_some() {
                     self.render_diff(window, cx)
                 } else if work {
@@ -82,9 +102,13 @@ impl Workspace {
                 };
                 div()
                     .size_full()
+                    .relative()
                     .flex()
                     .children(files)
+                    .children(files_divider)
+                    .children(files_rail)
                     .child(div().flex_1().min_w_0().h_full().child(content))
+                    .children(files_peek)
                     .into_any_element()
             }
         };
@@ -96,7 +120,7 @@ impl Workspace {
             .bg(rgb(t().bg))
             .child(header)
             .child(div().flex_1().min_h_0().child(body));
-        if expanded {
+        if fill {
             pane.flex_1().min_w_0().border_l_1().border_color(rgb(t().border)).into_any_element()
         } else {
             pane.flex_none().w(px(width)).into_any_element()
@@ -119,15 +143,16 @@ impl Workspace {
                 .on_click(cx.listener(move |workspace, _, _, cx| workspace.set_layout(this, cx)))
         };
 
+        let left = self.files_left.clone();
         div()
-            .w(px(FILES_WIDTH))
+            .w(px(self.files_width))
             .flex_none()
             .h_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(t().panel))
-            .border_r_1()
-            .border_color(rgb(t().border))
+            .child(gpui::canvas(move |bounds, _, _| left.set(f32::from(bounds.origin.x)), |_, _, _, _| {}).absolute().size_full())
             .child(
                 div()
                     .flex_none()

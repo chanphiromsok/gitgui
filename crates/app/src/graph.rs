@@ -411,7 +411,8 @@ pub fn columns(graph_width: f32, cols: Columns) -> impl IntoElement {
         .bg(rgb(t().panel))
         .border_b_1()
         .border_color(rgb(t().border))
-        .child(cell("Graph").w(px(graph_width)))
+        // The title is dropped when the drawing is too narrow for it, instead of wrapping letter by letter.
+        .child(cell(if graph_width >= 56. { "Graph" } else { "" }).w(px(graph_width)).flex_none().overflow_hidden().whitespace_nowrap())
         .child(cell("Description").flex_1().min_w_0())
         .when(cols.date != DateStyle::Hidden, |row| row.child(cell("Date").w(px(cols.date_width()))))
         .when(cols.author, |row| row.child(cell("Author").w(px(Columns::AUTHOR_W))))

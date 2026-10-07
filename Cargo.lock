@@ -2056,6 +2056,8 @@ dependencies = [
  "gitgui-store",
  "gpui",
  "image",
+ "objc",
+ "raw-window-handle",
  "resvg",
  "serde",
  "serde_json",

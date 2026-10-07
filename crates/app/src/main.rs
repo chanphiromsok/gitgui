@@ -17,7 +17,9 @@ mod minimap;
 mod pane;
 mod preview;
 mod rows;
+mod script;
 mod settings_view;
+mod snapshot;
 mod syntax;
 #[cfg(test)]
 mod tests;
@@ -92,6 +94,10 @@ fn main() {
             )
             .expect("could not open the window");
         let workspace = window.update(cx, |_, _, cx| cx.entity()).expect("the window was just opened");
+        // A development aid: drive the window through a script and save pictures of it.
+        if let Ok(script) = std::env::var("GITGUI_SCRIPT") {
+            script::run(window, script, cx);
+        }
 
         let target = workspace.clone();
         cx.on_action(move |_: &OpenFolder, cx| target.update(cx, |this, cx| this.open_folder(cx)));

@@ -241,6 +241,9 @@ pub struct FileState {
     pub scroll_x: std::cell::Cell<f32>,
     pub content_w: std::cell::Cell<f32>,
     pub diff_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
+    /// The file is new or deleted, so there is only one side to show: it is drawn as one column whatever
+    /// the diff mode is, instead of beside an empty half.
+    pub single_column: bool,
 }
 
 impl FileState {
@@ -263,14 +266,20 @@ impl FileState {
             scroll_x: Default::default(),
             content_w: Default::default(),
             diff_bounds: Default::default(),
+            single_column: false,
         }
+    }
+
+    /// How this file is laid out: the mode asked for, except one column for a new or deleted file.
+    pub fn mode(&self, wanted: Mode) -> Mode {
+        if self.single_column { Mode::Unified } else { wanted }
     }
 
     /// Rebuilds the rows from the diff, comments and composer. Scroll stays where it was unless
     /// the whole layout changed (a different mode).
     pub fn rebuild(&mut self, mode: Mode, keep_scroll: bool) {
         let top = self.list.logical_scroll_top();
-        self.rows = display_rows(&self.diff, mode, &self.comments, self.composing);
+        self.rows = display_rows(&self.diff, self.mode(mode), &self.comments, self.composing);
         self.minimap = crate::minimap::build(&self.diff, &self.rows, crate::diff_view::LINE_H);
         self.max_cols = self
             .diff
@@ -370,7 +379,22 @@ impl RepoState {
 pub enum Splitter {
     Sidebar,
     Pane,
+    /// Between the changed-files column and the diff.
+    Files,
 }
+
+/// A panel that can be hidden and still reached: pointing at its edge slides it back over the content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    Sidebar,
+    Graph,
+    Files,
+}
+
+/// How wide the changed-files column starts, and the least and most it may be dragged to.
+pub const FILES_WIDTH: f32 = 230.;
+pub const FILES_MIN: f32 = 150.;
+pub const FILES_MAX: f32 = 520.;
 
 gpui::actions!(workspace, [PreviousFile, NextFile]);
 
@@ -392,6 +416,13 @@ pub struct Workspace {
     pub dialog_input: Entity<TextInput>,
     pub settings: Settings,
     pub settings_open: bool,
+    /// The hidden panel that is showing over the content because the pointer is at its edge.
+    pub peek: Option<Panel>,
+    /// The graph is hidden while a commit is open, leaving the file pane the whole width.
+    pub graph_hidden: bool,
+    /// The changed-files column's width, and where it was last drawn (for dragging its divider).
+    pub files_width: f32,
+    pub files_left: std::rc::Rc<std::cell::Cell<f32>>,
     /// The page of the settings window that is showing.
     pub settings_page: crate::settings_view::SettingsPage,
     /// Every color theme found, built in first.
@@ -626,6 +657,10 @@ impl Workspace {
             dialog_input,
             settings,
             settings_open: false,
+            peek: None,
+            graph_hidden: false,
+            files_width: FILES_WIDTH,
+            files_left: Default::default(),
             settings_page: crate::settings_view::SettingsPage::Graph,
             menu: None,
             dialog: None,
@@ -697,6 +732,9 @@ impl Workspace {
             Splitter::Pane => {
                 let sidebar = self.shown_sidebar_width(total, pane_open);
                 self.pane_width = Some(layout::pane_at(x, total, sidebar));
+            }
+            Splitter::Files => {
+                self.files_width = (x - self.files_left.get()).clamp(FILES_MIN, FILES_MAX);
             }
         }
         cx.notify();
@@ -1127,6 +1165,8 @@ impl Workspace {
         let Phase::Ready(view) = &commit.phase else { return };
         let Some(change) = view.files.get(index).cloned() else { return };
         let (path, id) = (repo.project.path.clone(), commit.id.clone());
+        // A new or deleted file has one side only.
+        let single_column = matches!(change.status, FileStatus::Added | FileStatus::Deleted);
         let read_path = path.clone();
         let read_id = id.clone();
         let read_change = change.clone();
@@ -1219,6 +1259,7 @@ impl Workspace {
                         file.diff = diff;
                         file.colors = colors;
                         file.images = images;
+                        file.single_column = single_column;
                         file.phase = Phase::Ready(());
                         file.rebuild(mode, keep_scroll);
                     }
@@ -1301,6 +1342,80 @@ impl Workspace {
             repo.expanded = !repo.expanded;
             cx.notify();
         }
+    }
+
+    /// The pointer is at the edge of a hidden panel: show it over the content.
+    pub fn peek_panel(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        if self.peek != Some(panel) {
+            self.peek = Some(panel);
+            cx.notify();
+        }
+    }
+
+    /// The pointer left the panel that was showing over the content.
+    pub fn unpeek(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        if self.peek == Some(panel) {
+            self.peek = None;
+            cx.notify();
+        }
+    }
+
+    /// Hides or shows the graph while a commit is open.
+    pub fn toggle_graph_hidden(&mut self, cx: &mut Context<Self>) {
+        self.graph_hidden = !self.graph_hidden;
+        self.peek = None;
+        cx.notify();
+    }
+
+    /// A thin strip standing where a hidden panel was; pointing at it slides the panel in over the content.
+    /// It takes a few pixels of its own, so it never covers anything. `drag` makes it also start that divider's
+    /// drag (the sidebar's rail is where the sidebar's divider is, to drag it back out).
+    pub(crate) fn rail(&self, id: &'static str, panel: Panel, drag: Option<Splitter>, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .flex_none()
+            .w(px(10.))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.peek_panel(panel, cx);
+                }
+            }))
+            .when_some(drag, |rail, which| {
+                rail.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.begin_resize(which, cx)))
+            })
+            // A hairline so there is something to find, which brightens under the pointer.
+            .child(div().w(px(2.)).h_full().bg(rgb(t().border)).hover(|line| line.bg(rgb(t().accent))))
+            .into_any_element()
+    }
+
+    /// A hidden panel slid in over the content, until the pointer leaves it.
+    pub(crate) fn peeking(&self, id: &'static str, panel: Panel, left: f32, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id(id)
+            .debug_selector(move || id.to_owned())
+            .absolute()
+            .left(px(left))
+            .top_0()
+            .bottom_0()
+            .w(px(width))
+            .flex()
+            .bg(rgb(t().panel))
+            .border_r_1()
+            .border_color(rgb(t().border))
+            .shadow_lg()
+            .occlude()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.unpeek(panel, cx);
+                }
+            }))
+            .child(content)
+            .into_any_element()
     }
 
     /// Full view of the file pane, if it is not already.
@@ -1753,7 +1868,19 @@ impl Render for Workspace {
         let sidebar_width = if reading { 0. } else { self.shown_sidebar_width(total, pane_open) };
         // A hidden sidebar leaves its divider at the window's edge, to drag it back out.
         let sidebar = (sidebar_width > 0.).then(|| self.render_sidebar(sidebar_width, cx));
-        let divider = (!reading).then(|| self.splitter("sidebar-divider", Splitter::Sidebar, cx));
+        // Hidden, the sidebar can still be reached by pointing at the window's left edge, where a thin strip
+        // stands in for its divider.
+        let sidebar_hidden = sidebar_width <= 0. && self.repo.is_some();
+        let divider = if sidebar_hidden {
+            Some(self.rail("sidebar-rail", Panel::Sidebar, Some(Splitter::Sidebar), cx))
+        } else {
+            (!reading).then(|| self.splitter("sidebar-divider", Splitter::Sidebar, cx))
+        };
+        let peek_width = layout::sidebar_width(self.sidebar_width, total, pane_open);
+        let sidebar_peek = (sidebar_hidden && self.peek == Some(Panel::Sidebar)).then(|| {
+            let content = self.render_sidebar(peek_width, cx);
+            self.peeking("sidebar-peek", Panel::Sidebar, 0., peek_width, content, cx)
+        });
 
         div()
             .relative()
@@ -1790,6 +1917,7 @@ impl Render for Workspace {
                     .child(div().flex_1().min_h_0().child(self.render_main(window, sidebar_width, total, cx)))
                     .children(self.render_notice(cx)),
             )
+            .children(sidebar_peek)
             .children(self.render_overlays(window, cx))
     }
 }
@@ -1830,7 +1958,7 @@ impl Workspace {
     }
 
     /// The button that shows or hides the sidebar: a window with its left panel filled in while shown.
-    fn sidebar_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub(crate) fn sidebar_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let shown = self.sidebar_shown();
         div()
             .id("toggle-sidebar")
@@ -2052,15 +2180,26 @@ impl Workspace {
             Phase::Ready(_) => {
                 let pane_open = repo.commit.is_some();
                 let expanded = repo.expanded && pane_open;
+                // The graph steps aside in full view, and when it was hidden by hand.
+                let graph_gone = pane_open && (expanded || self.graph_hidden);
                 // While a file is open the code gets most of the width, unless the pane was dragged to a width.
                 let share = if repo.file.is_some() { layout::PANE_SHARE_READING } else { layout::PANE_SHARE };
                 let width = layout::pane_width(self.pane_width.or(Some((total - sidebar_width) * share)), total, sidebar_width);
                 // What is left for the graph beside the sidebar and the file pane (and its divider).
                 let area = total - sidebar_width - if pane_open { width + 6. } else { 0. };
-                let middle = (!expanded).then(|| self.render_middle(area, cx));
-                let divider = (pane_open && !expanded).then(|| self.splitter("pane-divider", Splitter::Pane, cx));
+                let middle = (!graph_gone).then(|| self.render_middle(area, cx));
+                let divider = (pane_open && !graph_gone).then(|| self.splitter("pane-divider", Splitter::Pane, cx));
                 let pane = pane_open.then(|| self.render_pane(window, width, cx));
-                div().size_full().flex().children(middle).children(divider).children(pane).into_any_element()
+                // Hidden by hand, the graph can be reached by pointing at the left edge of the file pane (in full
+                // view the sidebar's edge is the one in the corner).
+                let by_hand = pane_open && !expanded && self.graph_hidden;
+                let rail = by_hand.then(|| self.rail("graph-rail", Panel::Graph, None, cx));
+                let peek = (by_hand && self.peek == Some(Panel::Graph)).then(|| {
+                    let wide = (total - sidebar_width - 120.).clamp(320., 600.);
+                    let content = div().w(px(wide)).h_full().flex().flex_col().child(self.render_middle(wide, cx)).into_any_element();
+                    self.peeking("graph-peek", Panel::Graph, 0., wide, content, cx)
+                });
+                div().size_full().relative().flex().children(middle).children(divider).children(rail).children(pane).children(peek).into_any_element()
             }
         }
     }
@@ -2072,6 +2211,9 @@ impl Workspace {
 
         let current = match &view.current_branch {
             Some(name) => div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
                 .flex()
                 .items_center()
                 .gap_2()
@@ -2082,6 +2224,7 @@ impl Workspace {
             None => div().text_color(rgb(t().warning)).child("HEAD is detached"),
         };
         let header = div()
+            .overflow_hidden()
             .h(px(34.))
             .flex_none()
             .px_3()
@@ -2122,13 +2265,13 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(header)
-            .child(self.render_filter_bar(repo, view, cx))
+            .child(self.render_filter_bar(repo, view, area < 640., cx))
             .child(self.render_graph(area, cx))
             .into_any_element()
     }
 
     /// Which branches the graph shows, whether merged ones are left out, and the search box.
-    fn render_filter_bar(&self, repo: &RepoState, view: &RepoView, cx: &mut Context<Self>) -> AnyElement {
+    fn render_filter_bar(&self, repo: &RepoState, view: &RepoView, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
         let filter = &repo.graph_filter;
         let scope = filter.scope;
         let segment = |id: &'static str, label: &'static str, this: Scope| {
@@ -2142,7 +2285,7 @@ impl Workspace {
             .flex_none()
             .rounded_sm()
             .overflow_hidden()
-            .child(segment("scope-current", "Current branch", Scope::Current))
+            .child(segment("scope-current", if narrow { "Current" } else { "Current branch" }, Scope::Current))
             .child(segment("scope-local", "Local", Scope::Local))
             .child(segment("scope-all", "All", Scope::All));
 
@@ -2151,13 +2294,18 @@ impl Workspace {
         let hide_merged = bar_checkbox(
             "hide-merged",
             hide,
-            if view.scanning { "Hide merged (checking…)".to_owned() } else { format!("Hide merged ({merged})") },
+            match (view.scanning, narrow) {
+                (true, true) => "Merged…".to_owned(),
+                (true, false) => "Hide merged (checking…)".to_owned(),
+                (false, true) => format!("Merged ({merged})"),
+                (false, false) => format!("Hide merged ({merged})"),
+            },
             cx.listener(|this, _, _, cx| this.toggle_hide_merged(cx)),
         );
         let stashes = bar_checkbox(
             "show-stashes",
             !filter.hide_stashes,
-            format!("Stashes ({})", view.stashes),
+            if narrow { format!("Stash ({})", view.stashes) } else { format!("Stashes ({})", view.stashes) },
             cx.listener(|this, _, _, cx| this.toggle_stashes(cx)),
         );
 
@@ -2175,7 +2323,7 @@ impl Workspace {
         };
         let search = div()
             .flex_1()
-            .min_w(px(160.))
+            .min_w(px(if narrow { 70. } else { 160. }))
             .max_w(px(420.))
             .overflow_hidden()
             .child(self.search_input.clone());
@@ -2188,6 +2336,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_3()
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(t().border))
             .child(scopes)

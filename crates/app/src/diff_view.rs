@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use crate::changes::WORKTREE;
-use crate::detail::{deleted_tag, stats, status_color};
+use crate::detail::{added_tag, deleted_tag, stats, status_color};
 use crate::icons;
 use crate::rows::{Anchor, DisplayRow, Mode, Notice, anchor_of};
 use crate::preview::{self, Images, Preview};
@@ -47,7 +47,7 @@ impl Workspace {
             Some(old) => format!("{old} → {}", change.path),
             None => change.path.clone(),
         };
-        let mode = repo.mode;
+        let mode = file.mode(repo.mode);
         let count = file.comments.len();
 
         let toggle = |id: &'static str, label: &'static str, this: Mode| {
@@ -67,7 +67,18 @@ impl Workspace {
             .border_color(rgb(t().border))
             .child(button("overview", "Overview").on_click(cx.listener(|this, _, _, cx| this.close_file(cx))))
             .child(ui::file_icon(icons::file(change.path.rsplit('/').next().unwrap_or(&change.path))))
-            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(status_color(change.status)).child(SharedString::from(title)))
+            .child(
+                // A long path gives way to the buttons beside it, ending in an ellipsis.
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(status_color(change.status))
+                    .child(SharedString::from(title)),
+            )
+            .when(change.status == FileStatus::Added, |bar| bar.child(added_tag()))
             .when(change.status == FileStatus::Deleted, |bar| bar.child(deleted_tag()))
             .child(stats(change))
             .child(
@@ -77,7 +88,8 @@ impl Workspace {
                     n => format!("{n} comments"),
                 }),
             )
-            .when(!file.diff.binary && !file.diff.hunks.is_empty(), |bar| {
+            // A new or deleted file is shown whole already: there is nothing more to show.
+            .when(!file.diff.binary && !file.diff.hunks.is_empty() && !file.single_column, |bar| {
                 bar.child(
                     div()
                         .flex()
@@ -128,19 +140,15 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The rows, wide enough for the longest line and scrolling sideways when that is wider than the
-    /// pane, with the minimap over the right edge.
+    /// The rows, scrolling sideways when a line is longer than the pane, with the minimap over the right edge.
     fn diff_body(&self, file: &crate::workspace::FileState, mode: Mode, cx: &mut Context<Self>) -> AnyElement {
-        // Gutters and the "+" cell, then the code. In split view each side has its own.
-        let side = |gutter_cols: f32| 18. + (gutter_cols + 3. + file.max_cols as f32) * CHAR_W + 24.;
-        let width = match mode {
-            Mode::Unified => side(11.),
-            Mode::Split => 2. * side(5.),
+        // What the longest line needs beside the gutter, in each layout.
+        let gutter_cols = match mode {
+            Mode::Unified => 11.,
+            Mode::Split => 5.,
         };
+        file.content_w.set((gutter_cols + 3. + file.max_cols as f32) * CHAR_W + 24.);
         let rows = list(file.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx))).size_full();
-        file.content_w.set(width);
-        let viewport = f32::from(file.diff_bounds.get().size.width);
-        let offset = file.scroll_x.get().clamp(0., (width - viewport).max(0.));
         let bounds = file.diff_bounds.clone();
         // Sideways scrolling is done here, not by the pane, so the two directions do not fight: a swipe that
         // is mostly sideways moves the code sideways only, and one that is mostly down only scrolls down.
@@ -150,17 +158,7 @@ impl Workspace {
             .relative()
             .overflow_hidden()
             .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
-            .child(
-                div()
-                    .debug_selector(|| "diff-list".to_owned())
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(px(-offset))
-                    .w(px(width))
-                    .min_w_full()
-                    .child(rows),
-            )
+            .child(div().debug_selector(|| "diff-list".to_owned()).size_full().child(rows))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| this.scroll_diff_sideways(event, cx)));
         div().size_full().relative().child(scrolling).child(self.minimap(file, cx)).into_any_element()
     }
@@ -179,7 +177,8 @@ impl Workspace {
             file.list.scroll_by(delta.y);
         }
         let amount = if event.modifiers.shift && dx == 0. { dy } else { dx };
-        let most = (file.content_w.get() - f32::from(file.diff_bounds.get().size.width)).max(0.);
+        let mode = file.mode(self.repo.as_ref().map_or(Mode::Unified, |repo| repo.mode));
+        let most = max_scroll_x(file, mode);
         file.scroll_x.set((file.scroll_x.get() - amount).clamp(0., most));
         cx.stop_propagation();
         cx.notify();
@@ -304,19 +303,20 @@ impl Workspace {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Some(file) = repo.file.as_ref() else { return div().into_any_element() };
         let Some(row) = file.rows.get(ix).copied() else { return div().into_any_element() };
-        let mode = repo.mode;
+        let mode = file.mode(repo.mode);
+        let sx = file.scroll_x.get().clamp(0., max_scroll_x(file, mode));
         // Uncommitted lines have no commit to hang a comment on.
         let comments = repo.commit.as_ref().is_some_and(|commit| commit.id != WORKTREE);
 
         match row {
-            DisplayRow::Hunk(h) => hunk_header(h, &file.diff.hunks[h].header, file.context < WHOLE_FILE, cx),
+            DisplayRow::Hunk(h) => hunk_header(h, &file.diff.hunks[h].header, file.context < WHOLE_FILE && !file.single_column, cx),
             DisplayRow::Line { hunk, line } => {
                 let line = &file.diff.hunks[hunk].lines[line];
-                unified_line(ix, line, file.colors.of(line), comments, cx)
+                unified_line(ix, line, file.colors.of(line), comments, sx, cx)
             }
             DisplayRow::Pair { hunk, left, right } => {
                 let lines = &file.diff.hunks[hunk].lines;
-                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, cx)
+                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, sx, cx)
             }
             DisplayRow::Comment(i) => match file.comments.get(i) {
                 Some(comment) => comment_card(ix, comment, mode, cx),
@@ -367,6 +367,17 @@ impl Workspace {
             )
             .into_any_element()
     }
+}
+
+/// How far the code can be scrolled sideways: what the longest line needs, less the room there is for code
+/// (beside the "+" and, in split view, in each half).
+fn max_scroll_x(file: &crate::workspace::FileState, mode: Mode) -> f32 {
+    let viewport = f32::from(file.diff_bounds.get().size.width);
+    let room = match mode {
+        Mode::Unified => viewport - 18. - MINIMAP_W,
+        Mode::Split => viewport / 2. - 18.,
+    };
+    (file.content_w.get() - room).max(0.)
 }
 
 /// Where a comment card starts: under the code in unified view, past the gutters.
@@ -554,7 +565,7 @@ fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str, spans: &[Spa
     StyledText::new(text).with_highlights(highlights)
 }
 
-fn unified_line(ix: usize, line: &DiffLine, spans: &[Span], comments: bool, cx: &mut Context<Workspace>) -> AnyElement {
+fn unified_line(ix: usize, line: &DiffLine, spans: &[Span], comments: bool, sx: f32, cx: &mut Context<Workspace>) -> AnyElement {
     let (sign, sign_color) = marker(line.kind);
     let gutter = format!("{} {}", column(line.old_no, 5), column(line.new_no, 5));
     div()
@@ -571,7 +582,7 @@ fn unified_line(ix: usize, line: &DiffLine, spans: &[Span], comments: bool, cx: 
         .text_xs()
         .child(plus(("plus", ix), anchor_of(line).filter(|_| comments), "diff-line", cx))
         .text_color(rgb(t().editor_fg))
-        .child(diff_text(&gutter, sign, sign_color, &line.text, spans))
+        .child(div().flex_none().ml(px(-sx)).child(diff_text(&gutter, sign, sign_color, &line.text, spans)))
         .into_any_element()
 }
 
@@ -581,6 +592,7 @@ fn split_row(
     right: Option<&DiffLine>,
     colors: &FileColors,
     comments: bool,
+    sx: f32,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let half = |left_side: bool, line: Option<&DiffLine>, cx: &mut Context<Workspace>| -> AnyElement {
@@ -596,7 +608,7 @@ fn split_row(
             .items_center()
             .when_some(line_bg(line.kind), |cell, bg| cell.bg(rgb(bg)))
             .child(plus((if left_side { "plus-l" } else { "plus-r" }, ix), anchor_of(line).filter(|_| comments), group, cx))
-            .child(diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side)))
+            .child(div().flex_none().ml(px(-sx)).child(diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side))))
             .into_any_element()
     };
 
