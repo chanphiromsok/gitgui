@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod backend;
+pub mod clone;
 pub mod diff;
 pub mod filter;
 pub mod graph;

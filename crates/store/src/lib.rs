@@ -56,6 +56,19 @@ pub enum DiffMode {
     Split,
 }
 
+/// Which commits in the graph are drawn with their author's picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GraphFaces {
+    /// The latest commit of each branch (and the one HEAD is on); the rest are plain dots.
+    #[default]
+    Tips,
+    /// Every commit.
+    All,
+    /// Only the commits of the branch line that is selected.
+    Selected,
+}
+
 /// Choices the user can change. Every field has a default, so a file written by an older version
 /// (with fewer fields) still loads, and a field this version does not know is ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +92,8 @@ pub struct Settings {
     pub diff_mode: DiffMode,
     /// The project that was open last, to open again on the next start.
     pub last_project: Option<PathBuf>,
+    /// Which commits in the graph show their author's picture.
+    pub graph_faces: GraphFaces,
     /// How large the graph is drawn (commit circles, lanes, row height), in percent. 100 is the default.
     pub graph_scale: u32,
 }
@@ -106,6 +121,7 @@ impl Default for Settings {
             file_layout: FileLayout::Tree,
             diff_mode: DiffMode::Unified,
             graph_scale: 100,
+            graph_faces: GraphFaces::Tips,
             last_project: None,
         }
     }
@@ -588,5 +604,16 @@ mod tests {
         assert_eq!(store.settings().unwrap().last_project, None);
         store.save_settings(&Settings { last_project: Some(PathBuf::from("/work/app")), ..Settings::default() }).unwrap();
         assert_eq!(scratch.store().settings().unwrap().last_project, Some(PathBuf::from("/work/app")));
+    }
+
+    #[test]
+    fn graph_faces_default_to_branch_tips_and_are_remembered() {
+        let scratch = Scratch::new("graph-faces");
+        let store = scratch.store();
+        assert_eq!(store.settings().unwrap().graph_faces, GraphFaces::Tips);
+        store.save_settings(&Settings { graph_faces: GraphFaces::Selected, ..Settings::default() }).unwrap();
+        assert_eq!(scratch.store().settings().unwrap().graph_faces, GraphFaces::Selected);
+        let text = fs::read_to_string(scratch.0.join("data/settings.json")).unwrap();
+        assert!(text.contains("\"selected\""), "readable in the file: {text}");
     }
 }

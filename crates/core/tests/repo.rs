@@ -893,6 +893,36 @@ fn pull_rebase_replays_local_commits_on_the_remotes_and_stops_cleanly_on_conflic
 }
 
 #[test]
+fn clone_copies_a_repository_by_address_and_refuses_what_could_run_a_program_or_overwrite() {
+    let source = trunk();
+    let url = format!("file://{}", source.path().display());
+    let parent = std::env::temp_dir().join(format!("gitgui-test-{}-clone-parent", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+
+    let dest = gitgui_core::clone::clone(&url, &parent, "copy").unwrap();
+    assert_eq!(dest, parent.join("copy"));
+    let log = GitCli::new(&dest).log(&LogOptions { max_count: Some(10), skip: 0 }).unwrap();
+    let source_log = GitCli::new(source.path()).log(&LogOptions { max_count: Some(10), skip: 0 }).unwrap();
+    assert_eq!(log.len(), source_log.len(), "the whole history came");
+
+    // A folder that is there is left alone.
+    let again = gitgui_core::clone::clone(&url, &parent, "copy");
+    assert!(matches!(again, Err(Error::Parse(ref m)) if m.contains("already exists")), "{again:?}");
+
+    // `ext::` would run a program; nothing is made, nothing runs.
+    let marker = parent.join("ran");
+    let evil = format!("ext::sh -c touch% {}", marker.display());
+    assert!(gitgui_core::clone::clone(&evil, &parent, "evil").is_err());
+    assert!(!marker.exists() && !parent.join("evil").exists());
+    // A failing address (nothing there) reports git's own words and leaves no folder.
+    let missing = format!("file://{}/no-such-repo", parent.display());
+    let failed = gitgui_core::clone::clone(&missing, &parent, "nothing");
+    assert!(matches!(failed, Err(Error::Git { .. })), "{failed:?}");
+    assert!(!parent.join("nothing").exists());
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
 fn option_shaped_names_never_reach_git_for_any_operation() {
     let repo = trunk();
     let git = GitCli::new(repo.path());

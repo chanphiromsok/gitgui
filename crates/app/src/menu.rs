@@ -15,7 +15,7 @@ use gpui::{
 use crate::rows::Mode;
 use crate::ui::button;
 use gitgui_core::Layout;
-use gitgui_store::{DiffMode, FileLayout};
+use gitgui_store::{DiffMode, FileLayout, GraphFaces};
 use crate::workspace::{Phase, Workspace};
 use crate::icons;
 use crate::theme::{Origin, t};
@@ -664,6 +664,7 @@ impl Workspace {
                 self.settings.graph_scale,
                 cx,
             ))
+            .child(faces_row(self.settings.graph_faces, cx))
             .child(choice_row(
                 "File list",
                 "How a commit's changed files are listed. Also the Tree / Flat buttons above the list.",
@@ -883,6 +884,34 @@ fn scale_row(title: &'static str, detail: &'static str, current: u32, cx: &mut C
         .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
         .child(div().text_xs().text_color(rgb(t().muted)).child(detail))
         .child(div().flex().flex_wrap().gap_1().children(buttons))
+        .into_any_element()
+}
+
+/// Which graph commits show their author's picture: three choices, the chosen one lit.
+fn faces_row(current: GraphFaces, cx: &mut Context<Workspace>) -> AnyElement {
+    let option = |id: &'static str, label: &'static str, faces: GraphFaces| {
+        button(id, label)
+            .when(faces == current, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_graph_faces(faces, cx)))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("Pictures in the graph"))
+        .child(div().text_xs().text_color(rgb(t().muted)).child(
+            "Which commits are drawn with their author's picture: the latest commit of each branch, every commit, \
+             or only the branch you have selected. The rest are plain dots.",
+        ))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .child(option("faces-tips", "Branch tips", GraphFaces::Tips))
+                .child(option("faces-all", "Every commit", GraphFaces::All))
+                .child(option("faces-selected", "Selected branch", GraphFaces::Selected)),
+        )
         .into_any_element()
 }
 

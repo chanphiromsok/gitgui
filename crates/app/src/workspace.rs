@@ -15,7 +15,7 @@ use gitgui_core::{
     MergeClue, Operation, Query, ScanCache, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count,
     visible_rows, people, web_remote,
 };
-use gitgui_store::{Comment, DiffMode, FileLayout, NewComment, Project, Settings, Store};
+use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, NewComment, Project, Settings, Store};
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, FontWeight, ListAlignment, ListState, MouseButton, MouseMoveEvent,
     PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
@@ -1582,6 +1582,15 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Which commits in the graph show their author's picture. Kept for the next launch.
+    pub fn set_graph_faces(&mut self, faces: GraphFaces, cx: &mut Context<Self>) {
+        if self.settings.graph_faces != faces {
+            self.settings.graph_faces = faces;
+            self.save_settings();
+            cx.notify();
+        }
+    }
+
     /// How large the graph is drawn, in percent. Kept for the next launch.
     pub fn set_graph_scale(&mut self, percent: u32, cx: &mut Context<Self>) {
         let percent = percent.clamp(gitgui_store::GRAPH_SCALE_MIN, gitgui_store::GRAPH_SCALE_MAX);
@@ -2191,14 +2200,24 @@ impl Workspace {
                     "commits",
                     count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                        // Authors' pictures first: asking for one needs the workspace, not just the rows.
-                        let emails: Vec<String> = match this.repo.as_ref().map(|repo| &repo.phase) {
-                            Some(Phase::Ready(view)) => {
-                                range.clone().filter_map(|ix| Some(view.entries.get(ix)?.person.avatar_email.clone())).collect()
+                        // Authors' pictures first: asking for one needs the workspace, not just the rows. Only the
+                        // rows that draw one ask: a plain dot has no use for a picture.
+                        let faces = this.settings.graph_faces;
+                        let emails: Vec<Option<String>> = match this.repo.as_ref().map(|repo| (&repo.phase, repo.selected)) {
+                            Some((Phase::Ready(view), selected)) => {
+                                let highlight = selected.and_then(|ix| view.entries.get(ix)).map(|entry| entry.row.lineage);
+                                range
+                                    .clone()
+                                    .map(|ix| {
+                                        let entry = view.entries.get(ix)?;
+                                        (cols.author || graph::shows_face(faces, entry, highlight)).then(|| entry.person.avatar_email.clone())
+                                    })
+                                    .collect()
                             }
                             _ => Vec::new(),
                         };
-                        let mut avatars: Vec<Avatar> = emails.iter().map(|email| this.avatar_for(email, cx)).collect();
+                        let mut avatars: Vec<Avatar> =
+                            emails.iter().map(|email| email.as_ref().map_or(Avatar::None, |email| this.avatar_for(email, cx))).collect();
                         avatars.reverse();
                         let Some(repo) = this.repo.as_ref() else { return Vec::new() };
                         let Phase::Ready(view) = &repo.phase else { return Vec::new() };
@@ -2218,6 +2237,7 @@ impl Workspace {
                                     selected == Some(ix),
                                     highlight,
                                     cols,
+                                    faces,
                                     density,
                                     cx,
                                 ))

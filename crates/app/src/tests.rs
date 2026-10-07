@@ -1975,3 +1975,47 @@ async fn the_date_gives_way_so_the_description_keeps_its_room(cx: &mut TestAppCo
     cx.draw(point(px(0.), px(0.)), size(AvailableSpace::Definite(px(900.)), AvailableSpace::Definite(px(600.))), move |_, _| view);
     assert!(cx.debug_bounds("row-0").is_some());
 }
+
+#[gpui::test]
+async fn pictures_in_the_graph_are_for_branch_tips_unless_the_setting_says_otherwise(cx: &mut TestAppContext) {
+    use gitgui_store::GraphFaces;
+    let fx = merged_pr("faces");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+
+    let faces = |cx: &VisualTestContext, highlight: Option<usize>| -> (usize, usize) {
+        ws.read_with(cx, |ws, _| {
+            let mode = ws.settings.graph_faces;
+            let Phase::Ready(view) = &ws.repo.as_ref().unwrap().phase else { panic!("not ready") };
+            let commits: Vec<_> = view.entries.iter().filter(|e| e.commit.is_some()).collect();
+            (commits.iter().filter(|e| crate::graph::shows_face(mode, e, highlight)).count(), commits.len())
+        })
+    };
+    assert_eq!(ws.read_with(cx, |ws, _| ws.settings.graph_faces), GraphFaces::Tips, "the default");
+    let (tips, all) = faces(cx, None);
+    assert!(tips >= 1 && tips < all, "only some commits have a picture: {tips} of {all}");
+    // Every shown picture is on a commit with a branch label, or the one HEAD is on.
+    ws.read_with(cx, |ws, _| {
+        let Phase::Ready(view) = &ws.repo.as_ref().unwrap().phase else { panic!() };
+        for entry in view.entries.iter().filter(|e| e.commit.is_some()) {
+            let tip = entry.labels.iter().any(|l| matches!(l.kind, gitgui_core::LabelKind::Branch | gitgui_core::LabelKind::RemoteBranch));
+            assert_eq!(crate::graph::shows_face(GraphFaces::Tips, entry, None), tip || entry.dot == crate::graph::Dot::Current);
+        }
+    });
+
+    ws.update(cx, |ws, cx| ws.set_graph_faces(GraphFaces::All, cx));
+    assert_eq!(faces(cx, None), (all, all));
+    assert_eq!(Store::at(fx.data()).settings().unwrap().graph_faces, GraphFaces::All, "kept for the next start");
+
+    ws.update(cx, |ws, cx| ws.set_graph_faces(GraphFaces::Selected, cx));
+    let (none, _) = faces(cx, None);
+    assert!(none <= 1, "with nothing selected only the commit HEAD is on has one: {none}");
+    let line = ws.read_with(cx, |ws, _| {
+        let Phase::Ready(view) = &ws.repo.as_ref().unwrap().phase else { panic!() };
+        view.entries.iter().find(|e| e.commit.is_some()).unwrap().row.lineage
+    });
+    let (on_line, _) = faces(cx, Some(line));
+    assert!(on_line >= 1 && on_line < all, "the selected line's commits only: {on_line} of {all}");
+    draw(cx, &ws);
+}

@@ -19,6 +19,7 @@ use gpui::{
 use crate::avatars::Avatar;
 use crate::icons;
 use crate::layout::{Columns, DateStyle, short_date};
+use gitgui_store::GraphFaces;
 use crate::menu::MenuTarget;
 use crate::ui::{self, MONO, line_color};
 use crate::workspace::Workspace;
@@ -520,6 +521,19 @@ fn chip(text: SharedString, color: u32, probable: bool) -> impl IntoElement {
         .child(text)
 }
 
+/// Whether this row's commit is drawn with its author's picture, rather than as a plain dot.
+/// `highlight` is the selected commit's branch line.
+pub fn shows_face(mode: GraphFaces, entry: &Entry, highlight: Option<usize>) -> bool {
+    if entry.dot == Dot::Current {
+        return true;
+    }
+    match mode {
+        GraphFaces::All => true,
+        GraphFaces::Tips => entry.labels.iter().any(|l| matches!(l.kind, LabelKind::Branch | LabelKind::RemoteBranch)),
+        GraphFaces::Selected => highlight == Some(entry.row.lineage),
+    }
+}
+
 // `use<>`: edition 2024 would otherwise tie the element to the borrowed entry.
 #[allow(clippy::too_many_arguments)]
 pub fn render_entry(
@@ -530,6 +544,7 @@ pub fn render_entry(
     selected: bool,
     highlight: Option<usize>,
     cols: Columns,
+    faces: GraphFaces,
     density: Density,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
@@ -563,7 +578,9 @@ pub fn render_entry(
     // A commit with commits listed under it folds them with a chevron drawn on its dot.
     let fold = (entry.group_size > 0).then_some(entry.collapsed);
     // Any other commit is drawn as its author's initials; it steps back like its line does.
-    let node = (fold.is_none() && dot != Dot::Uncommitted).then(|| {
+    let face = shows_face(faces, entry, highlight);
+    let plain = fold.is_none() && dot != Dot::Uncommitted && !face;
+    let node = (fold.is_none() && dot != Dot::Uncommitted && face).then(|| {
         let alpha = match highlight {
             Some(h) if h != lineage => DIMMED,
             Some(_) => 1.,
@@ -623,7 +640,7 @@ pub fn render_entry(
                         |_, _, _| (),
                         move |bounds, _, window, _| {
                             let lines = Lines { lineage, fork_line, off_lines: &off_lines, off_branch, highlight };
-                            paint_lanes(bounds, &strokes, lane, &lines, dot, fold, density, window)
+                            paint_lanes(bounds, &strokes, lane, &lines, dot, fold, plain, density, window)
                         },
                     )
                     .size_full(),
@@ -774,6 +791,7 @@ fn paint_lanes(
     lines: &Lines,
     dot: Dot,
     fold: Option<bool>,
+    plain: bool,
     density: Density,
     window: &mut Window,
 ) {
@@ -868,7 +886,9 @@ fn paint_lanes(
         return;
     }
     match dot {
-        // A commit's node, with its author's initials, is drawn over the lines by the row.
+        // A commit's node, with its author's picture, is drawn over the lines by the row; a commit that
+        // does not show one is a plain dot.
+        Dot::Filled | Dot::Current if plain => circle(dot_r, color, 0., color),
         Dot::Filled | Dot::Current => {}
         Dot::Uncommitted => circle(dot_r, rgb(t().bg), 2., color),
     }
