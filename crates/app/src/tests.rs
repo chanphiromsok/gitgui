@@ -1555,3 +1555,23 @@ async fn flat_and_split_are_remembered_for_the_next_start(cx: &mut TestAppContex
     let back = Store::at(fx.data()).settings().unwrap();
     assert_eq!((back.file_layout, back.diff_mode), (FileLayout::Tree, DiffMode::Unified));
 }
+
+/// With every theme and icon theme listed the panel is taller than a short window; it must scroll, not
+/// push the Done button off the bottom.
+#[gpui::test]
+async fn the_settings_panel_fits_a_short_window(cx: &mut TestAppContext) {
+    let fx = merged_pr("settings-fit");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| ws.open_settings(cx));
+    cx.simulate_resize(size(px(1000.), px(420.)));
+    let view = AnyView::from(ws.clone());
+    cx.draw(
+        point(px(0.), px(0.)),
+        size(AvailableSpace::Definite(px(1000.)), AvailableSpace::Definite(px(420.))),
+        move |_, _| view,
+    );
+    let done = cx.debug_bounds("settings-done").expect("the Done button is drawn");
+    assert!(done.bottom() <= px(420.), "Done sits at {:?}, below a 420 px window", done.bottom());
+    assert!(done.top() >= px(0.));
+}

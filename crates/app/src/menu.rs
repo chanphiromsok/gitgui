@@ -494,7 +494,7 @@ impl Workspace {
     // ---- drawing ------------------------------------------------------------------------------
 
     pub fn render_overlays(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        [self.render_menu(window, cx), self.render_dialog(cx), self.render_settings(cx)].into_iter().flatten().collect()
+        [self.render_menu(window, cx), self.render_dialog(cx), self.render_settings(window, cx)].into_iter().flatten().collect()
     }
 
     fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -603,66 +603,82 @@ impl Workspace {
         ))
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.settings_open {
             return None;
         }
         let on = self.settings.group_by_parent;
+        let body = div()
+            .id("settings-scroll")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(setting_toggle(
+                "setting-group",
+                on,
+                "Group commits under their pull request",
+                "List the commits of a pull request or merged branch indented under it, with a guide line, \
+                 and fold them away with the chevron on the merge in the graph. Squash-merged branches go under \
+                 their squash commit. Turn off to list every commit in date order.",
+                cx.listener(|this, _, _, cx| this.toggle_group_by_parent(cx)),
+            ))
+            .child(setting_toggle(
+                "setting-avatars",
+                self.settings.fetch_avatars,
+                "Show authors' pictures",
+                "Fetch profile pictures from GitHub (for GitHub no-reply emails) and Gravatar, which is sent a \
+                 SHA-256 of each author's email. Pictures are kept for a week. Off shows initials only.",
+                cx.listener(|this, _, _, cx| this.toggle_fetch_avatars(cx)),
+            ))
+            .child(setting_toggle(
+                "setting-compact",
+                self.settings.compact_graph,
+                "Compact graph",
+                "Narrow lanes and thin lines, so a busy history leaves more room for the messages.",
+                cx.listener(|this, _, _, cx| this.toggle_compact_graph(cx)),
+            ))
+            .child(choice_row(
+                "File list",
+                "How a commit's changed files are listed. Also the Tree / Flat buttons above the list.",
+                [
+                    ("setting-layout-tree", "Tree", self.settings.file_layout == FileLayout::Tree),
+                    ("setting-layout-flat", "Flat", self.settings.file_layout == FileLayout::Flat),
+                ],
+                cx.listener(|this, _, _, cx| this.set_layout(Layout::Tree, cx)),
+                cx.listener(|this, _, _, cx| this.set_layout(Layout::Flat, cx)),
+            ))
+            .child(choice_row(
+                "Diff view",
+                "How a file's changes are laid out. Also the Unified / Split buttons above the diff.",
+                [
+                    ("setting-diff-unified", "Unified", self.settings.diff_mode == DiffMode::Unified),
+                    ("setting-diff-split", "Split", self.settings.diff_mode == DiffMode::Split),
+                ],
+                cx.listener(|this, _, _, cx| this.set_mode(Mode::Unified, cx)),
+                cx.listener(|this, _, _, cx| this.set_mode(Mode::Split, cx)),
+            ))
+            .child(self.render_theme_picker(cx))
+            .child(self.render_icon_picker(cx));
         Some(modal(
             div()
                 .w(px(520.))
+                .max_h(window.viewport_size().height * 0.9)
                 .p_4()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("Settings"))
-                .child(setting_toggle(
-                    "setting-group",
-                    on,
-                    "Group commits under their pull request",
-                    "List the commits of a pull request or merged branch indented under it, with a guide line, \
-                     and fold them away with the chevron on the merge in the graph. Squash-merged branches go under \
-                     their squash commit. Turn off to list every commit in date order.",
-                    cx.listener(|this, _, _, cx| this.toggle_group_by_parent(cx)),
-                ))
-                .child(setting_toggle(
-                    "setting-avatars",
-                    self.settings.fetch_avatars,
-                    "Show authors' pictures",
-                    "Fetch profile pictures from GitHub (for GitHub no-reply emails) and Gravatar, which is sent a \
-                     SHA-256 of each author's email. Pictures are kept for a week. Off shows initials only.",
-                    cx.listener(|this, _, _, cx| this.toggle_fetch_avatars(cx)),
-                ))
-                .child(setting_toggle(
-                    "setting-compact",
-                    self.settings.compact_graph,
-                    "Compact graph",
-                    "Narrow lanes and thin lines, so a busy history leaves more room for the messages.",
-                    cx.listener(|this, _, _, cx| this.toggle_compact_graph(cx)),
-                ))
-                .child(choice_row(
-                    "File list",
-                    "How a commit's changed files are listed. Also the Tree / Flat buttons above the list.",
-                    [
-                        ("setting-layout-tree", "Tree", self.settings.file_layout == FileLayout::Tree),
-                        ("setting-layout-flat", "Flat", self.settings.file_layout == FileLayout::Flat),
-                    ],
-                    cx.listener(|this, _, _, cx| this.set_layout(Layout::Tree, cx)),
-                    cx.listener(|this, _, _, cx| this.set_layout(Layout::Flat, cx)),
-                ))
-                .child(choice_row(
-                    "Diff view",
-                    "How a file's changes are laid out. Also the Unified / Split buttons above the diff.",
-                    [
-                        ("setting-diff-unified", "Unified", self.settings.diff_mode == DiffMode::Unified),
-                        ("setting-diff-split", "Split", self.settings.diff_mode == DiffMode::Split),
-                    ],
-                    cx.listener(|this, _, _, cx| this.set_mode(Mode::Unified, cx)),
-                    cx.listener(|this, _, _, cx| this.set_mode(Mode::Split, cx)),
-                ))
-                .child(self.render_theme_picker(cx))
-                .child(self.render_icon_picker(cx))
-                .child(div().flex().justify_end().child(button("settings-done", "Done").on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))))),
+                .child(div().flex_none().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("Settings"))
+                .child(body)
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .justify_end()
+                        .child(button("settings-done", "Done").debug_selector(|| "settings-done".to_owned()).on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))),
+                ),
         ))
     }
 
@@ -786,8 +802,7 @@ impl Workspace {
     }
 }
 
-/// A checkbox with a title and a line saying what it does.
-/// A setting with two choices, as a pair of buttons with the chosen one lit.
+/// A setting with two choices, as a pair of equal buttons with the chosen one lit.
 fn choice_row(
     title: &'static str,
     detail: &'static str,
@@ -797,25 +812,37 @@ fn choice_row(
 ) -> AnyElement {
     let [(id_a, label_a, on_a), (id_b, label_b, on_b)] = choices;
     let pick = |id, label, chosen: bool| {
-        button(id, label).when(chosen, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+        button(id, label)
+            .w(px(64.))
+            .justify_center()
+            .when(chosen, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
     };
     div()
         .flex()
-        .items_center()
-        .justify_between()
+        .items_start()
         .gap_3()
         .child(
             div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(div().text_xs().text_color(rgb(t().muted)).child(detail)),
         )
-        .child(div().flex().gap_1().child(pick(id_a, label_a, on_a).on_click(first)).child(pick(id_b, label_b, on_b).on_click(second)))
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .gap_1()
+                .child(pick(id_a, label_a, on_a).on_click(first))
+                .child(pick(id_b, label_b, on_b).on_click(second)),
+        )
         .into_any_element()
 }
 
+/// A checkbox with a title and a line saying what it does.
 fn setting_toggle(
     id: &'static str,
     on: bool,
@@ -872,6 +899,8 @@ fn modal(content: impl IntoElement) -> AnyElement {
         .child(
             div()
                 .rounded_lg()
+                .flex()
+                .flex_col()
                 .bg(rgb(t().panel))
                 .border_1()
                 .border_color(rgb(t().border))
