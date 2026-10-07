@@ -20,11 +20,13 @@ Saved projects, settings and comments live in `~/Library/Application Support/git
 Needs Xcode or the Command Line Tools (`xcode-select --install`). The Metal shader compiler is **not** needed: the app compiles its shaders when it starts (`runtime_shaders`).
 
 ```sh
-scripts/bundle-macos.sh             # this Mac's architecture
-scripts/bundle-macos.sh --universal # Apple Silicon + Intel in one app
+scripts/bundle-macos.sh                  # this Mac's architecture
+scripts/bundle-macos.sh --arch arm64     # Apple Silicon (can be built on an Intel Mac too)
+scripts/bundle-macos.sh --arch x86_64    # Intel (can be built on an Apple Silicon Mac)
+scripts/bundle-macos.sh --arch universal # both in one app
 ```
 
-This writes `dist/gitgui.app` and `dist/gitgui-<version>.dmg`. Drag the app to Applications.
+This writes `dist/gitgui.app` and `dist/gitgui-<version>-macos-<arch>.dmg`. Drag the app to Applications.
 
 **The icon** is `crates/app/assets/app-icon/icon.svg`. After changing it, make `AppIcon.icns` again:
 
@@ -33,11 +35,23 @@ cargo run -p gitgui-app --example app_icon -- /tmp/AppIcon.iconset && iconutil -
 ```
 
 **Signing.** The script signs ad hoc, which is enough to run on the Mac that built it. On another Mac, Gatekeeper blocks it: right-click the app and choose Open once, or run `xattr -dr com.apple.quarantine gitgui.app`.
-To distribute properly you need an Apple Developer ID: sign with `codesign --force --deep --options runtime --sign "Developer ID Application: NAME (TEAMID)" dist/gitgui.app`, then notarize with `xcrun notarytool submit dist/gitgui-<version>.dmg --keychain-profile PROFILE --wait` and `xcrun stapler staple dist/gitgui-<version>.dmg`.
+To distribute properly you need an Apple Developer ID: sign with `codesign --force --deep --options runtime --sign "Developer ID Application: NAME (TEAMID)" dist/gitgui.app`, then notarize with `xcrun notarytool submit dist/gitgui-<version>-macos-<arch>.dmg --keychain-profile PROFILE --wait` and `xcrun stapler staple dist/gitgui-<version>-macos-<arch>.dmg`.
+
+## Publishing a release on GitHub
+
+`.github/workflows/release.yml` builds the macOS Apple Silicon and Intel `.dmg` files and the Windows `.zip`, then drafts a GitHub release with them and a `SHA256SUMS` file. It never publishes by itself: open the draft, read it, press **Publish**.
+
+```sh
+# 1. Set `version` in the root Cargo.toml, commit, push.
+# 2. Tag it; the workflow starts on the tag:
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Or run it by hand without a tag: GitHub → Actions → release → Run workflow, and type the tag (`v0.1.0`). The tag is created when you publish the draft. The install notes in the release body come from `.github/release-notes.md`.
 
 ## Release build: Windows
 
-Build it on Windows (cross-compiling GPUI from another OS is not supported). **This has not been built or run on Windows yet.** The code compiles for it in principle (GPUI supports Windows, and the data folder uses `%APPDATA%`), but see the gaps below.
+The release workflow builds it on a Windows runner (cross-compiling GPUI from another OS is not supported). **It has never been run on a real Windows machine**, and the first workflow run may need fixes; check that run before relying on it. Shortcuts use Ctrl there, the code font is Consolas, and no console window opens.
 
 1. Install [Rust](https://rustup.rs) with the default `x86_64-pc-windows-msvc` toolchain.
 2. Install **Visual Studio Build Tools** with the *Desktop development with C++* workload and a Windows 10/11 SDK.
@@ -50,14 +64,14 @@ cargo build --release -p gitgui-app
 
 The program is `target\release\gitgui-app.exe`. It is a single file: copy it anywhere. For an installer, wrap it with [WiX](https://wixtoolset.org) or [Inno Setup](https://jrsoftware.org/isinfo.php); sign it with `signtool` to avoid SmartScreen warnings.
 
-Known Windows gaps, to fix before a public release:
-- Shortcuts are written for the Mac (`cmd-o`, `cmd-,`, `cmd-e`, and the text field's `cmd-c/v/x/a`). On Windows they should be `ctrl-…`; the menu bar is also macOS-only.
-- The code font is `Menlo`, which Windows does not have; set `MONO` in `crates/app/src/ui.rs` to `Consolas`.
+Known Windows gaps:
+- The menu bar is macOS-only; Minimize, Hide and the other macOS window shortcuts do nothing there.
+- The program has no icon of its own, and is not signed (SmartScreen warns).
 - Git is found on PATH only.
 
 ## Release build: Linux
 
-Install the system libraries GPUI needs (on Debian/Ubuntu: `libxkbcommon-x11-dev libwayland-dev libxcb1-dev libfontconfig-dev libssl-dev pkg-config`), then `cargo build --release -p gitgui-app`. Not tested either, and it has the same shortcut and font gaps as Windows.
+Install the system libraries GPUI needs (on Debian/Ubuntu: `libxkbcommon-x11-dev libwayland-dev libxcb1-dev libfontconfig-dev libssl-dev pkg-config`), then `cargo build --release -p gitgui-app`. Not tested either, and it uses Ctrl for shortcuts and DejaVu Sans Mono for code.
 
 ## Layout
 

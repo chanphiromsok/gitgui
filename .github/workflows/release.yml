@@ -1,0 +1,87 @@
+name: release
+
+# Builds gitgui for macOS (Apple Silicon and Intel) and Windows, then drafts a GitHub release with the files.
+# The release stays a draft: read it, then press Publish.
+#
+# Start it by pushing a tag:   git tag v0.1.0 && git push origin v0.1.0
+# or by hand: Actions → release → Run workflow (type the tag to draft, e.g. v0.1.0; nothing is tagged until you publish).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to draft, like v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-14   # Apple Silicon; the Intel build is cross-compiled
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+      - name: Build the app and dmg
+        run: scripts/bundle-macos.sh --arch ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p gitgui-app
+      - name: Zip
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force dist/gitgui | Out-Null
+          Copy-Item target/release/gitgui-app.exe dist/gitgui/gitgui.exe
+          Copy-Item README.md dist/gitgui/README.md
+          Compress-Archive -Path dist/gitgui -DestinationPath "dist/gitgui-$version-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Checksums
+        run: cd files && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" files/* \
+            --draft --generate-notes --title "gitgui $TAG" \
+            --notes-file .github/release-notes.md \
+            --target "$GITHUB_SHA"

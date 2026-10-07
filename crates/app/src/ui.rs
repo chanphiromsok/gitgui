@@ -109,7 +109,12 @@ fn paint_icon(kind: CommitKind, bounds: Bounds<Pixels>, window: &mut Window) {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub const MONO: &str = "Menlo";
+#[cfg(target_os = "windows")]
+pub const MONO: &str = "Consolas";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const MONO: &str = "DejaVu Sans Mono";
 
 /// A small text button.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<gpui::Div> {

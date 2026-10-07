@@ -1,25 +1,55 @@
 #!/bin/sh
-# Builds a release gitgui.app (and a .dmg) for the Mac you run this on.
-# usage: scripts/bundle-macos.sh [--universal]
-#   --universal  builds for Apple Silicon and Intel and joins them (needs both rustup targets)
+# Builds a release gitgui.app (and a .dmg) on a Mac.
+# usage: scripts/bundle-macos.sh [--arch arm64|x86_64|universal]
+#   no option   builds for the Mac you run this on
+#   --arch      builds for Apple Silicon (arm64), Intel (x86_64), or both joined (universal);
+#               needs `rustup target add` for the targets, which this script does for you.
+#   --universal is the same as --arch universal
+# Writes dist/gitgui.app and dist/gitgui-VERSION-macos-ARCH.dmg
 set -eu
 cd "$(dirname "$0")/.."
+
+ARCH=native
+case "${1:-}" in
+    --universal) ARCH=universal ;;
+    --arch) ARCH="${2:?--arch wants arm64, x86_64 or universal}" ;;
+    "") ;;
+    *) echo "usage: $0 [--arch arm64|x86_64|universal]" >&2; exit 2 ;;
+esac
 
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 OUT=dist
 APP="$OUT/gitgui.app"
 rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-if [ "${1:-}" = "--universal" ]; then
-    rustup target add aarch64-apple-darwin x86_64-apple-darwin
-    cargo build --release -p gitgui-app --target aarch64-apple-darwin
-    cargo build --release -p gitgui-app --target x86_64-apple-darwin
-    lipo -create -output "$APP/Contents/MacOS/gitgui" \
-        target/aarch64-apple-darwin/release/gitgui-app target/x86_64-apple-darwin/release/gitgui-app
-else
-    cargo build --release -p gitgui-app
-    cp target/release/gitgui-app "$APP/Contents/MacOS/gitgui"
-fi
+ARM=aarch64-apple-darwin
+X86=x86_64-apple-darwin
+BIN() { echo "target/$1/release/gitgui-app"; }
+
+case "$ARCH" in
+    native)
+        cargo build --release -p gitgui-app
+        cp target/release/gitgui-app "$APP/Contents/MacOS/gitgui"
+        ARCH=$(uname -m | sed 's/^arm64$/arm64/')
+        ;;
+    arm64)
+        rustup target add "$ARM"
+        cargo build --release -p gitgui-app --target "$ARM"
+        cp "$(BIN $ARM)" "$APP/Contents/MacOS/gitgui"
+        ;;
+    x86_64)
+        rustup target add "$X86"
+        cargo build --release -p gitgui-app --target "$X86"
+        cp "$(BIN $X86)" "$APP/Contents/MacOS/gitgui"
+        ;;
+    universal)
+        rustup target add "$ARM" "$X86"
+        cargo build --release -p gitgui-app --target "$ARM"
+        cargo build --release -p gitgui-app --target "$X86"
+        lipo -create -output "$APP/Contents/MacOS/gitgui" "$(BIN $ARM)" "$(BIN $X86)"
+        ;;
+    *) echo "unknown --arch $ARCH (arm64, x86_64 or universal)" >&2; exit 2 ;;
+esac
 
 # The icon: crates/app/assets/app-icon/icon.svg, drawn to AppIcon.icns by the app_icon example.
 cp crates/app/assets/app-icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
@@ -44,6 +74,7 @@ PLIST
 # Ad-hoc signature: enough to run on this Mac. For other Macs see "Signing" in the README.
 codesign --force --deep --sign - "$APP"
 
-rm -f "$OUT/gitgui-$VERSION.dmg"
-hdiutil create -quiet -volname gitgui -srcfolder "$APP" -ov -format UDZO "$OUT/gitgui-$VERSION.dmg"
-echo "Built $APP and $OUT/gitgui-$VERSION.dmg"
+DMG="$OUT/gitgui-$VERSION-macos-$ARCH.dmg"
+rm -f "$DMG"
+hdiutil create -quiet -volname gitgui -srcfolder "$APP" -ov -format UDZO "$DMG"
+echo "Built $APP and $DMG"

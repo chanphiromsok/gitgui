@@ -2,6 +2,9 @@
 //!
 //! usage: gitgui-app [PATH]
 
+// A release build on Windows is a window program: no console opens behind it.
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
 mod avatars;
 mod changes;
 mod detail;
@@ -53,21 +56,21 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         text_input::bind_keys(cx);
         cx.bind_keys([
-            KeyBinding::new("cmd-o", OpenFolder, None),
-            KeyBinding::new("cmd-,", OpenSettings, None),
-            KeyBinding::new("cmd-r", Refresh, None),
-            KeyBinding::new("cmd-f", FindCommits, None),
-            KeyBinding::new("cmd-b", ToggleSidebar, None),
+            KeyBinding::new("secondary-o", OpenFolder, None),
+            KeyBinding::new("secondary-,", OpenSettings, None),
+            KeyBinding::new("secondary-r", Refresh, None),
+            KeyBinding::new("secondary-f", FindCommits, None),
+            KeyBinding::new("secondary-b", ToggleSidebar, None),
             KeyBinding::new("up", workspace::PreviousFile, None),
             KeyBinding::new("down", workspace::NextFile, None),
             KeyBinding::new("escape", Back, None),
-            KeyBinding::new("cmd-e", ToggleFullView, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
+            KeyBinding::new("secondary-e", ToggleFullView, None),
+            KeyBinding::new("secondary-w", CloseWindow, None),
             KeyBinding::new("cmd-m", Minimize, None),
             KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
             KeyBinding::new("cmd-h", Hide, None),
             KeyBinding::new("alt-cmd-h", HideOthers, None),
-            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("secondary-q", Quit, None),
         ]);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);

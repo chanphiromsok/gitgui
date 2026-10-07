@@ -1731,3 +1731,20 @@ async fn pictures_looked_at_are_let_go_once_another_file_is_open(cx: &mut TestAp
     draw(cx, &ws);
     assert!(seen[3].upgrade().is_none(), "closing the pane lets go of the last one too");
 }
+
+/// Switching projects must free the old project's history at once, not when the new one has loaded:
+/// otherwise both are in memory together and memory spikes on every switch.
+#[gpui::test]
+async fn switching_projects_frees_the_old_history_before_the_new_one_loads(cx: &mut TestAppContext) {
+    let (first, second) = (merged_pr("switch-a"), merged_pr("switch-b"));
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(first.data())), cx));
+    open_project(&ws, cx, &first.repo());
+    let old = ws.read_with(cx, |ws, _| ws.kept_history()).expect("the first project's history is kept");
+    assert!(old.upgrade().is_some());
+
+    ws.update(cx, |ws, cx| ws.add_folder(&second.repo(), cx));
+    // Not yet read: the old history must already be gone.
+    assert!(old.upgrade().is_none(), "the old project's commits are still held while the new one loads");
+    cx.run_until_parked();
+    assert!(ws.read_with(cx, |ws, _| ws.kept_history()).is_some_and(|new| new.upgrade().is_some()));
+}

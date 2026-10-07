@@ -713,6 +713,9 @@ impl Workspace {
         }
         self.projects.retain(|p| p.path != path);
         self.scan_caches.remove(path);
+        if self.last_log.as_ref().is_some_and(|last| last.path == path) {
+            self.last_log = None;
+        }
         if self.running_scan.as_ref().is_some_and(|scan| scan.path == path) {
             self.stop_merge_scan();
         }
@@ -734,6 +737,11 @@ impl Workspace {
         });
         if kept.is_none() {
             self.search_input.update(cx, |input, cx| input.clear(cx));
+        }
+        // The last project's parsed history is of no use to another one, and keeping it until the new one
+        // has been read would hold both in memory at once.
+        if self.last_log.as_ref().is_some_and(|last| last.path != path) {
+            self.last_log = None;
         }
         // Whatever was open is closed: reads still running for it stop.
         self.cancel_file_load();
@@ -867,6 +875,12 @@ impl Workspace {
                 cx.notify();
             },
         );
+    }
+
+    /// A handle on the commits kept for the next refresh, which tells whether they are still alive.
+    #[cfg(test)]
+    pub(crate) fn kept_history(&self) -> Option<std::sync::Weak<Vec<Commit>>> {
+        self.last_log.as_ref().map(|last| Arc::downgrade(&last.commits))
     }
 
     /// A merge scan is running.
