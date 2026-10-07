@@ -71,10 +71,10 @@ impl Workspace {
             .when(change.status == FileStatus::Deleted, |bar| bar.child(deleted_tag()))
             .child(stats(change))
             .child(
-                div().min_w_0().flex_1().text_xs().text_color(rgb(t().muted)).child(match count {
-                    0 => "Click + beside a line to comment".to_owned(),
-                    1 => "1 comment on this file".to_owned(),
-                    n => format!("{n} comments on this file"),
+                div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().text_xs().text_color(rgb(t().muted)).child(match count {
+                    0 => String::new(),
+                    1 => "1 comment".to_owned(),
+                    n => format!("{n} comments"),
                 }),
             )
             .when(!file.diff.binary && !file.diff.hunks.is_empty(), |bar| {
@@ -138,12 +138,51 @@ impl Workspace {
             Mode::Split => 2. * side(5.),
         };
         let rows = list(file.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx))).size_full();
+        file.content_w.set(width);
+        let viewport = f32::from(file.diff_bounds.get().size.width);
+        let offset = file.scroll_x.get().clamp(0., (width - viewport).max(0.));
+        let bounds = file.diff_bounds.clone();
+        // Sideways scrolling is done here, not by the pane, so the two directions do not fight: a swipe that
+        // is mostly sideways moves the code sideways only, and one that is mostly down only scrolls down.
         let scrolling = div()
             .id("diff-x")
             .size_full()
-            .overflow_x_scroll()
-            .child(div().debug_selector(|| "diff-list".to_owned()).h_full().w(px(width)).min_w_full().child(rows));
+            .relative()
+            .overflow_hidden()
+            .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
+            .child(
+                div()
+                    .debug_selector(|| "diff-list".to_owned())
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-offset))
+                    .w(px(width))
+                    .min_w_full()
+                    .child(rows),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| this.scroll_diff_sideways(event, cx)));
         div().size_full().relative().child(scrolling).child(self.minimap(file, cx)).into_any_element()
+    }
+
+    /// A wheel or trackpad event over the code: sideways when it is mostly sideways (or shift is held).
+    fn scroll_diff_sideways(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        let Some(file) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()) else { return };
+        let delta = event.delta.pixel_delta(px(LINE_H));
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+        let sideways = event.modifiers.shift || dx.abs() > dy.abs();
+        if !sideways {
+            return;
+        }
+        // The list scrolls by the vertical part of any wheel event; take that back so the gesture stays level.
+        if dy != 0. && !event.modifiers.shift {
+            file.list.scroll_by(delta.y);
+        }
+        let amount = if event.modifiers.shift && dx == 0. { dy } else { dx };
+        let most = (file.content_w.get() - f32::from(file.diff_bounds.get().size.width)).max(0.);
+        file.scroll_x.set((file.scroll_x.get() - amount).clamp(0., most));
+        cx.stop_propagation();
+        cx.notify();
     }
 
     /// A strip down the right edge: a tick for every run of changed rows and a box for what is in view.
@@ -231,6 +270,13 @@ impl Workspace {
                     .border_y_1()
                     .border_color(rgba(0xffffff44)),
             )
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                // The strip sits over the code, so a wheel over it scrolls the code as it would beside it.
+                if let Some(file) = this.repo.as_ref().and_then(|repo| repo.file.as_ref()) {
+                    file.list.scroll_by(-event.delta.pixel_delta(px(LINE_H)).y);
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| this.minimap_jump(event.position.y, cx)))
             .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                 if event.dragging() {
@@ -393,29 +439,34 @@ fn hunk_header(h: usize, header: &str, can_expand: bool, cx: &mut Context<Worksp
     div()
         .w_full()
         .h(px(LINE_H + 4.))
-        .px_3()
         .flex()
         .items_center()
-        .gap_3()
         .bg(rgb(t().hunk_bg))
         .text_color(rgb(t().hunk_fg))
         .font_family(MONO)
         .text_xs()
-        .child(div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().child(SharedString::from(header.to_owned())))
-        .when(can_expand, |row| {
-            // More unchanged lines around every change, like "expand" beside a hunk on GitHub.
-            row.child(
-                div()
-                    .id(("hunk-more", h))
-                    .flex_none()
-                    .px_1p5()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(t().element_hover)))
-                    .on_click(cx.listener(|this, _, _, cx| this.more_context(cx)))
-                    .child("↕ Show more lines"),
-            )
+        // Where the line numbers are: a button to show more of the unchanged lines around every change.
+        .child(if can_expand {
+            div()
+                .id(("hunk-more", h))
+                .debug_selector(move || format!("hunk-more-{h}"))
+                .flex_none()
+                .w(px(42.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .text_color(rgb(t().accent))
+                .font_weight(FontWeight::BOLD)
+                .hover(|style| style.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
+                .on_click(cx.listener(|this, _, _, cx| this.more_context(cx)))
+                .child("↕")
+                .into_any_element()
+        } else {
+            div().flex_none().w(px(42.)).into_any_element()
         })
+        .child(div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().child(SharedString::from(header.to_owned())))
         .into_any_element()
 }
 

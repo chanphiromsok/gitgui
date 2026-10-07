@@ -237,6 +237,10 @@ pub struct FileState {
     pub minimap_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
     /// The longest line, in columns (a tab is four), to make the diff wide enough to scroll sideways.
     pub max_cols: usize,
+    /// How far the code is scrolled sideways, and the widths it was last laid out with.
+    pub scroll_x: std::cell::Cell<f32>,
+    pub content_w: std::cell::Cell<f32>,
+    pub diff_bounds: std::rc::Rc<std::cell::Cell<gpui::Bounds<gpui::Pixels>>>,
 }
 
 impl FileState {
@@ -256,6 +260,9 @@ impl FileState {
             minimap: Default::default(),
             minimap_bounds: Default::default(),
             max_cols: 0,
+            scroll_x: Default::default(),
+            content_w: Default::default(),
+            diff_bounds: Default::default(),
         }
     }
 
@@ -1296,6 +1303,16 @@ impl Workspace {
         }
     }
 
+    /// Full view of the file pane, if it is not already.
+    pub fn expand_pane(&mut self, cx: &mut Context<Self>) {
+        if let Some(repo) = self.repo.as_mut()
+            && !repo.expanded
+        {
+            repo.expanded = true;
+            cx.notify();
+        }
+    }
+
     /// Closes the file pane and deselects the commit.
     pub fn close_pane(&mut self, cx: &mut Context<Self>) {
         self.cancel_file_load();
@@ -1730,10 +1747,13 @@ impl Render for Workspace {
         self.release_pictures(window);
         let total = f32::from(window.viewport_size().width);
         let pane_open = self.repo.as_ref().is_some_and(|repo| repo.commit.is_some());
-        let sidebar_width = self.shown_sidebar_width(total, pane_open);
+        // Full view of the file pane is for reading code: the projects sidebar steps aside too, and comes back
+        // with the graph when it is collapsed.
+        let reading = pane_open && self.repo.as_ref().is_some_and(|repo| repo.expanded);
+        let sidebar_width = if reading { 0. } else { self.shown_sidebar_width(total, pane_open) };
         // A hidden sidebar leaves its divider at the window's edge, to drag it back out.
         let sidebar = (sidebar_width > 0.).then(|| self.render_sidebar(sidebar_width, cx));
-        let divider = self.splitter("sidebar-divider", Splitter::Sidebar, cx);
+        let divider = (!reading).then(|| self.splitter("sidebar-divider", Splitter::Sidebar, cx));
 
         div()
             .relative()
@@ -1759,7 +1779,7 @@ impl Render for Workspace {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| this.drag_divider(event, window, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_resize(cx)))
             .children(sidebar)
-            .child(divider)
+            .children(divider)
             .child(
                 div()
                     .flex_1()
@@ -2032,7 +2052,9 @@ impl Workspace {
             Phase::Ready(_) => {
                 let pane_open = repo.commit.is_some();
                 let expanded = repo.expanded && pane_open;
-                let width = layout::pane_width(self.pane_width, total, sidebar_width);
+                // While a file is open the code gets most of the width, unless the pane was dragged to a width.
+                let share = if repo.file.is_some() { layout::PANE_SHARE_READING } else { layout::PANE_SHARE };
+                let width = layout::pane_width(self.pane_width.or(Some((total - sidebar_width) * share)), total, sidebar_width);
                 // What is left for the graph beside the sidebar and the file pane (and its divider).
                 let area = total - sidebar_width - if pane_open { width + 6. } else { 0. };
                 let middle = (!expanded).then(|| self.render_middle(area, cx));

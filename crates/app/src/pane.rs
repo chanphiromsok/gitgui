@@ -60,7 +60,7 @@ impl Workspace {
                     .child(summary),
             )
             .child(
-                button("expand", if expanded { "Collapse" } else { "Expand" })
+                button("expand", if expanded { "Collapse (Esc)" } else { "Expand (⌘E)" })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
             )
             .child(button("close-pane", "Close").on_click(cx.listener(|this, _, _, cx| this.close_pane(cx))));

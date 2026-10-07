@@ -12,6 +12,8 @@ pub const PANE_MIN: f32 = 420.;
 pub const GRAPH_MIN: f32 = 320.;
 /// Without a width of its own, the file pane takes this share of what is right of the sidebar.
 pub const PANE_SHARE: f32 = 0.56;
+/// The share while a file's diff is open: the code is what is being read, so it gets most of the width.
+pub const PANE_SHARE_READING: f32 = 0.76;
 
 /// How the date is written in the graph's Date column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

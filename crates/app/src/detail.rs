@@ -248,7 +248,13 @@ pub fn file_row(
                 .cursor_pointer()
                 .when(is_selected, |row| row.bg(rgb(t().selected)))
                 .hover(|style| style.bg(rgb(if is_selected { t().selected } else { t().hover })))
-                .on_click(cx.listener(move |this, _, _, cx| this.open_file(index, cx)))
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                    this.open_file(index, cx);
+                    // Double-click: read it in full view, with the whole window for the code.
+                    if event.click_count() >= 2 {
+                        this.expand_pane(cx);
+                    }
+                }))
                 .child(ui::file_icon(icons::file(name)))
                 .child(
                     div()

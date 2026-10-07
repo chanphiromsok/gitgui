@@ -2119,3 +2119,84 @@ async fn the_settings_window_has_pages_and_its_controls_change_and_save_settings
     ws.update(cx, |ws, cx| ws.back(cx));
     assert!(!ws.read_with(cx, |ws, _| ws.settings_open), "Esc closes it");
 }
+
+#[gpui::test]
+async fn scrolling_down_and_sideways_do_not_fight_and_the_minimap_passes_the_wheel_on(cx: &mut TestAppContext) {
+    let fx = bare_fixture("scroll-axes");
+    let long = "y".repeat(300);
+    let text = |a: &str| -> String { (1..=400).map(|n| if n == 200 { format!("{a}\n") } else { format!("row {n} {long}\n") }).collect() };
+    commit_file(&fx, "w.txt", &text("before"), "base");
+    commit_file(&fx, "w.txt", &text("after"), "change");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "change");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| ws.set_diff_context(Some(crate::workspace::WHOLE_FILE), cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+
+    let top = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().list.logical_scroll_top());
+    let x = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().scroll_x.get());
+    let list = cx.debug_bounds("diff-list").unwrap();
+    let over_code = point(list.origin.x + px(200.), list.origin.y + px(200.));
+    let wheel = |cx: &mut VisualTestContext, at: Point<gpui::Pixels>, dx: f32, dy: f32| {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(dx), px(dy))),
+            ..Default::default()
+        });
+    };
+
+    // Mostly down, a little sideways: it scrolls down and the code does not slide.
+    wheel(cx, over_code, -4., -120.);
+    draw(cx, &ws);
+    assert!(top(cx).item_ix > 0, "scrolled down");
+    assert_eq!(x(cx), 0., "a little sideways noise does not move the code");
+
+    // Mostly sideways, a little down: the code slides and the rows stay where they were.
+    let before = top(cx);
+    wheel(cx, over_code, -200., -6.);
+    draw(cx, &ws);
+    assert!(x(cx) > 100., "slid sideways: {}", x(cx));
+    let after = top(cx);
+    assert_eq!((after.item_ix, after.offset_in_item), (before.item_ix, before.offset_in_item), "and did not drift down");
+
+    // The wheel over the minimap strip scrolls the code too, instead of being swallowed by it.
+    let strip = cx.debug_bounds("minimap").unwrap();
+    let before = top(cx);
+    wheel(cx, strip.center(), 0., -150.);
+    draw(cx, &ws);
+    assert!(top(cx).item_ix > before.item_ix, "scrolled from over the strip");
+}
+
+#[gpui::test]
+async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_window(cx: &mut TestAppContext) {
+    let fx = bare_fixture("review-space");
+    let text = |a: &str| -> String { (1..=60).map(|n| if n == 30 { format!("{a}\n") } else { format!("line {n}\n") }).collect() };
+    commit_file(&fx, "r.txt", &text("before"), "base");
+    commit_file(&fx, "r.txt", &text("after"), "change");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "change");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+
+    // The button is by the line numbers, at the left edge of the code, not at the far end of the header row.
+    let code = cx.debug_bounds("diff-list").unwrap();
+    let more = center_of(cx, "hunk-more-0".to_owned());
+    assert!(more.x - code.origin.x < px(60.), "beside the line numbers: {:?} vs {:?}", more.x, code.origin.x);
+
+    // While reading, the code area is the biggest part of the window: no sidebar, no graph.
+    let narrow_pane = code.size.width;
+    let before_x = code.origin.x;
+    ws.update(cx, |ws, cx| ws.toggle_expanded(cx));
+    draw(cx, &ws);
+    let wide = cx.debug_bounds("diff-list").unwrap();
+    assert!(wide.origin.x < px(260.), "only the file list is left of the code: starts at {:?}", wide.origin.x);
+    assert!(wide.size.width > narrow_pane * 1.3, "more room for the code in full view: {narrow_pane:?} → {:?}", wide.size.width);
+    ws.update(cx, |ws, cx| ws.back(cx));
+    draw(cx, &ws);
+    assert_eq!(cx.debug_bounds("diff-list").unwrap().origin.x, before_x, "the sidebar and graph come back");
+}
