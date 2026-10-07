@@ -449,7 +449,7 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
                 .when(label.remotes.len() > 1, |name| name.child(format!("{}", label.remotes.len())))
         })
         .child(
-            div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(SharedString::from(label.name.clone())),
+            div().min_w_0().overflow_hidden().line_clamp(1).text_ellipsis().child(SharedString::from(label.name.clone())),
         );
 
     let target = MenuTarget::Label(label.clone());
@@ -779,7 +779,7 @@ pub fn render_entry(
                     .overflow_hidden()
                     .text_color(rgb(t().muted))
                     .when(entry.commit.is_some(), |cell| cell.child(ui::avatar(&entry.person.name, &entry.person.email, avatar, 16. * density.scale)))
-                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(entry.author.clone())),
+                    .child(div().min_w_0().overflow_hidden().line_clamp(1).text_ellipsis().child(entry.author.clone())),
             )
         })
         .when(cols.commit, |row| {

@@ -50,7 +50,7 @@ impl Workspace {
             );
         }
         let header = div()
-            .h(px(38.))
+            .h(px(if below.is_some() { 32. } else { 38. }))
             .flex_none()
             .px_3()
             .flex()
@@ -67,7 +67,7 @@ impl Workspace {
                     .min_w_0()
                     .flex_1()
                     .overflow_hidden()
-                    .whitespace_nowrap()
+                    .line_clamp(1)
                     .text_ellipsis()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(t().text_strong))
@@ -157,16 +157,24 @@ impl Workspace {
             .bg(rgb(t().panel))
             .child(gpui::canvas(move |bounds, _, _| left.set(f32::from(bounds.origin.x)), |_, _, _, _| {}).absolute().size_full())
             .child(
+                // One row: the filter takes what room there is, the tree/flat choice sits beside it.
                 div()
+                    .w_full()
                     .flex_none()
-                    .p_2()
+                    .px_2()
+                    .py_1p5()
                     .flex()
-                    .flex_col()
+                    .items_center()
                     .gap_2()
                     .border_b_1()
                     .border_color(rgb(t().border))
-                    .child(segmented(vec![choice("layout-tree", "Tree", Layout::Tree), choice("layout-flat", "Flat", Layout::Flat)]))
-                    .child(self.filter_input.clone()),
+                    // Sized outright: beside the choice, a `flex_1` input collapses to nothing. What it gets is the
+                    // column less the row's padding, the gap and the (fixed-size) Tree/Flat choice.
+                    .child(div().flex_none().w(px((self.files_width - 16. - 8. - 92.).max(60.))).child(self.filter_input.clone()))
+                    .child(segmented(vec![
+                        choice("layout-tree", "Tree", Layout::Tree).px_2(),
+                        choice("layout-flat", "Flat", Layout::Flat).px_2(),
+                    ])),
             )
             .child(if shown_all {
                 div().p_3().text_xs().text_color(rgb(t().muted)).child("No file matches the filter.").into_any_element()

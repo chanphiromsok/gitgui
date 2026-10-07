@@ -18,7 +18,7 @@ use gitgui_core::{
 use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, FontWeight, ListAlignment, ListState, MouseButton, MouseMoveEvent,
-    PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, rgba, uniform_list,
+    PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
 };
 
 use crate::graph::{self, Entry};
@@ -2095,70 +2095,100 @@ impl Workspace {
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let selected_path = self.repo.as_ref().map(|repo| repo.project.path.clone());
         let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+        // What the open project can say about itself: its branch, and whether anything is waiting to be committed.
+        let open_status: Option<(Option<SharedString>, usize)> = self.repo.as_ref().and_then(|repo| match &repo.phase {
+            Phase::Ready(view) => Some((view.current_branch.clone(), repo.work.len())),
+            _ => None,
+        });
         let mut rows: Vec<AnyElement> = Vec::new();
         for (i, project) in self.projects.iter().enumerate() {
-            let row = {
-                let selected = selected_path.as_deref() == Some(project.path.as_path());
-                let (open_path, remove_path) = (project.path.clone(), project.path.clone());
-                let place = ui::tidy_parent(&project.path, home.as_deref());
-                div()
-                    .id(("project", i))
-                    .group("project-row")
-                    .pl(px(10.))
-                    .pr_3()
-                    .py_1p5()
+            let selected = selected_path.as_deref() == Some(project.path.as_path());
+            let (open_path, remove_path) = (project.path.clone(), project.path.clone());
+            let muted_line = |child: AnyElement| {
+                div().overflow_hidden().line_clamp(1).text_ellipsis().text_size(px(11.)).text_color(rgb(t().muted)).child(child)
+            };
+            let second: AnyElement = match open_status.as_ref().filter(|_| selected) {
+                Some((branch, changes)) => div()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .cursor_pointer()
-                    // A bar down the left edge marks the open project; the others keep the space, so names line up.
-                    .border_l_2()
-                    .border_color(if selected { rgb(t().accent) } else { rgba(0x00000000) })
-                    .when(selected, |row| row.bg(rgb(t().selected)))
-                    .hover(|style| style.bg(rgb(if selected { t().selected } else { t().hover })))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_project(open_path.clone(), cx)))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_sm()
-                                    .font_weight(if selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
-                                    .text_color(rgb(if selected { t().text_strong } else { t().text }))
-                                    .child(SharedString::from(project.name.clone())),
-                            )
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_xs()
-                                    .text_color(rgb(t().muted))
-                                    .child(SharedString::from(place)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("remove", i))
-                            .flex_none()
-                            .px_1()
-                            .text_color(rgb(t().muted))
-                            .opacity(0.)
-                            .group_hover("project-row", |style| style.opacity(1.))
-                            .hover(|style| style.text_color(rgb(t().text_strong)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_project(&remove_path, cx);
-                            }))
-                            .child("×"),
-                    )
+                    .gap_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(t().muted))
+                    .children(branch.clone().map(|branch| div().min_w_0().overflow_hidden().line_clamp(1).text_ellipsis().child(branch)))
+                    .child("·")
+                    .child(if *changes == 0 {
+                        div().flex_none().child("clean")
+                    } else {
+                        div().flex_none().text_color(rgb(t().modified)).child(format!("{changes} change{}", if *changes == 1 { "" } else { "s" }))
+                    })
+                    .into_any_element(),
+                None => muted_line(SharedString::from(ui::tidy_parent(&project.path, home.as_deref())).into_any_element()).into_any_element(),
             };
-            let selected = selected_path.as_deref() == Some(project.path.as_path());
+            // A tile of the project's own color with its first letter: enough to tell projects apart at a glance.
+            let lane = t().lane(avatars::hue(&project.name));
+            let (tile_fill, tile_ink) = if selected { (lane, theme::text_on(lane)) } else { (theme::mix(t().panel, lane, 0.26), lane) };
+            let tile = div()
+                .flex_none()
+                .size(px(28.))
+                .rounded_lg()
+                .bg(rgb(tile_fill))
+                .text_color(rgb(tile_ink))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .font_weight(FontWeight::BOLD)
+                .child(project.name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into()));
+            let row = div()
+                .id(("project", i))
+                .group("project-row")
+                .mx_2()
+                .my_px()
+                .px_2()
+                .py_1p5()
+                .flex()
+                .items_center()
+                .gap_2p5()
+                .rounded_lg()
+                .cursor_pointer()
+                .when(selected, |row| row.bg(rgb(t().selected)))
+                .hover(|style| style.bg(rgb(if selected { t().selected } else { t().hover })))
+                .on_click(cx.listener(move |this, _, _, cx| this.select_project(open_path.clone(), cx)))
+                .child(tile)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .line_clamp(1)
+                                .text_ellipsis()
+                                .text_size(px(13.))
+                                .font_weight(if selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                .text_color(rgb(if selected { t().text_strong } else { t().text }))
+                                .child(SharedString::from(project.name.clone())),
+                        )
+                        .child(second),
+                )
+                .child(
+                    div()
+                        .id(("remove", i))
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .text_color(rgb(t().muted))
+                        .opacity(0.)
+                        .group_hover("project-row", |style| style.opacity(1.))
+                        .hover(|style| style.text_color(rgb(t().text_strong)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.remove_project(&remove_path, cx);
+                        }))
+                        .child("×"),
+                );
             rows.push(row.into_any_element());
             // The open project's changes sit under its name.
             if selected && let Some(changes) = self.render_changes(cx) {
@@ -2184,7 +2214,7 @@ impl Workspace {
                     .gap_1()
                     .border_b_1()
                     .border_color(rgb(t().border))
-                    .child(div().min_w_0().flex_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().muted)).child("PROJECTS"))
+                    .child(div().min_w_0().flex_1().text_sm().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("Projects"))
                     .child(ghost("open-folder", "Open…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))))
                     .child(
                         ghost("clone-repo", "Clone…")

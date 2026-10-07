@@ -58,7 +58,7 @@ impl Workspace {
         };
 
         let toolbar = div()
-            .h(px(36.))
+            .h(px(32.))
             .flex_none()
             .px_3()
             .flex()
@@ -73,7 +73,7 @@ impl Workspace {
                     .flex_none()
                     .max_w(px(360.))
                     .overflow_hidden()
-                    .whitespace_nowrap()
+                    .line_clamp(1)
                     .text_ellipsis()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(status_color(change.status))
@@ -83,7 +83,7 @@ impl Workspace {
                 div()
                     .min_w_0()
                     .overflow_hidden()
-                    .whitespace_nowrap()
+                    .line_clamp(1)
                     .text_ellipsis()
                     .text_xs()
                     .text_color(rgb(t().muted))

@@ -236,8 +236,9 @@ impl Workspace {
         if !matches!(repo.phase, Phase::Ready(_)) {
             return None;
         }
+        // A clean tree says so on the project's own row, not with a row of its own.
         if repo.work.is_empty() {
-            return Some(div().pl(px(18.)).py_1().text_xs().text_color(rgb(t().muted)).child("No changes").into_any_element());
+            return None;
         }
         let open = self.work_open().then(|| repo.file.as_ref().map(|f| f.index)).flatten();
         let staged: Vec<usize> = (0..repo.work.len()).filter(|&i| repo.work[i].staged).collect();
@@ -317,7 +318,7 @@ impl Workspace {
                     .flex_none()
                     .max_w(px(150.))
                     .overflow_hidden()
-                    .whitespace_nowrap()
+                    .line_clamp(1)
                     .text_ellipsis()
                     .text_color(rgb(t().text))
                     .when(deleted, |name| name.line_through().text_color(rgb(t().muted)))
@@ -328,7 +329,7 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .overflow_hidden()
-                    .whitespace_nowrap()
+                    .line_clamp(1)
                     .text_ellipsis()
                     .text_color(rgb(t().muted))
                     .child(SharedString::from(dir.to_owned())),

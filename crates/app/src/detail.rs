@@ -111,7 +111,8 @@ impl Workspace {
             div()
                 .flex()
                 .gap_2()
-                .child(div().w(px(76.)).flex_none().font_weight(FontWeight::BOLD).child(label))
+                .text_sm()
+                .child(div().w(px(84.)).flex_none().whitespace_nowrap().text_color(rgb(t().muted)).child(label))
                 .child(div().min_w_0().flex_1().child(value))
         };
         let text = |value: String| div().font_family(MONO).text_xs().child(SharedString::from(value)).into_any_element();
@@ -139,10 +140,11 @@ impl Workspace {
             .id("commit-info")
             .size_full()
             .overflow_y_scroll()
-            .p_3()
+            .px_3()
+            .py_2()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_0p5()
             .child(field("Commit:", text(detail.id.clone())))
             .when(!detail.parents.is_empty(), |panel| {
                 panel.child(field("Parents:", div().flex().flex_col().children(parents).into_any_element()))
@@ -168,13 +170,16 @@ impl Workspace {
                     .child(format!("{} <{}>", detail.author, detail.author_email))
                     .into_any_element(),
             ))
-            .child(field(
-                "Committer:",
-                div().child(format!("{} <{}>", detail.committer, detail.committer_email)).into_any_element(),
-            ))
+            // Said only when it is someone else (or another identity): usually it is the author again.
+            .when(detail.committer != detail.author || detail.committer_email != detail.author_email, |panel| {
+                panel.child(field(
+                    "Committer:",
+                    div().child(format!("{} <{}>", detail.committer, detail.committer_email)).into_any_element(),
+                ))
+            })
             .child(field("Date:", div().child(SharedString::from(detail.date.clone())).into_any_element()))
             .children(self.pr_link(detail, cx).map(|(label, link)| field(label, link)))
-            .child(div().pt_3().child(SharedString::from(detail.message.clone())))
+            .child(div().pt_2().text_sm().child(SharedString::from(detail.message.clone())))
             .children(self.render_merge_notes(cx))
             .child(div().pt_4().text_xs().text_color(rgb(t().muted)).child("Pick a file on the left to see what changed."))
             .into_any_element()
@@ -230,7 +235,7 @@ pub fn file_row(
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_dir(&path, cx)))
             .child(div().flex_none().w(px(10.)).child(if open { "▾" } else { "▸" }))
             .child(ui::file_icon(icons::folder(name, open)))
-            .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().child(SharedString::from(name.clone())))
+            .child(div().overflow_hidden().line_clamp(1).text_ellipsis().child(SharedString::from(name.clone())))
             .into_any_element()
         },
         TreeRow::File { depth, name, dir, index } => {
@@ -275,7 +280,7 @@ pub fn file_row(
                             .min_w_0()
                             .flex_1()
                             .overflow_hidden()
-                            .whitespace_nowrap()
+                            .line_clamp(1)
                             .text_ellipsis()
                             .text_xs()
                             .text_color(rgb(t().muted))

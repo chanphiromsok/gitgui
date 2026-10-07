@@ -794,7 +794,7 @@ impl Workspace {
                                     .min_w_0()
                                     .flex_1()
                                     .overflow_hidden()
-                                    .whitespace_nowrap()
+                                    .line_clamp(1)
                                     .text_ellipsis()
                                     .font_family(crate::ui::MONO)
                                     .child(SharedString::from(folder.display().to_string())),
