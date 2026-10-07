@@ -1665,6 +1665,92 @@ async fn pointing_at_a_line_says_who_last_changed_it(cx: &mut TestAppContext) {
     assert!(note(&ws, cx, gone).is_none());
 }
 
+/// A repository whose team names branches `type/ticket-title` and merges them into `develop` with pull-request merges.
+fn team_repo(name: &str) -> Fixture {
+    let fx = bare_fixture(name);
+    commit_file(&fx, "a.txt", "base\n", "base");
+    fx.git(&["branch", "develop"]);
+    fx.git(&["checkout", "-q", "develop"]);
+    for (i, branch) in ["feature/74-driver-reporting", "feature/75-booking", "bugfix/90-crash", "bugfix/91-typo"].iter().enumerate() {
+        fx.git(&["checkout", "-q", "-b", branch]);
+        commit_file(&fx, &format!("f{i}.txt"), "x\n", &format!("work {i}"));
+        fx.git(&["checkout", "-q", "develop"]);
+        fx.git(&["merge", "-q", "--no-ff", "-m", &format!("Merge pull request #{} from acme/{branch}", i + 1), branch]);
+    }
+    fx
+}
+
+/// The workflow is read from the branches, kept per project, and the New branch window builds a name the team's way
+/// and starts it from the team's branch.
+#[gpui::test]
+async fn the_new_branch_window_names_the_branch_the_way_the_team_does(cx: &mut TestAppContext) {
+    use crate::settings_view::SettingsPage;
+    let fx = team_repo("workflow");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    cx.run_until_parked();
+
+    // What the branches show.
+    let found = ws.read_with(cx, |ws, _| ws.detected_workflow()).expect("a repository is open");
+    assert_eq!(found.shape, gitgui_core::Shape::TypeTicketSlug);
+    assert!(found.types.iter().any(|(kind, _)| kind == "feature") && found.types.iter().any(|(kind, _)| kind == "bugfix"));
+    assert_eq!(found.base.as_deref(), Some("develop"));
+    assert!(ws.read_with(cx, |ws, _| ws.saved_workflow()).is_none(), "nothing is kept until it is accepted");
+
+    // The Settings page says so, and "Use this" keeps it for the project.
+    ws.update(cx, |ws, cx| {
+        ws.open_settings(cx);
+        ws.set_settings_page(SettingsPage::Workflow, cx);
+    });
+    draw(cx, &ws);
+    let use_this = center_of(cx, "workflow-use".to_owned());
+    click(cx, MouseButton::Left, use_this);
+    let saved = ws.read_with(cx, |ws, _| ws.saved_workflow()).expect("kept");
+    assert_eq!((saved.shape.as_str(), saved.base.as_deref()), ("type-ticket-slug", Some("develop")));
+    assert_eq!(Store::at(fx.data()).projects().unwrap()[0].workflow, Some(saved), "and it is on disk");
+    ws.update(cx, |ws, cx| ws.close_settings(cx));
+
+    // A name that does not follow the habit is said so; one that does is not.
+    assert!(ws.read_with(cx, |ws, _| ws.workflow_hint("driver-reporting")).unwrap().contains("type"));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.workflow_hint("feature/74-driver-reporting")), None);
+
+    // The window: the first type, the team's base, and the name as it is typed.
+    ws.update_in(cx, |ws, window, cx| ws.open_new_branch(window, cx));
+    ws.update(cx, |ws, cx| {
+        ws.branch_ticket.update(cx, |input, cx| input.set_text("#101", cx));
+        ws.branch_title.update(cx, |input, cx| input.set_text("Driver Reporting v2", cx));
+    });
+    draw(cx, &ws);
+    assert_eq!(ws.read_with(cx, |ws, cx| ws.typed_branch_name(cx)), "feature/101-driver-reporting-v2");
+    assert!(cx.debug_bounds("new-branch-create").is_some(), "the window is drawn");
+    assert_eq!(ws.read_with(cx, |ws, _| ws.new_branch.as_ref().map(|w| w.base.clone())), Some("develop".to_owned()));
+
+    // A name already taken is not made.
+    ws.update(cx, |ws, cx| {
+        ws.branch_ticket.update(cx, |input, cx| input.set_text("74", cx));
+        ws.branch_title.update(cx, |input, cx| input.set_text("driver reporting", cx));
+    });
+    ws.update(cx, |ws, cx| ws.create_new_branch(cx));
+    cx.run_until_parked();
+    assert!(ws.read_with(cx, |ws, _| ws.new_branch.is_some()), "it stays open");
+
+    // And the real one is made from develop and switched to.
+    ws.update(cx, |ws, cx| {
+        ws.branch_ticket.update(cx, |input, cx| input.set_text("#101", cx));
+        ws.branch_title.update(cx, |input, cx| input.set_text("Driver Reporting v2", cx));
+    });
+    ws.update(cx, |ws, cx| ws.create_new_branch(cx));
+    cx.run_until_parked();
+    assert!(ws.read_with(cx, |ws, _| ws.new_branch.is_none()), "the window closes");
+    let git = GitCli::new(fx.repo());
+    assert_eq!(git.current_branch().unwrap().as_deref(), Some("feature/101-driver-reporting-v2"));
+    let rev = |name: &str| {
+        let out = Command::new("git").arg("-C").arg(fx.repo()).args(["rev-parse", name]).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(rev("feature/101-driver-reporting-v2"), rev("develop"), "it starts where develop is");
+}
+
 /// Clicking a style card in the settings changes how the graph is colored, at once, and is kept for the next launch.
 #[gpui::test]
 async fn choosing_a_graph_style_in_the_settings_recolors_the_graph_and_is_kept(cx: &mut TestAppContext) {

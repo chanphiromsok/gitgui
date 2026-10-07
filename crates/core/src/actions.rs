@@ -111,7 +111,8 @@ impl GitCli {
         self.check_new_branch_name(name)?;
         let at = at.unwrap_or("HEAD");
         check_name(at)?;
-        if switch { self.write(&["switch", "-c", name, at]) } else { self.write(&["branch", name, at]) }
+        // Not tracking the branch it starts from: a new branch pushed to its own name, not to `develop`.
+        if switch { self.write(&["switch", "-c", name, "--no-track", at]) } else { self.write(&["branch", "--no-track", name, at]) }
     }
 
     /// Makes a lightweight tag at `at`.

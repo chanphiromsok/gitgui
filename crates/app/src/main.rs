@@ -27,6 +27,7 @@ mod tests;
 mod text_input;
 mod theme;
 mod ui;
+mod workflow_ui;
 mod workspace;
 
 use gpui::{

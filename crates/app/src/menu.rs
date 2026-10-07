@@ -146,7 +146,7 @@ impl Workspace {
         }
     }
 
-    fn current_branch_name(&self) -> Option<String> {
+    pub(crate) fn current_branch_name(&self) -> Option<String> {
         match &self.repo.as_ref()?.phase {
             Phase::Ready(view) => view.current_branch.as_ref().map(ToString::to_string),
             _ => None,
@@ -612,7 +612,7 @@ impl Workspace {
 
     /// Runs `job` on a background thread, then reads the repository again and reports. `if_unmerged`
     /// names a branch to offer a forced delete for when git says it is not fully merged.
-    fn run(
+    pub(crate) fn run(
         &mut self,
         busy: String,
         done: String,
@@ -682,8 +682,11 @@ impl Workspace {
 
     // ---- drawing ------------------------------------------------------------------------------
 
-    pub fn render_overlays(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        [self.render_menu(window, cx), self.render_dialog(cx), self.render_settings(window, cx)].into_iter().flatten().collect()
+    pub fn render_overlays(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        [self.render_menu(window, cx), self.render_dialog(cx), self.render_new_branch(window, cx), self.render_settings(window, cx)]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     fn render_menu(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -781,6 +784,13 @@ impl Workspace {
                 .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(dialog.title.clone()))
                 .child(div().text_color(rgb(t().text)).child(dialog.body.clone()))
                 .when(dialog.prompt.is_some(), |panel| panel.child(self.dialog_input.clone()))
+                // A branch name that is not how this team names them, said while it is typed.
+                .when_some(
+                    matches!(dialog.action, Action::CreateBranch(_) | Action::RenameBranch(_))
+                        .then(|| self.workflow_hint(self.dialog_input.read(cx).text()))
+                        .flatten(),
+                    |panel, hint| panel.child(div().text_xs().text_color(rgb(t().warning)).child(hint)),
+                )
                 .when_some(dialog.folder.clone(), |panel, folder| {
                     panel.child(
                         div()

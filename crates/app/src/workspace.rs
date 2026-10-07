@@ -459,7 +459,7 @@ pub struct Workspace {
     /// The window's own keyboard focus: a click outside a text field comes back here, so keys like
     /// Up and Down reach the window instead of the field typed in last.
     focus: gpui::FocusHandle,
-    store: Option<Store>,
+    pub(crate) store: Option<Store>,
     pub projects: Vec<Project>,
     pub notice: Option<Notice>,
     pub repo: Option<RepoState>,
@@ -496,6 +496,12 @@ pub struct Workspace {
     avatar_hints: std::cell::RefCell<HashMap<String, avatars::Hint>>,
     pub menu: Option<MenuState>,
     pub dialog: Option<Dialog>,
+    /// The "New branch" window, while it is open, and what is typed in it.
+    pub new_branch: Option<crate::workflow_ui::NewBranch>,
+    pub branch_ticket: Entity<TextInput>,
+    pub branch_title: Entity<TextInput>,
+    /// Asks the next draw to give the title the keyboard (after "Enter" in the ticket).
+    pub branch_focus_title: std::cell::Cell<bool>,
     /// What is being done right now, while a git operation runs.
     pub busy: Option<SharedString>,
     loads: u64,
@@ -676,7 +682,27 @@ impl Workspace {
         cx.subscribe(&dialog_input, |this, _input, event: &TextInputEvent, cx| match event {
             TextInputEvent::Submit => this.confirm_dialog(cx),
             TextInputEvent::Cancel => this.cancel_dialog(cx),
-            TextInputEvent::Changed => {}
+            // The hint under a branch name follows what is typed.
+            TextInputEvent::Changed => cx.notify(),
+        })
+        .detach();
+
+        let branch_ticket = cx.new(|cx| TextInput::new("e.g. 74 or ABC-123 (optional)", cx));
+        cx.subscribe(&branch_ticket, |this, _input, event: &TextInputEvent, cx| match event {
+            // "Enter" after the ticket goes on to the title.
+            TextInputEvent::Submit => {
+                this.branch_focus_title.set(true);
+                cx.notify();
+            }
+            TextInputEvent::Cancel => this.close_new_branch(cx),
+            TextInputEvent::Changed => cx.notify(),
+        })
+        .detach();
+        let branch_title = cx.new(|cx| TextInput::new("What is the work? e.g. driver reporting", cx));
+        cx.subscribe(&branch_title, |this, _input, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Submit => this.create_new_branch(cx),
+            TextInputEvent::Cancel => this.close_new_branch(cx),
+            TextInputEvent::Changed => cx.notify(),
         })
         .detach();
 
@@ -723,6 +749,10 @@ impl Workspace {
             search_input,
             commit_input,
             dialog_input,
+            new_branch: None,
+            branch_ticket,
+            branch_title,
+            branch_focus_title: Default::default(),
             settings,
             settings_open: false,
             hover_line: None,
@@ -1404,6 +1434,9 @@ impl Workspace {
         if self.dialog.is_some() {
             return self.cancel_dialog(cx);
         }
+        if self.new_branch.is_some() {
+            return self.close_new_branch(cx);
+        }
         if self.settings_open {
             return self.close_settings(cx);
         }
@@ -1656,7 +1689,7 @@ impl Workspace {
 
     /// A text field has the keyboard, so keys like the arrows are its own.
     pub fn typing(&self, window: &Window, cx: &App) -> bool {
-        [&self.input, &self.filter_input, &self.search_input, &self.commit_input, &self.dialog_input]
+        [&self.input, &self.filter_input, &self.search_input, &self.commit_input, &self.dialog_input, &self.branch_ticket, &self.branch_title]
             .into_iter()
             .any(|input| gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window))
     }
@@ -2434,6 +2467,11 @@ impl Workspace {
                     } else {
                         view.timing.clone()
                     }),
+            )
+            .child(
+                button("new-branch", "New branch…")
+                    .debug_selector(|| "new-branch".to_owned())
+                    .on_click(cx.listener(|this, _, window, cx| this.open_new_branch(window, cx))),
             )
             .child(
                 button("pull-rebase", "Pull (rebase)")

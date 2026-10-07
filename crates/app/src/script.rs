@@ -109,6 +109,16 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         "theme" => workspace.set_theme(rest, cx),
         "style" => workspace.set_graph_style(rest, cx),
         "hover" => workspace.script_hover(rest, cx),
+        "newbranch" => {
+            workspace.open_new_branch(window, cx);
+            // `newbranch kind ticket title…` also fills it in.
+            let mut words = rest.splitn(3, ' ');
+            if let (Some(kind), Some(ticket), Some(title)) = (words.next(), words.next(), words.next()) {
+                workspace.set_branch_kind(kind, cx);
+                workspace.branch_ticket.update(cx, |input, cx| input.set_text(if ticket == "-" { "" } else { ticket }, cx));
+                workspace.branch_title.update(cx, |input, cx| input.set_text(title, cx));
+            }
+        }
         "search" => workspace.set_search(rest.to_owned(), cx),
         "menu" => {
             // menu authors|dates X Y: the menu a click there on that chip would open.
@@ -135,6 +145,7 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             let page = match rest {
                 "files" => SettingsPage::Files,
                 "style" => SettingsPage::GraphStyle,
+                "workflow" => SettingsPage::Workflow,
                 "appearance" => SettingsPage::Appearance,
                 "projects" => SettingsPage::Projects,
                 _ => SettingsPage::Graph,

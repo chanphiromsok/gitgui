@@ -26,18 +26,20 @@ const MAX_H: f32 = 600.;
 pub enum SettingsPage {
     Graph,
     GraphStyle,
+    Workflow,
     Files,
     Appearance,
     Projects,
 }
 
 impl SettingsPage {
-    pub const ALL: [SettingsPage; 5] = [Self::Graph, Self::GraphStyle, Self::Files, Self::Appearance, Self::Projects];
+    pub const ALL: [SettingsPage; 6] = [Self::Graph, Self::GraphStyle, Self::Workflow, Self::Files, Self::Appearance, Self::Projects];
 
     fn title(self) -> &'static str {
         match self {
             Self::Graph => "Graph",
             Self::GraphStyle => "Graph style",
+            Self::Workflow => "Workflow",
             Self::Files => "Files & diffs",
             Self::Appearance => "Appearance",
             Self::Projects => "Projects",
@@ -48,6 +50,7 @@ impl SettingsPage {
         match self {
             Self::Graph => "How the commit history is drawn and what is shown beside it.",
             Self::GraphStyle => "The colors, line shapes, commit marks and labels of the graph.",
+            Self::Workflow => "How this project's team names branches and where new work starts.",
             Self::Files => "How a commit's changed files and their diffs are laid out.",
             Self::Appearance => "Colors and file icons.",
             Self::Projects => "Where new clones go, and where gitgui keeps its own files.",
@@ -56,7 +59,7 @@ impl SettingsPage {
 }
 
 /// An on/off control.
-fn switch(id: &'static str, on: bool) -> Stateful<gpui::Div> {
+pub(crate) fn switch(id: &'static str, on: bool) -> Stateful<gpui::Div> {
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
@@ -96,7 +99,7 @@ fn row(title: &'static str, detail: &'static str, control: impl IntoElement) -> 
 }
 
 /// Rows of one kind, in a card with a line between them.
-fn card(title: Option<&'static str>, rows: Vec<AnyElement>) -> AnyElement {
+pub(crate) fn card(title: Option<&'static str>, rows: Vec<AnyElement>) -> AnyElement {
     let count = rows.len();
     div()
         .flex()
@@ -277,6 +280,7 @@ impl Workspace {
                 ]
             }
             SettingsPage::GraphStyle => vec![self.graph_style_cards(card_w, cx)],
+            SettingsPage::Workflow => self.workflow_page(cx),
             SettingsPage::Files => vec![card(
                 None,
                 vec![

@@ -12,6 +12,7 @@ pub mod model;
 pub mod people;
 pub mod squash;
 pub mod tree;
+pub mod workflow;
 pub mod worktree;
 
 pub use actions::{CheckoutTarget, Operation, Outcome};
@@ -32,4 +33,5 @@ pub use people::{People, Person, people};
 pub use model::{Commit, CommitDetail, FileChange, FileStatus, Label, LabelKind, Ref, RefKind, labels};
 pub use squash::{BranchTip, Evidence, MergeClue, MergeScan, scan_inputs, subject_pr};
 pub use worktree::WorkFile;
+pub use workflow::{Detected, MergeStyle, Shape, branch_name, detect, name_problem, slugify};
 pub use tree::{Layout, TreeRow, file_tree, flat_list, visible_rows};

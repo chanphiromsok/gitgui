@@ -154,6 +154,20 @@ pub struct Project {
     pub path: PathBuf,
     /// The folder's name.
     pub name: String,
+    /// How this project's team names and starts branches, once it has been set (or learned from the branches).
+    #[serde(default)]
+    pub workflow: Option<WorkflowSetting>,
+}
+
+/// A team's branching habits for one project.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSetting {
+    /// The words a branch name starts with before the slash (`feature`, `bugfix`), in the order they are offered.
+    pub types: Vec<String>,
+    /// How a name is built, by id (`type-ticket-slug`, `type-slug`, `ticket-slug`, `slug`).
+    pub shape: String,
+    /// The branch new work starts from.
+    pub base: Option<String>,
 }
 
 /// Which side of a diff a comment is on. A removed line only exists on the old side.
@@ -223,10 +237,20 @@ impl Store {
             return Ok(existing.clone());
         }
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let project = Project { path, name };
+        let project = Project { path, name, workflow: None };
         projects.push(project.clone());
         write_json(&self.dir.join("projects.json"), &projects)?;
         Ok(project)
+    }
+
+    /// Keeps (or with `None`, forgets) how the team of the project at `path` works.
+    pub fn set_workflow(&self, path: &Path, workflow: Option<WorkflowSetting>) -> Result<(), Error> {
+        let mut projects = self.projects()?;
+        let Some(project) = projects.iter_mut().find(|p| p.path == path) else {
+            return Err(Error::NotFound(path.display().to_string()));
+        };
+        project.workflow = workflow;
+        write_json(&self.dir.join("projects.json"), &projects)
     }
 
     pub fn remove_project(&self, path: &Path) -> Result<(), Error> {
@@ -625,6 +649,24 @@ mod tests {
         assert_eq!(store.settings().unwrap().last_project, None);
         store.save_settings(&Settings { last_project: Some(PathBuf::from("/work/app")), ..Settings::default() }).unwrap();
         assert_eq!(scratch.store().settings().unwrap().last_project, Some(PathBuf::from("/work/app")));
+    }
+
+    #[test]
+    fn a_projects_workflow_is_remembered_and_an_old_file_without_one_still_loads() {
+        let scratch = Scratch::new("workflow");
+        let store = scratch.store();
+        let project = store.add_project(&scratch.folder("repo")).unwrap();
+        assert_eq!(project.workflow, None);
+        let workflow = WorkflowSetting { types: vec!["feature".into(), "bugfix".into()], shape: "type-ticket-slug".into(), base: Some("develop".into()) };
+        store.set_workflow(&project.path, Some(workflow.clone())).unwrap();
+        assert_eq!(scratch.store().projects().unwrap()[0].workflow, Some(workflow));
+        store.set_workflow(&project.path, None).unwrap();
+        assert_eq!(store.projects().unwrap()[0].workflow, None);
+        assert!(store.set_workflow(Path::new("/nowhere"), None).is_err());
+        // A projects.json from before workflows existed.
+        let old = format!(r#"[{{"path": {:?}, "name": "repo"}}]"#, project.path);
+        std::fs::write(scratch.0.join("data").join("projects.json"), old).unwrap();
+        assert_eq!(store.projects().unwrap()[0].workflow, None);
     }
 
     #[test]
