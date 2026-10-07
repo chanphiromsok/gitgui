@@ -14,7 +14,7 @@ use gitgui_core::{
     MergeClue, Operation, Query, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count, visible_rows,
     people, web_remote,
 };
-use gitgui_store::{Comment, NewComment, Project, Settings, Store};
+use gitgui_store::{Comment, DiffMode, FileLayout, NewComment, Project, Settings, Store};
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, FontWeight, ListAlignment, ListState, MouseButton, MouseMoveEvent,
     PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
@@ -272,7 +272,7 @@ pub struct RepoState {
 }
 
 impl RepoState {
-    fn loading(project: Project, generation: u64) -> Self {
+    fn loading(project: Project, generation: u64, settings: &Settings) -> Self {
         Self {
             collapsed: HashSet::new(),
             folded_dirs: HashSet::new(),
@@ -284,9 +284,9 @@ impl RepoState {
             selected: None,
             commit: None,
             file: None,
-            mode: Mode::Unified,
+            mode: mode_of(settings.diff_mode),
             expanded: false,
-            layout: Layout::Tree,
+            layout: layout_of(settings.file_layout),
             files_visible: true,
             filter: String::new(),
             file_rows: Vec::new(),
@@ -645,7 +645,7 @@ impl Workspace {
         if kept.is_none() {
             self.search_input.update(cx, |input, cx| input.clear(cx));
         }
-        let mut state = RepoState::loading(project, generation);
+        let mut state = RepoState::loading(project, generation, &self.settings);
         state.graph_filter = kept.unwrap_or_default();
         let rerun = matches!(state.graph_filter.query(), Query::Path(_) | Query::Code(_));
         self.repo = Some(state);
@@ -962,13 +962,16 @@ impl Workspace {
         }
     }
 
+    /// Tree or flat list of changed files. The choice is kept for the next launch.
     pub fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
-        let Some(repo) = self.repo.as_mut() else { return };
+        self.settings.file_layout = file_layout_of(layout);
+        self.save_settings();
+        let Some(repo) = self.repo.as_mut() else { return cx.notify() };
         if repo.layout != layout {
             repo.layout = layout;
             repo.refresh_file_rows();
-            cx.notify();
         }
+        cx.notify();
     }
 
     pub fn set_filter(&mut self, filter: String, cx: &mut Context<Self>) {
@@ -1212,14 +1215,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Unified or split diff. The choice is kept for the next launch.
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        let Some(repo) = self.repo.as_mut() else { return };
-        if repo.mode == mode {
-            return;
-        }
-        repo.mode = mode;
-        if let Some(file) = repo.file.as_mut() {
-            file.rebuild(mode, false);
+        self.settings.diff_mode = diff_mode_of(mode);
+        self.save_settings();
+        let Some(repo) = self.repo.as_mut() else { return cx.notify() };
+        if repo.mode != mode {
+            repo.mode = mode;
+            if let Some(file) = repo.file.as_mut() {
+                file.rebuild(mode, false);
+            }
         }
         cx.notify();
     }
@@ -1855,6 +1860,34 @@ fn bar_checkbox(
                 .when(on, |b| b.child("✓")),
         )
         .child(label)
+}
+
+fn layout_of(saved: FileLayout) -> Layout {
+    match saved {
+        FileLayout::Tree => Layout::Tree,
+        FileLayout::Flat => Layout::Flat,
+    }
+}
+
+fn file_layout_of(layout: Layout) -> FileLayout {
+    match layout {
+        Layout::Tree => FileLayout::Tree,
+        Layout::Flat => FileLayout::Flat,
+    }
+}
+
+fn mode_of(saved: DiffMode) -> Mode {
+    match saved {
+        DiffMode::Unified => Mode::Unified,
+        DiffMode::Split => Mode::Split,
+    }
+}
+
+fn diff_mode_of(mode: Mode) -> DiffMode {
+    match mode {
+        Mode::Unified => DiffMode::Unified,
+        Mode::Split => DiffMode::Split,
+    }
 }
 
 fn centered(content: impl IntoElement) -> AnyElement {

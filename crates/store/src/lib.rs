@@ -38,6 +38,24 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// How a commit's changed files are listed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileLayout {
+    #[default]
+    Tree,
+    Flat,
+}
+
+/// How a file's diff is laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffMode {
+    #[default]
+    Unified,
+    Split,
+}
+
 /// Choices the user can change. Every field has a default, so a file written by an older version
 /// (with fewer fields) still loads, and a field this version does not know is ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,11 +73,24 @@ pub struct Settings {
     pub compact_graph: bool,
     /// Fetch authors' pictures from GitHub and Gravatar; off draws their initials only.
     pub fetch_avatars: bool,
+    /// Changed files as a tree or a flat list. Remembered from one launch to the next.
+    pub file_layout: FileLayout,
+    /// A file's diff unified or split. Remembered from one launch to the next.
+    pub diff_mode: DiffMode,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { group_by_parent: true, theme: None, icon_theme: None, sidebar_hidden: false, compact_graph: false, fetch_avatars: true }
+        Self {
+            group_by_parent: true,
+            theme: None,
+            icon_theme: None,
+            sidebar_hidden: false,
+            compact_graph: false,
+            fetch_avatars: true,
+            file_layout: FileLayout::Tree,
+            diff_mode: DiffMode::Unified,
+        }
     }
 }
 
@@ -491,5 +522,32 @@ mod tests {
 
         assert!(matches!(store.settings(), Err(Error::Corrupt { .. })));
         assert_eq!(fs::read_to_string(&file).unwrap(), "not json");
+    }
+
+    #[test]
+    fn the_file_list_and_diff_layout_are_remembered_and_default_to_tree_and_unified() {
+        let scratch = Scratch::new("layout-settings");
+        let store = scratch.store();
+        let fresh = store.settings().unwrap();
+        assert_eq!((fresh.file_layout, fresh.diff_mode), (FileLayout::Tree, DiffMode::Unified));
+
+        store.save_settings(&Settings { file_layout: FileLayout::Flat, diff_mode: DiffMode::Split, ..Settings::default() }).unwrap();
+        let again = scratch.store().settings().unwrap();
+        assert_eq!((again.file_layout, again.diff_mode), (FileLayout::Flat, DiffMode::Split));
+        let text = fs::read_to_string(scratch.0.join("data/settings.json")).unwrap();
+        assert!(text.contains("\"flat\"") && text.contains("\"split\""), "readable in the file: {text}");
+    }
+
+    #[test]
+    fn a_settings_file_from_before_these_choices_keeps_the_defaults() {
+        let scratch = Scratch::new("layout-compat");
+        fs::create_dir_all(scratch.0.join("data")).unwrap();
+        fs::write(scratch.0.join("data/settings.json"), r#"{"group_by_parent": false}"#).unwrap();
+        let loaded = scratch.store().settings().unwrap();
+        assert!(!loaded.group_by_parent);
+        assert_eq!((loaded.file_layout, loaded.diff_mode), (FileLayout::Tree, DiffMode::Unified));
+        // A value from a newer version that this one does not know is an error, not a silent reset.
+        fs::write(scratch.0.join("data/settings.json"), r#"{"diff_mode": "sideways"}"#).unwrap();
+        assert!(matches!(scratch.store().settings(), Err(Error::Corrupt { .. })));
     }
 }

@@ -1500,3 +1500,58 @@ async fn one_person_under_two_identities_gets_one_profile(cx: &mut TestAppContex
     assert_eq!(local.1.name, "Ada", "named as she commits most");
     assert_eq!(local.1.avatar_email, "123+ada@users.noreply.github.com", "pictured by her GitHub account");
 }
+
+#[gpui::test]
+async fn flat_and_split_are_remembered_for_the_next_start(cx: &mut TestAppContext) {
+    use gitgui_store::{DiffMode, FileLayout};
+    let fx = merged_pr("remember-layout");
+
+    // First run: the defaults are tree and unified. Switch to flat and split.
+    {
+        let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+        open_project(&ws, cx, &fx.repo());
+        let (layout, mode) = ws.read_with(cx, |ws, _| {
+            let repo = ws.repo.as_ref().unwrap();
+            (repo.layout, repo.mode)
+        });
+        assert_eq!((layout, mode), (Layout::Tree, Mode::Unified));
+
+        ws.update(cx, |ws, cx| ws.set_layout(Layout::Flat, cx));
+        ws.update(cx, |ws, cx| ws.set_mode(Mode::Split, cx));
+        let saved = Store::at(fx.data()).settings().unwrap();
+        assert_eq!((saved.file_layout, saved.diff_mode), (FileLayout::Flat, DiffMode::Split), "written as soon as it is chosen");
+
+        // The Settings panel shows the same two choices.
+        ws.update(cx, |ws, cx| ws.open_settings(cx));
+        draw(cx, &ws);
+    }
+
+    // Next start: a brand new workspace on the same data folder opens in flat and split.
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let (layout, mode) = ws.read_with(cx, |ws, _| {
+        let repo = ws.repo.as_ref().unwrap();
+        (repo.layout, repo.mode)
+    });
+    assert_eq!((layout, mode), (Layout::Flat, Mode::Split), "restored without touching anything");
+
+    // And it really shows: the file list is flat and the diff is side by side.
+    select(&ws, cx, "chore: m1");
+    let flat = ws.read_with(cx, |ws, _| {
+        ws.repo.as_ref().unwrap().file_rows.iter().all(|row| matches!(row, gitgui_core::TreeRow::File { .. }))
+    });
+    assert!(flat, "no folder rows in a flat list");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    let has_pairs = ws.read_with(cx, |ws, _| {
+        ws.repo.as_ref().unwrap().file.as_ref().unwrap().rows.iter().any(|r| matches!(r, DisplayRow::Pair { .. }))
+    });
+    assert!(has_pairs, "the first file opens split, with no click on Split");
+    draw(cx, &ws);
+
+    // Changing them in the Settings panel works the same way, and the project switch keeps them.
+    ws.update(cx, |ws, cx| ws.set_layout(Layout::Tree, cx));
+    ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx));
+    let back = Store::at(fx.data()).settings().unwrap();
+    assert_eq!((back.file_layout, back.diff_mode), (FileLayout::Tree, DiffMode::Unified));
+}

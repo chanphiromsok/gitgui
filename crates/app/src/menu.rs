@@ -12,7 +12,10 @@ use gpui::{
     rgb, rgba,
 };
 
+use crate::rows::Mode;
 use crate::ui::button;
+use gitgui_core::Layout;
+use gitgui_store::{DiffMode, FileLayout};
 use crate::workspace::{Phase, Workspace};
 use crate::icons;
 use crate::theme::{Origin, t};
@@ -637,6 +640,26 @@ impl Workspace {
                     "Narrow lanes and thin lines, so a busy history leaves more room for the messages.",
                     cx.listener(|this, _, _, cx| this.toggle_compact_graph(cx)),
                 ))
+                .child(choice_row(
+                    "File list",
+                    "How a commit's changed files are listed. Also the Tree / Flat buttons above the list.",
+                    [
+                        ("setting-layout-tree", "Tree", self.settings.file_layout == FileLayout::Tree),
+                        ("setting-layout-flat", "Flat", self.settings.file_layout == FileLayout::Flat),
+                    ],
+                    cx.listener(|this, _, _, cx| this.set_layout(Layout::Tree, cx)),
+                    cx.listener(|this, _, _, cx| this.set_layout(Layout::Flat, cx)),
+                ))
+                .child(choice_row(
+                    "Diff view",
+                    "How a file's changes are laid out. Also the Unified / Split buttons above the diff.",
+                    [
+                        ("setting-diff-unified", "Unified", self.settings.diff_mode == DiffMode::Unified),
+                        ("setting-diff-split", "Split", self.settings.diff_mode == DiffMode::Split),
+                    ],
+                    cx.listener(|this, _, _, cx| this.set_mode(Mode::Unified, cx)),
+                    cx.listener(|this, _, _, cx| this.set_mode(Mode::Split, cx)),
+                ))
                 .child(self.render_theme_picker(cx))
                 .child(self.render_icon_picker(cx))
                 .child(div().flex().justify_end().child(button("settings-done", "Done").on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))))),
@@ -764,6 +787,35 @@ impl Workspace {
 }
 
 /// A checkbox with a title and a line saying what it does.
+/// A setting with two choices, as a pair of buttons with the chosen one lit.
+fn choice_row(
+    title: &'static str,
+    detail: &'static str,
+    choices: [(&'static str, &'static str, bool); 2],
+    first: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+    second: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let [(id_a, label_a, on_a), (id_b, label_b, on_b)] = choices;
+    let pick = |id, label, chosen: bool| {
+        button(id, label).when(chosen, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+    };
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().text_xs().text_color(rgb(t().muted)).child(detail)),
+        )
+        .child(div().flex().gap_1().child(pick(id_a, label_a, on_a).on_click(first)).child(pick(id_b, label_b, on_b).on_click(second)))
+        .into_any_element()
+}
+
 fn setting_toggle(
     id: &'static str,
     on: bool,
