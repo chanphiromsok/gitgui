@@ -11,6 +11,7 @@
 //! select <text>           the first commit whose summary has the text (or a row number)
 //! file 0                  open the commit's nth changed file
 //! mode split|unified      layout tree|flat      expand      back      more
+//! search <text>   fill the search box (author:… date:… words)      menu authors|dates X Y   open that chip's menu
 //! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
@@ -38,6 +39,8 @@ pub fn run(window: WindowHandle<Workspace>, file: String, cx: &mut App) {
     };
     let dir = std::env::var_os("GITGUI_SHOTS").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     eprintln!("gitgui: running the script {file}");
+    // A window that is covered is not drawn, and a picture of it would show what it last drew.
+    cx.activate(true);
     cx.spawn(async move |cx| {
         let executor = cx.background_executor().clone();
         let pause = |ms: u64| executor.timer(Duration::from_millis(ms));
@@ -95,6 +98,15 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             cx,
         ),
         "theme" => workspace.set_theme(rest, cx),
+        "search" => workspace.set_search(rest.to_owned(), cx),
+        "menu" => {
+            // menu authors|dates X Y: the menu a click there on that chip would open.
+            let (kind, at) = rest.split_once(' ').unwrap_or((rest, "0 0"));
+            if let [x, y] = numbers(at)[..] {
+                let target = if kind == "dates" { crate::menu::MenuTarget::Dates } else { crate::menu::MenuTarget::Authors };
+                workspace.open_menu(gpui::point(px(x), px(y)), target, cx);
+            }
+        }
         "sidebar" => workspace.toggle_sidebar(cx),
         "graph" => workspace.toggle_graph_hidden(cx),
         "files" => workspace.toggle_files_visible(cx),

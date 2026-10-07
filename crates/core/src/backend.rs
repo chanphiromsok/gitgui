@@ -348,6 +348,13 @@ impl GitCli {
         Ok((fingerprint, Some(commits_of(&stashes, &stdout)?)))
     }
 
+    /// Seconds east of UTC in the time zone git writes times in here, from `git var GIT_COMMITTER_IDENT`
+    /// (`Ada <a@x> 1700000000 +0700`). 0 when git cannot say.
+    pub fn utc_offset(&self) -> i64 {
+        let ident = String::from_utf8_lossy(&self.run(&["var", "GIT_COMMITTER_IDENT"]).unwrap_or_default()).into_owned();
+        parse_zone(ident.split_whitespace().last().unwrap_or(""))
+    }
+
     pub(crate) fn has_head(&self) -> bool {
         self.command(&["rev-parse", "--verify", "--quiet", "HEAD"])
             .output()
@@ -606,6 +613,21 @@ const FIELD: char = '\x1f';
 const RECORD_END: char = '\x1e';
 // Names and emails through `.mailmap` (%aN, %cN…), so a repository can say which identities are one person.
 const LOG_FORMAT: &str = "--format=%x1e%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ad%x1f%D%x1f%cN%x1f%cE%x1f%s";
+/// `+0700` → 25200, `-0330` → -12600; 0 for anything else.
+fn parse_zone(zone: &str) -> i64 {
+    let sign = match zone.as_bytes().first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return 0,
+    };
+    let digits = &zone[1..];
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return 0;
+    }
+    let (hours, minutes): (i64, i64) = (digits[..2].parse().unwrap_or(0), digits[2..].parse().unwrap_or(0));
+    sign * (hours * 3600 + minutes * 60)
+}
+
 const DATE_FORMAT: &str = "--date=format-local:%e %b %Y %H:%M";
 const LONG_DATE_FORMAT: &str = "--date=format-local:%a %b %e %Y %H:%M:%S %z";
 const DETAIL_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%ad%x1f%B";

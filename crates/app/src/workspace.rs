@@ -109,9 +109,15 @@ impl RepoView {
         let squashed = self.squashed();
         let hidden: HashSet<String> =
             if filter.hide_merged { self.clues.iter().map(|clue| clue.branch.clone()).collect() } else { HashSet::new() };
-        let narrowed = filter.scope != Scope::All || !hidden.is_empty() || filter.hide_stashes;
-        let shown =
-            if narrowed { filter_commits(&self.commits, filter.scope, &hidden, !filter.hide_stashes) } else { Vec::new() };
+        // `author:` and `date:` in the search limit the graph itself, joining what is left (see `narrow`).
+        let constraints = self.with_every_identity(filter.parsed().0);
+        let narrowed = filter.scope != Scope::All || !hidden.is_empty() || filter.hide_stashes || !constraints.is_empty();
+        let shown = if narrowed {
+            let base = filter_commits(&self.commits, filter.scope, &hidden, !filter.hide_stashes);
+            if constraints.is_empty() { base } else { gitgui_core::narrow(&base, |commit| constraints.matches(commit)) }
+        } else {
+            Vec::new()
+        };
         self.stashes = stash_count(&self.commits);
         let commits: &[Commit] = if narrowed { &shown } else { &self.commits };
         let built = graph::build_entries(
@@ -155,6 +161,24 @@ impl RepoView {
         self.apply_search(filter);
     }
 
+    /// An author asked for by name or email stands for the person, so every email they commit under counts.
+    fn with_every_identity(&self, mut constraints: gitgui_core::Constraints) -> gitgui_core::Constraints {
+        for asked in constraints.authors.clone() {
+            for (person, emails) in self.people.everyone() {
+                let is_them = person.name.to_lowercase().contains(&asked)
+                    || emails.iter().any(|email| *email == asked || email.contains(asked.as_str()));
+                if is_them {
+                    for email in emails {
+                        if !constraints.authors.iter().any(|a| a == email) {
+                            constraints.authors.push(email.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        constraints
+    }
+
     /// Marks the rows the search does not find, and lists the ones it does.
     fn apply_search(&mut self, filter: &GraphFilter) {
         let query = filter.query();
@@ -187,6 +211,8 @@ pub struct GraphFilter {
     pub hide_stashes: bool,
     /// The search box's text.
     pub search: String,
+    /// Today, for `date:today` and `date:7d` in the search; set when the repository is read.
+    pub today: gitgui_core::Day,
     /// What git found for a `path:` or `code:` search, and the text it was asked for.
     pub found: Option<(String, HashSet<String>)>,
     /// A `path:` or `code:` search is running.
@@ -194,13 +220,19 @@ pub struct GraphFilter {
 }
 
 impl GraphFilter {
+    /// The search split into the author and date it limits the graph to, and the words that are left.
+    pub fn parsed(&self) -> (gitgui_core::Constraints, String) {
+        gitgui_core::parse_constraints(&self.search, self.today)
+    }
+
     pub fn query(&self) -> Query {
-        Query::parse(&self.search)
+        Query::parse(&self.parsed().1)
     }
 
     /// What git found for the search as it reads now; `None` when it has not been asked.
     fn found_now(&self) -> Option<&HashSet<String>> {
-        self.found.as_ref().filter(|(text, _)| text == self.search.trim()).map(|(_, ids)| ids)
+        let text = self.parsed().1;
+        self.found.as_ref().filter(|(asked, _)| *asked == text.trim()).map(|(_, ids)| ids)
     }
 }
 
@@ -512,6 +544,8 @@ struct RepoData {
     /// The repository's web home, from its remote, for pull request and commit links.
     web: Option<WebRemote>,
     work: Vec<WorkFile>,
+    /// The day it is here, for `date:today` in the search.
+    today: gitgui_core::Day,
 }
 
 /// Reads the repository; the commits are left unparsed (`None`) when the log is the one `unchanged`
@@ -543,7 +577,9 @@ fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_cor
     let in_progress = git.in_progress();
     let web = git.remote_url().ok().flatten().and_then(|url| web_remote(&url));
     let work = git.work_status().unwrap_or_default();
-    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), in_progress, web, work })
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let today = gitgui_core::day_of(now, git.utc_offset());
+    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), in_progress, web, work, today })
 }
 
 /// A commit's record and the files it changed; `None` when it stopped early because `wanted` said the
@@ -942,6 +978,7 @@ impl Workspace {
                     Ok((data, commits, everyone)) => {
                         let in_progress = data.in_progress;
                         repo.work = data.work;
+                        repo.graph_filter.today = data.today;
                         this.last_log = Some(LastLog {
                             path: path.clone(),
                             fingerprint: data.fingerprint,
@@ -1661,14 +1698,21 @@ impl Workspace {
     /// The search box changed: a plain search dims what it misses right away; `path:` and `code:`
     /// wait for Enter, since they ask git.
     pub fn set_search(&mut self, text: String, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
         let Some(repo) = self.repo.as_mut() else { return };
         if repo.graph_filter.search == text {
             return;
         }
+        let before = repo.graph_filter.parsed().0;
         repo.graph_filter.search = text;
-        let filter = repo.graph_filter.clone();
-        if let Phase::Ready(view) = &mut repo.phase {
-            view.apply_search(&filter);
+        // A new author or date limits the graph itself, so it is drawn again; other words only mark rows.
+        if repo.graph_filter.parsed().0 != before {
+            repo.rebuild(&settings);
+        } else {
+            let filter = repo.graph_filter.clone();
+            if let Phase::Ready(view) = &mut repo.phase {
+                view.apply_search(&filter);
+            }
         }
         cx.notify();
     }
@@ -1703,7 +1747,7 @@ impl Workspace {
     fn run_search(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.as_mut() else { return };
         let query = repo.graph_filter.query();
-        let text = repo.graph_filter.search.trim().to_owned();
+        let text = repo.graph_filter.parsed().1.trim().to_owned();
         let path = repo.project.path.clone();
         let generation = repo.generation;
         repo.graph_filter.searching = true;
@@ -2383,6 +2427,36 @@ impl Workspace {
             cx.listener(|this, _, _, cx| this.toggle_stashes(cx)),
         );
 
+        // The author and the days the graph is limited to, as chips that open a menu to change them.
+        let author_term = gitgui_core::term(&filter.search, "author");
+        let date_term = gitgui_core::term(&filter.search, "date")
+            .or_else(|| gitgui_core::term(&filter.search, "since").map(|d| format!("from {d}")))
+            .or_else(|| gitgui_core::term(&filter.search, "until").map(|d| format!("until {d}")));
+        let author_label = match &author_term {
+            Some(asked) => {
+                // An email or a name that belongs to someone in the history is shown as their name.
+                let name = view.people.of(asked).map(|person| person.name.clone());
+                format!("Author: {} ▾", name.unwrap_or_else(|| asked.clone()))
+            }
+            None => "Author ▾".to_owned(),
+        };
+        let date_label = match date_term.as_deref() {
+            Some("today") => "Date: Today ▾".to_owned(),
+            Some("yesterday") => "Date: Yesterday ▾".to_owned(),
+            Some("7d") => "Date: Last 7 days ▾".to_owned(),
+            Some("30d") => "Date: Last 30 days ▾".to_owned(),
+            Some("month") => "Date: This month ▾".to_owned(),
+            Some(other) => format!("Date: {other} ▾"),
+            None => "Date ▾".to_owned(),
+        };
+        let chip = |id: &'static str, label: String, active: bool, target: crate::menu::MenuTarget| {
+            ui::toggle(id, label, active)
+                .debug_selector(move || id.to_owned())
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| this.open_menu(event.position(), target.clone(), cx)))
+        };
+        let author_chip = chip("filter-author", author_label, author_term.is_some(), crate::menu::MenuTarget::Authors);
+        let date_chip = chip("filter-date", date_label, date_term.is_some(), crate::menu::MenuTarget::Dates);
+
         let query = filter.query();
         let asks_git = matches!(query, Query::Path(_) | Query::Code(_));
         let status: Option<String> = match query {
@@ -2416,6 +2490,8 @@ impl Workspace {
             .child(scopes)
             .child(hide_merged)
             .child(stashes)
+            .child(author_chip)
+            .child(date_chip)
             .child(search)
             .children(status.map(|text| div().flex_none().text_xs().text_color(rgb(t().muted)).child(text)))
             .into_any_element()

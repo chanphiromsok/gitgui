@@ -21,7 +21,10 @@ pub use group::{Placed, descendants, group_by_parent};
 pub use lineage::{
     CommitKind, branch_rank, commit_branches, commit_kind, commit_rank, conventional_prefix, lineage_names, merged_branch_name,
 };
-pub use filter::{Query, Scope, filter_commits, matches_text, stash_count};
+pub use filter::{
+    Constraints, Day, Query, Scope, add_days, commit_day, day_of, filter_commits, matches_text, narrow, parse_constraints, stash_count,
+    term, with_term,
+};
 pub use diff::{DiffLine, FileDiff, Hunk, LineKind, Pair};
 pub use people::{People, Person, people};
 pub use model::{Commit, CommitDetail, FileChange, FileStatus, Label, LabelKind, Ref, RefKind, labels};

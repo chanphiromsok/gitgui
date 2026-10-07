@@ -126,6 +126,17 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Replaces the text and puts the caret at its end, so typing goes on after it.
+    pub fn replace_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.content = SharedString::from(text.to_owned());
+        self.selected_range = text.len()..text.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.last_layout = None;
+        cx.emit(TextInputEvent::Changed);
+        cx.notify();
+    }
+
     pub fn focus(&self, window: &mut Window) {
         window.focus(&self.focus_handle);
     }

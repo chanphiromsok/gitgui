@@ -27,6 +27,10 @@ pub enum MenuTarget {
     Label(Label),
     /// A commit, by its full id.
     Commit(String),
+    /// The authors to limit the graph to.
+    Authors,
+    /// The days to limit the graph to.
+    Dates,
 }
 
 /// Something a menu item does.
@@ -47,6 +51,10 @@ pub enum Action {
     /// Make a tag at this commit.
     CreateTag(String),
     CherryPick(String),
+    /// Limit the graph to this author (an email), or to anyone.
+    FilterAuthor(Option<String>),
+    /// Limit the graph to these days (a `date:` value like `today` or `7d`), or to any time.
+    FilterDate(Option<String>),
     /// Clone a repository by address (typed in the dialog) into the dialog's folder.
     Clone,
     Copy { text: String, what: &'static str },
@@ -171,6 +179,46 @@ impl Workspace {
         let copy = |text: &str, what: &'static str| Action::Copy { text: text.to_owned(), what };
 
         match target {
+            MenuTarget::Authors => {
+                let (search, people, commits) = match self.repo.as_ref().map(|repo| (&repo.graph_filter.search, &repo.phase)) {
+                    Some((search, Phase::Ready(view))) => (search.clone(), Some(view.people.clone()), Some(view.commits.clone())),
+                    Some((search, _)) => (search.clone(), None, None),
+                    None => (String::new(), None, None),
+                };
+                let asked = gitgui_core::term(&search, "author").map(|a| a.to_lowercase());
+                let tick = |on: bool, label: &str| if on { format!("✓  {label}") } else { format!("    {label}") };
+                let mut out = vec![item(&tick(asked.is_none(), "Anyone"), Action::FilterAuthor(None), true), separator()];
+                if let (Some(people), Some(commits)) = (people, commits) {
+                    // The people who made the most commits first.
+                    let mut counts: Vec<(String, String, usize)> = Vec::new();
+                    for commit in commits.iter() {
+                        if let Some(person) = people.of(&commit.email) {
+                            match counts.iter_mut().find(|(_, email, _)| *email == person.email) {
+                                Some(entry) => entry.2 += 1,
+                                None => counts.push((person.name.clone(), person.email.clone(), 1)),
+                            }
+                        }
+                    }
+                    counts.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+                    for (name, email, _) in counts.into_iter().take(14) {
+                        let on = asked.as_deref().is_some_and(|a| a == email.to_lowercase() || name.to_lowercase() == a);
+                        out.push(item(&tick(on, &name), Action::FilterAuthor(Some(email)), true));
+                    }
+                }
+                out
+            }
+            MenuTarget::Dates => {
+                let search = self.repo.as_ref().map(|repo| repo.graph_filter.search.clone()).unwrap_or_default();
+                let asked = gitgui_core::term(&search, "date");
+                let tick = |on: bool, label: &str| if on { format!("✓  {label}") } else { format!("    {label}") };
+                let mut out = vec![item(&tick(asked.is_none(), "Any time"), Action::FilterDate(None), true), separator()];
+                for (label, spec) in [("Today", "today"), ("Yesterday", "yesterday"), ("Last 7 days", "7d"), ("Last 30 days", "30d"), ("This month", "month")] {
+                    out.push(item(&tick(asked.as_deref() == Some(spec), label), Action::FilterDate(Some(spec.to_owned())), true));
+                }
+                out.push(separator());
+                out.push(item("    Or type date:2026-10-01..2026-10-07", Action::FilterDate(asked.clone()), false));
+                out
+            }
             MenuTarget::Label(label) => {
                 let name = label.name.clone();
                 let on_it = label.head || current.as_deref() == Some(name.as_str());
@@ -238,6 +286,12 @@ impl Workspace {
         }
         if let Action::OpenUrl(url) = action {
             return cx.open_url(&url);
+        }
+        // Limiting the graph is not an operation on the repository: it rewrites the search box.
+        match action {
+            Action::FilterAuthor(value) => return self.set_search_term("author", value, cx),
+            Action::FilterDate(value) => return self.set_search_term("date", value, cx),
+            _ => {}
         }
         if self.busy.is_some() {
             return self.say(Notice::warn("Another operation is still running."), cx);
@@ -364,7 +418,7 @@ impl Workspace {
                 false,
                 Some(String::new()),
             ),
-            Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) => return,
+            Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => return,
         };
         if let Some(initial) = &prompt {
             let initial = initial.clone();
@@ -430,12 +484,22 @@ impl Workspace {
                 let shown = short(&at);
                 self.run(format!("Tagging {shown}…"), format!("Tagged {shown} as {typed}."), None, move |git| git.create_tag(&typed, &at).map(Outcome::Done), cx);
             }
-            Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) => {}
+            Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => {}
             Action::Clone => {
                 let folder = dialog.folder.unwrap_or_else(|| self.clone_folder());
                 self.clone_repo(typed, folder, cx);
             }
         }
+    }
+
+    // ---- limiting the graph ---------------------------------------------------------------------
+
+    /// Puts `key:value` in the search box (taking out any other `key:` word), or only takes it out. The box is
+    /// the one place the author and date live, so what the menus choose can be read, edited and typed over.
+    pub(crate) fn set_search_term(&mut self, key: &str, value: Option<String>, cx: &mut Context<Self>) {
+        let current = self.search_input.read(cx).text().to_owned();
+        let next = gitgui_core::with_term(&current, key, value.as_deref());
+        self.search_input.update(cx, |input, cx| input.replace_text(&next, cx));
     }
 
     // ---- cloning ------------------------------------------------------------------------------

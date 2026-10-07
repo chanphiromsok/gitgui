@@ -2304,3 +2304,99 @@ async fn the_pane_below_the_graph_has_a_divider_that_resizes_it_within_limits(cx
     ws.update(cx, |ws, cx| ws.set_review_layout(gitgui_store::ReviewLayout::Beside, cx));
     assert_eq!(Store::at(fx.data()).settings().unwrap().review_layout, gitgui_store::ReviewLayout::Beside, "kept");
 }
+
+/// A commit by `who` on `day` (noon UTC, so it is the same day wherever the test runs).
+fn commit_as(fx: &Fixture, who: (&str, &str), day: &str, file: &str, message: &str) {
+    fx.write(file, message);
+    fx.git(&["add", "."]);
+    let date = format!("{day}T12:00:00 +0000");
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(fx.repo())
+        .args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", who.0)
+        .env("GIT_AUTHOR_EMAIL", who.1)
+        .env("GIT_COMMITTER_NAME", who.0)
+        .env("GIT_COMMITTER_EMAIL", who.1)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "commit {message}");
+}
+
+#[gpui::test]
+async fn the_graph_can_be_limited_to_an_author_and_to_days_from_the_search_box_and_the_menus(cx: &mut TestAppContext) {
+    use crate::menu::Action;
+    let fx = bare_fixture("by-author-date");
+    let (ada, bob) = (("Ada Lovelace", "ada@example.com"), ("Bob Barker", "bob@example.com"));
+    commit_as(&fx, ada, "2026-10-01", "a.txt", "one by ada");
+    commit_as(&fx, bob, "2026-10-02", "b.txt", "two by bob");
+    commit_as(&fx, ada, "2026-10-05", "c.txt", "three by ada");
+    commit_as(&fx, bob, "2026-10-06", "d.txt", "four by bob");
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let shown = |cx: &VisualTestContext| -> Vec<String> {
+        ws.read_with(cx, |ws, _| {
+            let Phase::Ready(view) = &ws.repo.as_ref().unwrap().phase else { panic!("not ready") };
+            view.entries.iter().filter(|e| e.commit.is_some()).map(|e| e.summary.to_string()).collect()
+        })
+    };
+    let search = |ws: &Entity<Workspace>, cx: &mut VisualTestContext, text: &str| {
+        ws.update(cx, |ws, cx| ws.set_search(text.to_owned(), cx));
+        draw(cx, ws);
+    };
+    assert_eq!(shown(cx).len(), 4);
+
+    // An author, by part of the name: the others are not in the graph at all.
+    search(&ws, cx, "author:bob");
+    assert_eq!(shown(cx), ["four by bob", "two by bob"]);
+    assert!(ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => view.timing.contains("2 of 4 commits"),
+        _ => false,
+    }), "the count says what is shown");
+
+    // Days: a range with an open end, one day, a month.
+    search(&ws, cx, "date:2026-10-05..");
+    assert_eq!(shown(cx), ["four by bob", "three by ada"]);
+    search(&ws, cx, "date:2026-10-02");
+    assert_eq!(shown(cx), ["two by bob"]);
+    search(&ws, cx, "date:2026-10");
+    assert_eq!(shown(cx).len(), 4);
+    search(&ws, cx, "date:2026-09");
+    assert!(shown(cx).is_empty(), "no commit in September: an empty graph, not a crash");
+
+    // Both together, and words besides them still mark rows.
+    search(&ws, cx, "author:ada date:2026-10-02..");
+    assert_eq!(shown(cx), ["three by ada"]);
+    search(&ws, cx, "author:ada two");
+    assert_eq!(shown(cx), ["three by ada", "one by ada"]);
+
+    // Half a date, while it is typed, limits nothing.
+    search(&ws, cx, "date:2026-1");
+    assert_eq!(shown(cx).len(), 4);
+
+    // The menus write the same words in the box, keeping what else is typed there.
+    search(&ws, cx, "");
+    ws.update(cx, |ws, cx| ws.set_search_term("author", Some("bob@example.com".into()), cx));
+    assert_eq!(ws.read_with(cx, |ws, app| ws.search_input.read(app).text().to_owned()), "author:bob@example.com");
+    assert_eq!(shown(cx), ["four by bob", "two by bob"]);
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::FilterDate(Some("7d".into())), window, cx));
+    let text = ws.read_with(cx, |ws, app| ws.search_input.read(app).text().to_owned());
+    assert_eq!(text, "author:bob@example.com date:7d");
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::FilterAuthor(None), window, cx));
+    let text = ws.read_with(cx, |ws, app| ws.search_input.read(app).text().to_owned());
+    assert_eq!(text, "date:7d", "Anyone takes the author out and leaves the days");
+
+    // The chips are in the filter bar and the menus list the people and the presets.
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("filter-author").is_some() && cx.debug_bounds("filter-date").is_some());
+    let people: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&crate::menu::MenuTarget::Authors).iter().map(|i| i.label.to_string()).collect());
+    assert!(people.iter().any(|l| l.contains("Ada Lovelace")) && people.iter().any(|l| l.contains("Bob Barker")), "{people:?}");
+    let dates: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&crate::menu::MenuTarget::Dates).iter().map(|i| i.label.to_string()).collect());
+    assert!(dates.iter().any(|l| l.starts_with('✓') && l.contains("Last 7 days")), "the chosen preset is ticked: {dates:?}");
+}

@@ -33,6 +33,15 @@ pub struct People {
 }
 
 impl People {
+    /// Everyone in the history with every email they commit under (lowercase), in no particular order.
+    pub fn everyone(&self) -> Vec<(&Person, Vec<&str>)> {
+        let mut emails: Vec<Vec<&str>> = vec![Vec::new(); self.people.len()];
+        for (email, &ix) in &self.by_email {
+            emails[ix].push(email.as_str());
+        }
+        self.people.iter().zip(emails).collect()
+    }
+
     /// The person behind `email`, if they appear in the history.
     pub fn of(&self, email: &str) -> Option<&Person> {
         self.by_email.get(&key(email)).map(|&i| &self.people[i])

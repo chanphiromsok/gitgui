@@ -131,6 +131,255 @@ pub fn filter_commits(commits: &[Commit], scope: Scope, hidden: &HashSet<String>
     trimmed.into_iter().filter(|c| wanted.contains(&c.id)).collect()
 }
 
+// ---- author and date --------------------------------------------------------------------------
+
+/// A calendar day: year, month, day. Tuples order the way days do.
+pub type Day = (i32, u32, u32);
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm), and back.
+fn days_from_civil((y, m, d): Day) -> i64 {
+    let y = i64::from(y) - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(days: i64) -> Day {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = (yoe + era * 400 + i64::from(m <= 2)) as i32;
+    (y, m, d)
+}
+
+/// The day `n` days after `day` (before, when negative).
+pub fn add_days(day: Day, n: i64) -> Day {
+    civil_from_days(days_from_civil(day) + n)
+}
+
+/// The day a moment falls on, `utc_offset` seconds east of UTC.
+pub fn day_of(epoch_seconds: i64, utc_offset: i64) -> Day {
+    civil_from_days((epoch_seconds + utc_offset).div_euclid(86_400))
+}
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        _ => 28,
+    }
+}
+
+/// `2026-10-05` as a day; `2026-10` as its first day (and `month_end` its last).
+fn parse_day(text: &str) -> Option<Day> {
+    let mut parts = text.split('-');
+    // Fixed widths, so a date half-typed (`2026-1`) is not taken for January while its month is still being written.
+    fn field(part: Option<&str>, width: usize) -> Option<&str> {
+        part.filter(|p| p.len() == width && p.bytes().all(|b| b.is_ascii_digit()))
+    }
+    let y: i32 = field(parts.next(), 4)?.parse().ok().filter(|y| (1970..=9999).contains(y))?;
+    let m: u32 = field(parts.next(), 2)?.parse().ok().filter(|m| (1..=12).contains(m))?;
+    let d: u32 = match parts.next() {
+        Some(d) => field(Some(d), 2)?.parse().ok().filter(|d| (1..=days_in_month(y, m)).contains(d))?,
+        None => 1,
+    };
+    parts.next().is_none().then_some((y, m, d))
+}
+
+/// The last day an incomplete date covers: `2026-10` → 31 October; a full date is itself.
+fn parse_day_end(text: &str) -> Option<Day> {
+    let (y, m, d) = parse_day(text)?;
+    Some(if text.matches('-').count() == 1 { (y, m, days_in_month(y, m)) } else { (y, m, d) })
+}
+
+/// The day a commit was made, from its `date` ("7 Oct 2026 15:32", in the user's time zone).
+pub fn commit_day(commit: &Commit) -> Option<Day> {
+    let mut words = commit.date.split_whitespace();
+    let d: u32 = words.next()?.parse().ok()?;
+    let month = words.next()?;
+    let y: i32 = words.next()?.parse().ok()?;
+    const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let m = MONTHS.iter().position(|name| month.to_ascii_lowercase().starts_with(name))? as u32 + 1;
+    Some((y, m, d))
+}
+
+/// Narrowing the graph to one author or a stretch of days, from `author:` and `date:` words in the search.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Constraints {
+    /// A commit matches when any of these is its email (whole, ignoring case) or is part of its author name
+    /// or email. Empty: anyone.
+    pub authors: Vec<String>,
+    /// First and last day, both included. `None`: no limit on that side.
+    pub since: Option<Day>,
+    pub until: Option<Day>,
+}
+
+impl Constraints {
+    pub fn is_empty(&self) -> bool {
+        self.authors.is_empty() && self.since.is_none() && self.until.is_none()
+    }
+
+    pub fn matches(&self, commit: &Commit) -> bool {
+        if !self.authors.is_empty() {
+            let (name, email) = (commit.author.to_lowercase(), commit.email.to_lowercase());
+            let by_author = self.authors.iter().any(|a| email == *a || name.contains(a.as_str()) || email.contains(a.as_str()));
+            if !by_author {
+                return false;
+            }
+        }
+        if self.since.is_some() || self.until.is_some() {
+            let Some(day) = commit_day(commit) else { return false };
+            if self.since.is_some_and(|since| day < since) || self.until.is_some_and(|until| day > until) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The words of a search, split on spaces, except inside double quotes (`author:"Ada Lovelace"`).
+fn words(text: &str) -> Vec<String> {
+    let (mut out, mut word, mut quoted) = (Vec::new(), String::new(), false);
+    for c in text.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
+
+/// A `date:` value: `today`, `yesterday`, `week`, `month`, `7d` (the last 7 days), `2026-10-05`, `2026-10`, or
+/// a range `2026-10-01..2026-10-07` with either end left open.
+fn parse_date_spec(spec: &str, today: Day) -> Option<(Option<Day>, Option<Day>)> {
+    let spec = spec.to_ascii_lowercase();
+    match spec.as_str() {
+        "today" => return Some((Some(today), Some(today))),
+        "yesterday" => {
+            let day = add_days(today, -1);
+            return Some((Some(day), Some(day)));
+        }
+        "week" => return Some((Some(add_days(today, -6)), Some(today))),
+        "month" => return Some((Some((today.0, today.1, 1)), Some(today))),
+        _ => {}
+    }
+    if let Some(n) = spec.strip_suffix('d').and_then(|n| n.parse::<i64>().ok()).filter(|n| (1..=36_500).contains(n)) {
+        return Some((Some(add_days(today, 1 - n)), Some(today)));
+    }
+    if let Some((from, to)) = spec.split_once("..") {
+        let from = if from.is_empty() { None } else { Some(parse_day(from)?) };
+        let to = if to.is_empty() { None } else { Some(parse_day_end(to)?) };
+        return Some((from, to));
+    }
+    Some((Some(parse_day(&spec)?), Some(parse_day_end(&spec)?)))
+}
+
+/// Takes the `author:`, `date:`, `since:` and `until:` words out of a search. What is left is returned with
+/// the constraints; a word that does not make sense (a half-typed date) is dropped and constrains nothing.
+pub fn parse_constraints(text: &str, today: Day) -> (Constraints, String) {
+    let mut constraints = Constraints::default();
+    let mut rest: Vec<String> = Vec::new();
+    for word in words(text) {
+        let lower = word.to_ascii_lowercase();
+        let value = |key: &str| lower.strip_prefix(key).map(|_| word[key.len()..].trim().to_owned());
+        if let Some(author) = value("author:") {
+            if !author.is_empty() {
+                constraints.authors.push(author.to_lowercase());
+            }
+        } else if let Some(spec) = value("date:") {
+            if let Some((since, until)) = parse_date_spec(&spec, today) {
+                (constraints.since, constraints.until) = (since, until);
+            }
+        } else if let Some(day) = value("since:") {
+            constraints.since = parse_day(&day).or(constraints.since);
+        } else if let Some(day) = value("until:") {
+            constraints.until = parse_day_end(&day).or(constraints.until);
+        } else if word.contains('"') || word.contains(' ') {
+            rest.push(format!("\"{word}\""));
+        } else {
+            rest.push(word);
+        }
+    }
+    (constraints, rest.join(" "))
+}
+
+/// The value of the first `key:` word in a search, as typed.
+pub fn term(text: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    words(text)
+        .into_iter()
+        .find(|word| word.to_ascii_lowercase().starts_with(&prefix))
+        .map(|word| word[prefix.len()..].to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The search with every `key:` word replaced by `key:value` (or removed when `value` is `None`).
+pub fn with_term(text: &str, key: &str, value: Option<&str>) -> String {
+    let prefix = format!("{key}:");
+    let mut kept: Vec<String> = words(text)
+        .into_iter()
+        .filter(|word| !word.to_ascii_lowercase().starts_with(&prefix))
+        .map(|word| if word.contains(' ') { format!("\"{word}\"") } else { word })
+        .collect();
+    if let Some(value) = value {
+        kept.push(if value.contains(' ') { format!("{prefix}\"{value}\"") } else { format!("{prefix}{value}") });
+    }
+    kept.join(" ")
+}
+
+/// The commits that pass `keep`, with each one's parents moved down to the nearest commits that also pass,
+/// the way `git log` simplifies a filtered history: what is left stays one connected graph, with lines
+/// running past the commits that were left out.
+pub fn narrow(commits: &[Commit], keep: impl Fn(&Commit) -> bool) -> Vec<Commit> {
+    /// A long dropped stretch can lead to very many kept ancestors; this many are enough to draw the lines.
+    const MOST: usize = 32;
+    let kept: Vec<bool> = commits.iter().map(&keep).collect();
+    let index: std::collections::HashMap<&str, usize> = commits.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
+    // The nearest kept commit(s) at or below each commit. Parents come after their children, so go from the end.
+    let mut nearest: Vec<Vec<usize>> = vec![Vec::new(); commits.len()];
+    let below = |commit: &Commit, nearest: &[Vec<usize>]| -> Vec<usize> {
+        let mut found: Vec<usize> = Vec::new();
+        for parent in commit.parents.iter().filter_map(|p| index.get(p.as_str())) {
+            for &ix in &nearest[*parent] {
+                if !found.contains(&ix) && found.len() < MOST {
+                    found.push(ix);
+                }
+            }
+        }
+        found
+    };
+    for ix in (0..commits.len()).rev() {
+        nearest[ix] = if kept[ix] { vec![ix] } else { below(&commits[ix], &nearest) };
+    }
+    commits
+        .iter()
+        .enumerate()
+        .filter(|(ix, _)| kept[*ix])
+        .map(|(_, commit)| {
+            let mut commit = commit.clone();
+            commit.parents = below(&commit, &nearest).into_iter().map(|ix| commits[ix].id.clone()).collect();
+            commit
+        })
+        .collect()
+}
+
 /// How many stashes there are.
 pub fn stash_count(commits: &[Commit]) -> usize {
     commits.iter().filter(|c| c.refs.iter().any(|r| r.kind == RefKind::Stash)).count()
@@ -232,5 +481,121 @@ mod tests {
         assert!(matches_text(&c, "abcd"));
         assert!(!matches_text(&c, "bcde"), "an id matches from its start");
         assert!(!matches_text(&c, "work bob"));
+    }
+
+    // ---- author and date
+
+    fn by(id: &str, parents: &[&str], author: &str, email: &str, date: &str) -> Commit {
+        Commit { author: author.into(), email: email.into(), date: date.into(), ..commit(id, parents, &[]) }
+    }
+
+    const TODAY: Day = (2026, 10, 7);
+
+    #[test]
+    fn day_arithmetic_crosses_months_years_and_leap_days() {
+        assert_eq!(add_days((2026, 10, 7), -6), (2026, 10, 1));
+        assert_eq!(add_days((2026, 10, 1), -1), (2026, 9, 30));
+        assert_eq!(add_days((2026, 1, 1), -1), (2025, 12, 31));
+        assert_eq!(add_days((2024, 2, 28), 1), (2024, 2, 29));
+        assert_eq!(add_days((2025, 2, 28), 1), (2025, 3, 1));
+        assert_eq!(day_of(0, 0), (1970, 1, 1));
+        assert_eq!(day_of(1_700_000_000, 0), (2023, 11, 14));
+        assert_eq!(day_of(1_700_000_000, 7 * 3600), (2023, 11, 15), "past midnight in UTC+7");
+    }
+
+    #[test]
+    fn a_commit_date_reads_back_as_a_day() {
+        assert_eq!(commit_day(&by("a", &[], "A", "a@x", "7 Oct 2026 15:32")), Some((2026, 10, 7)));
+        assert_eq!(commit_day(&by("a", &[], "A", "a@x", "21 Feb 2025 09:05")), Some((2025, 2, 21)));
+        assert_eq!(commit_day(&by("a", &[], "A", "a@x", "")), None);
+        assert_eq!(commit_day(&by("a", &[], "A", "a@x", "7 Smarch 2026 15:32")), None);
+    }
+
+    #[test]
+    fn search_words_for_author_and_date_are_taken_out_and_the_rest_is_kept() {
+        let (c, rest) = parse_constraints("fix author:ada date:2026-10-01..2026-10-05 login", TODAY);
+        assert_eq!(c.authors, ["ada"]);
+        assert_eq!((c.since, c.until), (Some((2026, 10, 1)), Some((2026, 10, 5))));
+        assert_eq!(rest, "fix login");
+
+        let (c, rest) = parse_constraints("author:\"Ada Lovelace\" author:bob@x.io", TODAY);
+        assert_eq!(c.authors, ["ada lovelace", "bob@x.io"]);
+        assert_eq!(rest, "");
+
+        // Open ends, a whole month, relative words, and half-typed words that constrain nothing.
+        assert_eq!(parse_constraints("date:2026-10-03..", TODAY).0.since, Some((2026, 10, 3)));
+        assert_eq!(parse_constraints("date:2026-10-03..", TODAY).0.until, None);
+        assert_eq!(parse_constraints("date:..2026-10-03", TODAY).0.until, Some((2026, 10, 3)));
+        let month = parse_constraints("date:2026-02", TODAY).0;
+        assert_eq!((month.since, month.until), (Some((2026, 2, 1)), Some((2026, 2, 28))));
+        let (today, yesterday) = (parse_constraints("date:today", TODAY).0, parse_constraints("date:yesterday", TODAY).0);
+        assert_eq!((today.since, today.until), (Some(TODAY), Some(TODAY)));
+        assert_eq!(yesterday.since, Some((2026, 10, 6)));
+        let week = parse_constraints("date:7d", TODAY).0;
+        assert_eq!((week.since, week.until), (Some((2026, 10, 1)), Some(TODAY)));
+        assert_eq!(parse_constraints("date:month", TODAY).0.since, Some((2026, 10, 1)));
+        for half_typed in ["date:", "date:2026-1", "date:2026-13-01", "date:2026-02-30", "date:soon", "author:", "since:x"] {
+            let (c, rest) = parse_constraints(half_typed, TODAY);
+            assert!(c.is_empty(), "{half_typed:?} constrains nothing");
+            assert_eq!(rest, "", "and is not left in the text");
+        }
+        assert_eq!(parse_constraints("path:src date:today", TODAY).1, "path:src");
+    }
+
+    #[test]
+    fn constraints_match_by_author_name_or_email_and_by_day() {
+        let ada = by("a", &[], "Ada Lovelace", "Ada@Example.com", "5 Oct 2026 10:00");
+        let bob = by("b", &[], "Bob", "bob@example.com", "20 Sep 2026 10:00");
+        let nodate = by("c", &[], "Ada", "ada@example.com", "");
+        let only = |text: &str| parse_constraints(text, TODAY).0;
+        assert!(only("author:lovelace").matches(&ada) && !only("author:lovelace").matches(&bob));
+        assert!(only("author:ada@example.com").matches(&ada), "an email matches whole, whatever its case");
+        assert!(only("author:ada author:bob").matches(&bob), "any of them");
+        assert!(only("date:week").matches(&ada) && !only("date:week").matches(&bob));
+        assert!(only("date:2026-09").matches(&bob) && !only("date:2026-09").matches(&ada));
+        assert!(only("since:2026-10-05 until:2026-10-05").matches(&ada), "both ends are included");
+        assert!(!only("date:2026-10").matches(&nodate), "a commit with no date is not in a range");
+        assert!(only("").matches(&nodate), "no constraint, no filter");
+        assert!(only("author:ada date:month").matches(&ada) && !only("author:bob date:month").matches(&ada));
+    }
+
+    #[test]
+    fn replacing_a_search_word_keeps_the_rest_of_the_search() {
+        assert_eq!(with_term("fix author:ada", "author", Some("bob")), "fix author:bob");
+        assert_eq!(with_term("fix author:ada date:7d", "author", None), "fix date:7d");
+        assert_eq!(with_term("", "date", Some("today")), "date:today");
+        assert_eq!(with_term("login", "author", Some("Ada Lovelace")), "login author:\"Ada Lovelace\"");
+        assert_eq!(with_term("AUTHOR:ada x", "author", Some("bob")), "x author:bob", "any case of the key");
+        assert_eq!(term("x author:\"Ada Lovelace\" date:7d", "author").as_deref(), Some("Ada Lovelace"));
+        assert_eq!(term("x date:7d", "date").as_deref(), Some("7d"));
+        assert_eq!(term("x date:", "date"), None);
+        assert_eq!(term("x", "author"), None);
+    }
+
+    #[test]
+    fn narrowing_to_some_commits_keeps_the_graph_connected() {
+        // Newest first:  m (merge of f2 and r1) ← f2 ← f1 ← base;  r1 ← base.
+        let log = vec![
+            by("m", &["r1", "f2"], "Ada", "ada@x", "7 Oct 2026 10:00"),
+            by("f2", &["f1"], "Bob", "bob@x", "6 Oct 2026 10:00"),
+            by("r1", &["base"], "Ada", "ada@x", "5 Oct 2026 10:00"),
+            by("f1", &["base"], "Bob", "bob@x", "4 Oct 2026 10:00"),
+            by("base", &[], "Ada", "ada@x", "1 Oct 2026 10:00"),
+        ];
+        let ada = parse_constraints("author:ada", TODAY).0;
+        let shown = narrow(&log, |c| ada.matches(c));
+        assert_eq!(ids(&shown), ["m", "r1", "base"]);
+        // The merge's second parent (f2, Bob's) is gone; what it led to (base, through f1) is the nearest of Ada's.
+        let parents = |id: &str| shown.iter().find(|c| c.id == id).unwrap().parents.clone();
+        assert_eq!(parents("m"), ["r1", "base"]);
+        assert_eq!(parents("r1"), ["base"]);
+        assert!(parents("base").is_empty());
+        // Every parent that is left is a commit that is shown, so the layout has nothing dangling.
+        for commit in &shown {
+            assert!(commit.parents.iter().all(|p| shown.iter().any(|c| &c.id == p)), "{commit:?}");
+        }
+        // Nothing passes: nothing is shown. Everything passes: nothing changes.
+        assert!(narrow(&log, |_| false).is_empty());
+        assert_eq!(narrow(&log, |_| true), log);
     }
 }
