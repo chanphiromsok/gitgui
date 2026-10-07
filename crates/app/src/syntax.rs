@@ -337,10 +337,10 @@ impl FileColors {
 /// Colors `diff` of the file at `path`, from the whole file before and after. A side whose text does
 /// not match the diff's lines (line endings, filters) is left plain rather than colored wrongly.
 pub fn for_diff(path: &str, old: Option<&str>, new: Option<&str>, diff: &FileDiff) -> FileColors {
-    let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(|l| l.trim_end_matches('\r').to_owned()).collect() };
     let side = |text: Option<&str>, number: fn(&DiffLine) -> Option<u32>| -> Lines {
-        let Some(text) = text else { return Lines::default() };
-        let file = lines_of(text);
+        // Too big to color: say so before splitting a huge file into lines for nothing.
+        let Some(text) = text.filter(|text| text.len() <= MAX_BYTES) else { return Lines::default() };
+        let file: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
         let matches = diff.hunks.iter().flat_map(|h| &h.lines).all(|line| {
             number(line).is_none_or(|n| file.get(n as usize - 1).is_some_and(|f| *f == line.text.trim_end_matches('\r')))
         });

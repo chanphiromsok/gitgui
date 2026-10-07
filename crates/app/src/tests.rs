@@ -1575,3 +1575,123 @@ async fn the_settings_panel_fits_a_short_window(cx: &mut TestAppContext) {
     assert!(done.bottom() <= px(420.), "Done sits at {:?}, below a 420 px window", done.bottom());
     assert!(done.top() >= px(0.));
 }
+
+// ---- background work stays bounded --------------------------------------------------------------
+
+fn count(ws: &Entity<Workspace>, cx: &VisualTestContext, which: fn(&crate::workspace::Counts) -> &std::sync::atomic::AtomicUsize) -> usize {
+    ws.read_with(cx, |ws, _| which(&ws.counts).load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn notes_shown(ws: &Entity<Workspace>, cx: &VisualTestContext) -> Vec<String> {
+    ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => view.entries.iter().flat_map(|e| e.notes.iter().map(|n| n.text.to_string())).collect(),
+        _ => Vec::new(),
+    })
+}
+
+#[gpui::test]
+async fn refreshing_when_no_branch_moved_runs_no_new_merge_scan(cx: &mut TestAppContext) {
+    let fx = squashed_pr("rescan");
+    fx.git(&["branch", "feat/open", "main~1"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let notes = notes_shown(&ws, cx);
+    assert!(notes.iter().any(|n| n.contains("squash of branch feat/x")), "{notes:?}");
+    assert_eq!(count(&ws, cx, |c| &c.scans), 1);
+
+    // Refresh is also what every operation (commit, checkout, merge…) ends with.
+    for _ in 0..50 {
+        ws.update(cx, |ws, cx| ws.refresh(cx));
+        cx.run_until_parked();
+        assert_eq!(notes_shown(&ws, cx), notes, "the scan's findings show straight away after each read");
+    }
+    draw(cx, &ws);
+    assert_eq!(count(&ws, cx, |c| &c.repo_reads), 51);
+    assert_eq!(count(&ws, cx, |c| &c.scans), 1, "50 refreshes with no branch moved ran no merge scan");
+    assert!(!ws.read_with(cx, |ws, _| ws.scan_running()), "nothing is left running");
+
+    assert!(notes.iter().any(|n| n == "✓ merged into main"), "feat/open sits on main's history: {notes:?}");
+
+    // A branch that moves is scanned again: it has work of its own now, so it is not merged any more.
+    fx.git(&["checkout", "-q", "feat/open"]);
+    commit_file(&fx, "open.txt", "1\n", "wip: open work");
+    fx.git(&["checkout", "-q", "main"]);
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(count(&ws, cx, |c| &c.scans), 2);
+    let after = notes_shown(&ws, cx);
+    assert!(after.iter().any(|n| n.contains("squash of branch feat/x")), "{after:?}");
+    assert!(!after.iter().any(|n| n == "✓ merged into main"), "{after:?}");
+}
+
+#[gpui::test]
+async fn refreshes_asked_for_while_a_read_runs_become_one_more_read(cx: &mut TestAppContext) {
+    let fx = squashed_pr("reread");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let before = count(&ws, cx, |c| &c.repo_reads);
+    // Holding Cmd-R: 30 refreshes before any read has come back.
+    for _ in 0..30 {
+        ws.update(cx, |ws, cx| ws.refresh(cx));
+    }
+    cx.run_until_parked();
+    assert_eq!(count(&ws, cx, |c| &c.repo_reads) - before, 2, "the read already running, then one more");
+    assert_eq!(count(&ws, cx, |c| &c.scans), 1);
+    assert!(ws.read_with(cx, |ws, _| matches!(ws.repo.as_ref().unwrap().phase, Phase::Ready(_))));
+    assert_eq!(summaries(&ws, cx)[0], "feat: x (#7)");
+
+    // The extra read sees what changed after the first one started.
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    commit_file(&fx, "c.txt", "c\n", "chore: made while reading");
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(summaries(&ws, cx)[0], "chore: made while reading");
+}
+
+#[gpui::test]
+async fn stepping_through_files_quickly_reads_only_the_one_left_open(cx: &mut TestAppContext) {
+    let fx = fixture("step-fast");
+    for n in 0..12 {
+        fx.write(&format!("src/f{n:02}.rs"), &format!("fn f{n}() {{ let s = \"{n}\"; }}\n"));
+    }
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "twelve files"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+
+    // Clicking down the graph faster than git answers: only the last commit is read.
+    let before = count(&ws, cx, |c| &c.commit_reads);
+    for summary in ["base", "change", "twelve files"] {
+        let ix = index_of(&ws, cx, summary);
+        ws.update(cx, |ws, cx| ws.select_entry(ix, cx));
+    }
+    cx.run_until_parked();
+    assert_eq!(count(&ws, cx, |c| &c.commit_reads) - before, 1);
+    assert_eq!(file_names(&ws, cx).len(), 12);
+
+    // Holding Down through the files: only the one it stops on is read and colored.
+    let before = count(&ws, cx, |c| &c.file_reads);
+    for n in 0..12 {
+        ws.update(cx, |ws, cx| ws.open_file(n, cx));
+    }
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert_eq!(count(&ws, cx, |c| &c.file_reads) - before, 1);
+    let (index, ready, text) = ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        let text = file.diff.hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.clone()).collect::<Vec<_>>().join("\n");
+        (file.index, matches!(file.phase, Phase::Ready(())), text)
+    });
+    assert_eq!((index, ready), (11, true));
+    assert!(text.contains("fn f11()"), "{text}");
+    assert!(ws.read_with(cx, |ws, _| !ws.repo.as_ref().unwrap().file.as_ref().unwrap().colors.new.0.is_empty()), "and it is colored");
+
+    // Closing the file stops a read still running for it.
+    let before = count(&ws, cx, |c| &c.file_reads);
+    ws.update(cx, |ws, cx| {
+        ws.open_file(0, cx);
+        ws.close_file(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(count(&ws, cx, |c| &c.file_reads), before);
+}

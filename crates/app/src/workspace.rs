@@ -7,12 +7,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gitgui_core::{
     Backend, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Layout, Lineage, LogOptions, People, WorkFile,
-    MergeClue, Operation, Query, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count, visible_rows,
-    people, web_remote,
+    MergeClue, Operation, Query, ScanCache, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count,
+    visible_rows, people, web_remote,
 };
 use gitgui_store::{Comment, DiffMode, FileLayout, NewComment, Project, Settings, Store};
 use gpui::{
@@ -44,8 +45,9 @@ pub enum Phase<T> {
 
 pub struct RepoView {
     /// The commits as read, newest first. The rows are made from these, and made again when the
-    /// grouping, a fold, or the merge scan changes what to show.
-    pub commits: Vec<Commit>,
+    /// grouping, a fold, or the merge scan changes what to show. Shared with the last read, which a
+    /// refresh that finds nothing new reuses.
+    pub commits: Arc<Vec<Commit>>,
     pub changed: usize,
     pub entries: Vec<Entry>,
     pub graph_width: f32,
@@ -59,7 +61,7 @@ pub struct RepoView {
     /// The repository's web home, for pull request and commit links.
     pub web: Option<WebRemote>,
     /// Who is who among the authors.
-    pub people: People,
+    pub people: Arc<People>,
     /// How many commits the filters leave in the graph.
     pub shown: usize,
     /// How many stashes there are, shown or not.
@@ -74,6 +76,19 @@ pub struct RepoView {
     pub scanning: bool,
     /// Branches the scan ran out of time before checking.
     pub unchecked: usize,
+    /// The branches and trunks the merge scan is about, as they were read.
+    scan_inputs: ScanInputs,
+}
+
+/// The branches to check for merges and the trunks to check them against.
+type ScanInputs = (Vec<BranchTip>, Vec<BranchTip>);
+
+/// The merge scan that is running, so a refresh that finds the same branches waits for it instead of
+/// starting another, and one that finds different branches stops it.
+struct RunningScan {
+    path: PathBuf,
+    inputs: ScanInputs,
+    cancel: Arc<AtomicBool>,
 }
 
 impl RepoView {
@@ -96,7 +111,7 @@ impl RepoView {
         let shown =
             if narrowed { filter_commits(&self.commits, filter.scope, &hidden, !filter.hide_stashes) } else { Vec::new() };
         self.stashes = stash_count(&self.commits);
-        let commits = if narrowed { &shown } else { &self.commits };
+        let commits: &[Commit] = if narrowed { &shown } else { &self.commits };
         let built = graph::build_entries(
             commits,
             &graph::Options {
@@ -364,10 +379,54 @@ pub struct Workspace {
     /// The file pane's width as last dragged; `None` until it is, then it takes a share of the room.
     pub pane_width: Option<f32>,
     pub resizing: Option<Splitter>,
+    /// What each project's merge scans found, so the next scan asks git only about what has moved.
+    scan_caches: HashMap<PathBuf, Arc<ScanCache>>,
+    running_scan: Option<RunningScan>,
+    /// A read of the repository is running. Reads asked for meanwhile become one more read after it.
+    reading: bool,
+    reread: bool,
+    /// Each file and each commit opened takes the next number; a background read for one that is no
+    /// longer open stops before doing more work.
+    file_ticket: Arc<AtomicU64>,
+    commit_ticket: Arc<AtomicU64>,
+    last_log: Option<LastLog>,
+    /// How much background work has actually run.
+    pub(crate) counts: Arc<Counts>,
+}
+
+/// Background work done so far, counted so tests can tell work that ran from work that was skipped.
+#[derive(Default)]
+pub(crate) struct Counts {
+    pub repo_reads: AtomicUsize,
+    pub scans: AtomicUsize,
+    pub commit_reads: AtomicUsize,
+    pub file_reads: AtomicUsize,
+}
+
+impl Drop for Workspace {
+    /// A closed window leaves its merge scan nobody to report to.
+    fn drop(&mut self) {
+        self.stop_merge_scan();
+    }
+}
+
+/// Whether the background read that took `ticket` is still for what is open.
+fn current(latest: &AtomicU64, ticket: u64) -> bool {
+    latest.load(Ordering::Relaxed) == ticket
+}
+
+/// The commits as last read, to reuse when git prints the same log again.
+struct LastLog {
+    path: PathBuf,
+    fingerprint: u64,
+    commits: Arc<Vec<Commit>>,
+    people: Arc<People>,
 }
 
 struct RepoData {
-    commits: Vec<Commit>,
+    /// The log's fingerprint, and the commits: `None` when they are the same as last time.
+    fingerprint: u64,
+    commits: Option<Vec<Commit>>,
     current_branch: Option<String>,
     changed: usize,
     read: Duration,
@@ -378,25 +437,41 @@ struct RepoData {
     work: Vec<WorkFile>,
 }
 
-fn read_repo(path: &Path) -> Result<RepoData, gitgui_core::Error> {
+/// Reads the repository; the commits are left unparsed (`None`) when the log is the one `unchanged`
+/// fingerprints.
+fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_core::Error> {
     let git = GitCli::new(path);
     let started = Instant::now();
-    let commits = git.log(&LogOptions { max_count: Some(LOAD_LIMIT), skip: 0 })?;
+    let (fingerprint, commits) = git.log_if_changed(&LogOptions { max_count: Some(LOAD_LIMIT), skip: 0 }, unchanged)?;
     let current_branch = git.current_branch()?;
     let changed = git.changed_files()?;
     let in_progress = git.in_progress();
     let web = git.remote_url().ok().flatten().and_then(|url| web_remote(&url));
     let work = git.work_status().unwrap_or_default();
-    Ok(RepoData { commits, current_branch, changed, read: started.elapsed(), in_progress, web, work })
+    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), in_progress, web, work })
 }
 
-fn read_commit(path: &Path, id: &str) -> Result<CommitView, gitgui_core::Error> {
+/// A commit's record and the files it changed; `None` when it stopped early because `wanted` said the
+/// commit is no longer the one open.
+fn read_commit(path: &Path, id: &str, wanted: impl Fn() -> bool) -> Option<Result<CommitView, gitgui_core::Error>> {
     let git = GitCli::new(path);
-    let detail = git.commit_detail(id)?;
-    let files = git.commit_files(id)?;
+    if !wanted() {
+        return None;
+    }
+    let detail = match git.commit_detail(id) {
+        Ok(detail) => detail,
+        Err(err) => return Some(Err(err)),
+    };
+    if !wanted() {
+        return None;
+    }
+    let files = match git.commit_files(id) {
+        Ok(files) => files,
+        Err(err) => return Some(Err(err)),
+    };
     let additions = files.iter().filter_map(|f| f.additions).sum();
     let deletions = files.iter().filter_map(|f| f.deletions).sum();
-    Ok(CommitView { detail, files, additions, deletions })
+    Some(Ok(CommitView { detail, files, additions, deletions }))
 }
 
 impl Workspace {
@@ -504,6 +579,14 @@ impl Workspace {
             sidebar_width: layout::SIDEBAR_DEFAULT,
             pane_width: None,
             resizing: None,
+            scan_caches: HashMap::new(),
+            running_scan: None,
+            reading: false,
+            reread: false,
+            file_ticket: Arc::new(AtomicU64::new(0)),
+            commit_ticket: Arc::new(AtomicU64::new(0)),
+            last_log: None,
+            counts: Arc::default(),
         }
     }
 
@@ -626,6 +709,10 @@ impl Workspace {
             return self.fail(err, cx);
         }
         self.projects.retain(|p| p.path != path);
+        self.scan_caches.remove(path);
+        if self.running_scan.as_ref().is_some_and(|scan| scan.path == path) {
+            self.stop_merge_scan();
+        }
         if self.repo.as_ref().is_some_and(|repo| repo.project.path == path) {
             self.repo = None;
         }
@@ -645,6 +732,9 @@ impl Workspace {
         if kept.is_none() {
             self.search_input.update(cx, |input, cx| input.clear(cx));
         }
+        // Whatever was open is closed: reads still running for it stop.
+        self.cancel_file_load();
+        self.cancel_commit_load();
         let mut state = RepoState::loading(project, generation, &self.settings);
         state.graph_filter = kept.unwrap_or_default();
         let rerun = matches!(state.graph_filter.query(), Query::Path(_) | Query::Code(_));
@@ -654,20 +744,73 @@ impl Workspace {
             self.run_search(cx);
         }
 
+        // Opening another project leaves the last one's merge scan nothing to do.
+        if self.running_scan.as_ref().is_some_and(|scan| scan.path != path) {
+            self.stop_merge_scan();
+        }
+        self.start_read(cx);
+    }
+
+    /// Reads the open repository in the background. Only one read runs at a time: asking again while
+    /// one runs (holding Cmd-R, or an operation finishing) makes one more read once it is done, since
+    /// the one running may have started before what changed.
+    fn start_read(&mut self, cx: &mut Context<Self>) {
+        if self.reading {
+            self.reread = true;
+            return;
+        }
+        let Some(repo) = self.repo.as_ref() else { return };
+        let (path, generation) = (repo.project.path.clone(), repo.generation);
+        self.reading = true;
+        self.reread = false;
+        let counts = self.counts.clone();
         let read_path = path.clone();
+        let unchanged = self.last_log.as_ref().filter(|last| last.path == path).map(|last| last.fingerprint);
         self.spawn_load(
             cx,
-            move || read_repo(&read_path),
+            move || {
+                counts.repo_reads.fetch_add(1, Ordering::Relaxed);
+                read_repo(&read_path, unchanged)
+            },
             move |this, result, cx| {
+                this.reading = false;
                 let settings = this.settings.clone();
-                let Some(repo) = this.repo.as_mut().filter(|repo| repo.generation == generation) else { return };
+                let stale = this.reread || !this.repo.as_ref().is_some_and(|repo| repo.generation == generation);
+                if stale {
+                    // Something asked for a newer read meanwhile: this answer may predate it.
+                    if this.repo.as_ref().is_some_and(|repo| matches!(repo.phase, Phase::Loading)) {
+                        this.start_read(cx);
+                    }
+                    return;
+                }
+                // An unchanged log reuses the commits read last time. (Reads run one at a time, so the
+                // last read is still the one the fingerprint was taken from.)
+                let last = this.last_log.take().filter(|last| last.path == path);
+                let result = result.map_err(|err| err.to_string()).and_then(|mut data| {
+                    let (commits, everyone) = match (data.commits.take(), last) {
+                        (Some(commits), _) => {
+                            let everyone = Arc::new(people(&commits));
+                            (Arc::new(commits), everyone)
+                        }
+                        (None, Some(last)) => (last.commits, last.people),
+                        (None, None) => return Err("The history could not be read; try again.".to_owned()),
+                    };
+                    Ok((data, commits, everyone))
+                });
+                let Some(repo) = this.repo.as_mut() else { return };
                 match result {
-                    Ok(data) => {
+                    Ok((data, commits, everyone)) => {
                         let in_progress = data.in_progress;
                         repo.work = data.work;
-                        let everyone = people(&data.commits);
+                        this.last_log = Some(LastLog {
+                            path: path.clone(),
+                            fingerprint: data.fingerprint,
+                            commits: commits.clone(),
+                            people: everyone.clone(),
+                        });
+                        let (branches, targets) = scan_inputs(&commits);
                         let mut view = RepoView {
-                            commits: data.commits,
+                            commits,
                             changed: data.changed,
                             entries: Vec::new(),
                             graph_width: 0.,
@@ -683,15 +826,23 @@ impl Workspace {
                             stashes: 0,
                             matches: Vec::new(),
                             clues: Vec::new(),
-                            tips: HashMap::new(),
-                            scanning: true,
+                            tips: branches.iter().chain(&targets).map(|t| (t.name.clone(), t.id.clone())).collect(),
+                            scanning: false,
                             unchecked: 0,
+                            scan_inputs: (branches, targets),
                         };
+                        // Branches that have not moved since the last scan are known at once.
+                        let cache = this.scan_caches.entry(path.clone()).or_default().clone();
+                        let (branches, targets) = &view.scan_inputs;
+                        let wanted = !branches.is_empty() && !targets.is_empty();
+                        let known = wanted.then(|| cache.lookup(branches, targets)).flatten();
+                        let scan = wanted && known.is_none();
+                        if let Some(known) = known {
+                            view.clues = known.clues;
+                        }
+                        view.scanning = scan;
                         view.rebuild(&settings, &repo.collapsed, &repo.graph_filter);
-                        let (branches, targets) = scan_inputs(&view.commits);
-                        view.tips = branches.iter().chain(&targets).map(|t| (t.name.clone(), t.id.clone())).collect();
-                        view.scanning = !branches.is_empty() && !targets.is_empty();
-                        let scan = view.scanning;
+                        let inputs = view.scan_inputs.clone();
                         repo.phase = Phase::Ready(view);
                         if let Some(operation) = in_progress.filter(|_| this.notice.is_none()) {
                             this.notice = Some(Notice {
@@ -705,38 +856,66 @@ impl Workspace {
                             });
                         }
                         if scan {
-                            this.start_merge_scan(path, generation, branches, targets, cx);
+                            this.start_merge_scan(path, inputs, cache, cx);
                         }
                     }
-                    Err(err) => repo.phase = Phase::Failed(err.to_string().into()),
+                    Err(err) => repo.phase = Phase::Failed(err.into()),
                 }
                 cx.notify();
             },
         );
     }
 
+    /// A merge scan is running.
+    #[cfg(test)]
+    pub(crate) fn scan_running(&self) -> bool {
+        self.running_scan.is_some()
+    }
+
+    /// Stops the merge scan that is running, if any. What it has found so far stays in its cache.
+    fn stop_merge_scan(&mut self) {
+        if let Some(scan) = self.running_scan.take() {
+            scan.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Looks, in the background, for branches already merged by a squash or rebase, then redraws with
-    /// what it found.
-    fn start_merge_scan(
-        &mut self,
-        path: PathBuf,
-        generation: u64,
-        branches: Vec<BranchTip>,
-        targets: Vec<BranchTip>,
-        cx: &mut Context<Self>,
-    ) {
+    /// what it found. A scan of the same branches that is already running is waited for, not repeated;
+    /// one of other branches is stopped, since its answer is out of date.
+    fn start_merge_scan(&mut self, path: PathBuf, inputs: ScanInputs, cache: Arc<ScanCache>, cx: &mut Context<Self>) {
+        if self.running_scan.as_ref().is_some_and(|scan| scan.path == path && scan.inputs == inputs) {
+            return;
+        }
+        self.stop_merge_scan();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.running_scan = Some(RunningScan { path: path.clone(), inputs: inputs.clone(), cancel: cancel.clone() });
+        let counts = self.counts.clone();
+        let (scan_path, scan_inputs, stop) = (path.clone(), inputs.clone(), cancel.clone());
         self.spawn_load(
             cx,
-            move || GitCli::new(&path).merge_clues(&branches, &targets),
+            move || {
+                counts.scans.fetch_add(1, Ordering::Relaxed);
+                let (branches, targets) = &scan_inputs;
+                GitCli::new(&scan_path).merge_clues_cached(branches, targets, &cache, &stop)
+            },
             move |this, result, cx| {
+                if this.running_scan.as_ref().is_some_and(|scan| Arc::ptr_eq(&scan.cancel, &cancel)) {
+                    this.running_scan = None;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
                 let settings = this.settings.clone();
-                let Some(repo) = this.repo.as_mut().filter(|repo| repo.generation == generation) else { return };
-                if let Phase::Ready(view) = &mut repo.phase {
-                    view.scanning = false;
-                    if let Ok(scan) = result {
-                        view.clues = scan.clues;
-                        view.unchecked = scan.unchecked;
-                    }
+                // Whichever read of this repository is shown, if it is about the same branches.
+                let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == path) else { return };
+                let Phase::Ready(view) = &mut repo.phase else { return };
+                if view.scan_inputs != inputs {
+                    return;
+                }
+                view.scanning = false;
+                if let Ok(scan) = result {
+                    view.clues = scan.clues;
+                    view.unchecked = scan.unchecked;
                 }
                 repo.rebuild(&settings);
                 cx.notify();
@@ -775,10 +954,18 @@ impl Workspace {
 
         let read_path = path.clone();
         let read_id = id.clone();
+        self.cancel_file_load();
+        let ticket = self.commit_ticket.fetch_add(1, Ordering::Relaxed) + 1;
+        let (latest, counts) = (self.commit_ticket.clone(), self.counts.clone());
         self.spawn_load(
             cx,
-            move || read_commit(&read_path, &read_id),
+            move || {
+                read_commit(&read_path, &read_id, || current(&latest, ticket))
+                    .inspect(|_| _ = counts.commit_reads.fetch_add(1, Ordering::Relaxed))
+            },
             move |this, result, cx| {
+                // Stopped early: another commit was picked since.
+                let Some(result) = result else { return };
                 let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == path) else { return };
                 let Some(commit) = repo.commit.as_mut().filter(|commit| commit.id == id) else { return };
                 commit.phase = match result {
@@ -843,9 +1030,18 @@ impl Workspace {
         let read_change = change.clone();
         // An uncommitted change is read from the working tree and the index, not from a commit.
         let work = (id == WORKTREE).then(|| repo.work.get(index).cloned()).flatten();
+        // Stepping through files quickly leaves reads behind for files already left: each stops at its
+        // next step instead of reading and coloring whole files nobody will see.
+        let ticket = self.file_ticket.fetch_add(1, Ordering::Relaxed) + 1;
+        let (latest, counts) = (self.file_ticket.clone(), self.counts.clone());
         self.spawn_load(
             cx,
-            move || -> Result<(FileDiff, syntax::FileColors, Option<preview::Images>), gitgui_core::Error> {
+            move || -> Option<Result<(FileDiff, syntax::FileColors, Option<preview::Images>), gitgui_core::Error>> {
+                let wanted = || current(&latest, ticket);
+                if !wanted() {
+                    return None;
+                }
+                counts.file_reads.fetch_add(1, Ordering::Relaxed);
                 let git = GitCli::new(&read_path);
                 let path = read_change.path.as_str();
                 let image = preview::is_image(path);
@@ -854,12 +1050,24 @@ impl Workspace {
                 // coloring, so each line is colored knowing what comes before it, or a picture).
                 let (diff, old, new) = match &work {
                     Some(work) => {
-                        let diff = git.work_diff(work, DIFF_CONTEXT)?;
+                        let diff = match git.work_diff(work, DIFF_CONTEXT) {
+                            Ok(diff) => diff,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        if !wanted() {
+                            return None;
+                        }
                         let (old, new) = if image || language { git.work_sides(work) } else { (None, None) };
                         (diff, old, new)
                     }
                     None => {
-                        let diff = git.file_diff(&read_id, &read_change, DIFF_CONTEXT)?;
+                        let diff = match git.file_diff(&read_id, &read_change, DIFF_CONTEXT) {
+                            Ok(diff) => diff,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        if !wanted() {
+                            return None;
+                        }
                         let (old, new) = if image || language {
                             let old_path = read_change.old_path.as_deref().unwrap_or(path);
                             let old = (read_change.status != FileStatus::Added)
@@ -880,15 +1088,22 @@ impl Workspace {
                     old: old.clone().and_then(|bytes| preview::preview(path, bytes)),
                     new: new.clone().and_then(|bytes| preview::preview(path, bytes)),
                 });
+                if !wanted() {
+                    return None;
+                }
                 let colors = if language && !diff.binary {
-                    let text = |bytes: &Option<Vec<u8>>| bytes.as_ref().and_then(|b| String::from_utf8(b.clone()).ok());
-                    syntax::for_diff(path, text(&old).as_deref(), text(&new).as_deref(), &diff)
+                    fn text(bytes: &Option<Vec<u8>>) -> Option<&str> {
+                        bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok())
+                    }
+                    syntax::for_diff(path, text(&old), text(&new), &diff)
                 } else {
                     syntax::FileColors::default()
                 };
-                Ok((diff, colors, images))
+                Some(Ok((diff, colors, images)))
             },
             move |this, result, cx| {
+                // Stopped early: another file was opened since.
+                let Some(result) = result else { return };
                 let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == path) else { return };
                 let mode = repo.mode;
                 let still_open = repo.commit.as_ref().is_some_and(|commit| commit.id == id);
@@ -908,7 +1123,18 @@ impl Workspace {
         );
     }
 
+    /// Stops a background read of a file that is about to be closed or replaced.
+    pub(crate) fn cancel_file_load(&self) {
+        self.file_ticket.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stops a background read of a commit that is about to be closed or replaced.
+    pub(crate) fn cancel_commit_load(&self) {
+        self.commit_ticket.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn close_file(&mut self, cx: &mut Context<Self>) {
+        self.cancel_file_load();
         if let Some(repo) = self.repo.as_mut()
             && repo.file.take().is_some()
         {
@@ -945,6 +1171,8 @@ impl Workspace {
 
     /// Closes the file pane and deselects the commit.
     pub fn close_pane(&mut self, cx: &mut Context<Self>) {
+        self.cancel_file_load();
+        self.cancel_commit_load();
         if let Some(repo) = self.repo.as_mut() {
             repo.commit = None;
             repo.file = None;

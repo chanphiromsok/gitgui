@@ -63,6 +63,8 @@ impl Workspace {
 
     /// Shows the working tree in the file pane.
     pub fn open_work(&mut self, cx: &mut Context<Self>) {
+        self.cancel_file_load();
+        self.cancel_commit_load();
         let Some(repo) = self.repo.as_mut() else { return };
         repo.commit = Some(CommitState { id: WORKTREE.to_owned(), phase: Phase::Ready(work_view(&repo.work)) });
         repo.file = None;
