@@ -17,7 +17,7 @@ use crate::rows::{Anchor, DisplayRow, Mode, Notice, anchor_of};
 use crate::preview::{self, Images, Preview};
 use crate::minimap::MarkKind;
 use crate::syntax::{FileColors, Span};
-use crate::ui::{self, MONO, button};
+use crate::ui::{self, MONO, button, ghost, segment, segmented};
 use crate::workspace::{Phase, WHOLE_FILE, Workspace};
 use crate::theme::t;
 
@@ -53,10 +53,8 @@ impl Workspace {
         let mode = file.mode(repo.mode);
         let count = file.comments.len();
 
-        let toggle = |id: &'static str, label: &'static str, this: Mode| {
-            button(id, label)
-                .when(mode == this, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
-                .on_click(cx.listener(move |workspace, _, _, cx| workspace.set_mode(this, cx)))
+        let choice = |id: &'static str, label: &'static str, this: Mode| {
+            segment(id, label, mode == this).on_click(cx.listener(move |workspace, _, _, cx| workspace.set_mode(this, cx)))
         };
 
         let toolbar = div()
@@ -65,10 +63,10 @@ impl Workspace {
             .px_3()
             .flex()
             .items_center()
-            .gap_3()
+            .gap_2()
             .border_b_1()
             .border_color(rgb(t().border))
-            .child(button("overview", "Overview").on_click(cx.listener(|this, _, _, cx| this.close_file(cx))))
+            .child(ghost("overview", "‹ Overview").on_click(cx.listener(|this, _, _, cx| this.close_file(cx))))
             .child(ui::file_icon(icons::file(change.path.rsplit('/').next().unwrap_or(&change.path))))
             .child(
                 div()
@@ -108,20 +106,20 @@ impl Workspace {
                         .flex()
                         .gap_1()
                         .child(
-                            button("more-context", if file.context >= WHOLE_FILE { "Whole file" } else { "Show more lines" })
+                            ghost("more-context", if file.context >= WHOLE_FILE { "Whole file" } else { "↕ More lines" })
                                 .debug_selector(|| "more-context".to_owned())
                                 .on_click(cx.listener(|this, _, _, cx| this.more_context(cx))),
                         )
                         .when(file.context != 3, |group| {
                             group.child(
-                                button("less-context", "Collapse")
+                                ghost("less-context", "Collapse")
                                     .debug_selector(|| "less-context".to_owned())
                                     .on_click(cx.listener(|this, _, _, cx| this.set_diff_context(None, cx))),
                             )
                         }),
                 )
             })
-            .child(div().flex().gap_1().child(toggle("mode-unified", "Unified", Mode::Unified)).child(toggle("mode-split", "Split", Mode::Split)));
+            .child(segmented(vec![choice("mode-unified", "Unified", Mode::Unified), choice("mode-split", "Split", Mode::Split)]));
 
         let body: AnyElement = match &file.phase {
             Phase::Loading => centered_text("Loading diff…", t().muted),

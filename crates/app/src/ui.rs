@@ -2,7 +2,7 @@
 
 use gitgui_core::CommitKind;
 use gpui::{
-    BorderStyle, Bounds, ElementId, PathBuilder, Pixels, Point, Rgba, SharedString, Stateful, Window, canvas, div, point,
+    AnyElement, BorderStyle, Bounds, ElementId, FontWeight, PathBuilder, Pixels, Point, Rgba, SharedString, Stateful, Window, canvas, div, point,
     prelude::*, px, quad, rgb, size,
 };
 use crate::theme::t;
@@ -115,6 +115,67 @@ pub const MONO: &str = "Menlo";
 pub const MONO: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub const MONO: &str = "DejaVu Sans Mono";
+
+/// A quiet button for the toolbars: no fill until the pointer is over it, so a row of them does not shout.
+/// Filled `button`s are for the one action that matters in a place.
+pub fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .px_2()
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .text_xs()
+        .text_color(rgb(t().muted))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(t().element_hover)).text_color(rgb(t().text_strong)))
+        .child(label.into())
+}
+
+/// One choice of a segmented control (exactly one is chosen, and it is lit with the accent color); the caller
+/// adds the click.
+pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, chosen: bool) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(24.))
+        .px_3()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .cursor_pointer()
+        .when(chosen, |s| s.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+        .when(!chosen, |s| s.text_color(rgb(t().text)).hover(|style| style.bg(rgb(t().element_hover))))
+        .child(label.into())
+}
+
+/// One switch of a group of on/off switches (each can be on or off; on is a soft fill, not the accent color,
+/// which is kept for a single choice); the caller adds the click.
+pub fn toggle(id: impl Into<ElementId>, label: impl Into<SharedString>, on: bool) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(px(24.))
+        .px_3()
+        .rounded_sm()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .cursor_pointer()
+        .when(on, |s| s.bg(rgb(t().selected)).text_color(rgb(t().text_strong)).font_weight(FontWeight::SEMIBOLD))
+        .when(!on, |s| s.text_color(rgb(t().muted)).hover(|style| style.bg(rgb(t().element_hover)).text_color(rgb(t().text))))
+        .child(label.into())
+}
+
+/// A few choices or switches side by side in one rounded track.
+pub fn segmented(segments: Vec<Stateful<gpui::Div>>) -> AnyElement {
+    div().flex_none().flex().gap_0p5().p(px(2.)).rounded_md().bg(rgb(t().element)).children(segments).into_any_element()
+}
 
 /// A small text button.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<gpui::Div> {

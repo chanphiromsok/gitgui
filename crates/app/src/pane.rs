@@ -7,7 +7,7 @@ use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::
 
 use crate::changes::WORKTREE;
 use crate::detail::file_row;
-use crate::ui::{MONO, button};
+use crate::ui::{MONO, ghost, segment, segmented, toggle};
 use crate::workspace::{Panel, Phase, Splitter, Workspace};
 use crate::theme::t;
 
@@ -33,33 +33,34 @@ impl Workspace {
             _ => Default::default(),
         };
 
+        // Which panels show: switches in one track, soft when on. (The accent color is for a single choice.)
+        let mut panels = Vec::new();
+        if !expanded {
+            panels.push(
+                toggle("toggle-graph", "Graph", !self.graph_hidden)
+                    .debug_selector(|| "toggle-graph".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_graph_hidden(cx))),
+            );
+        }
+        if !work {
+            panels.push(
+                toggle("toggle-files", "Files", files_visible)
+                    .debug_selector(|| "toggle-files".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_files_visible(cx))),
+            );
+        }
         let header = div()
-            .h(px(34.))
+            .h(px(38.))
             .flex_none()
             .px_3()
             .flex()
             .items_center()
-            .gap_2()
+            .gap_3()
             .border_b_1()
             .border_color(rgb(t().border))
             // With the graph hidden its header, and the sidebar button in it, is gone: keep one here.
             .when(self.graph_hidden && !expanded, |header| header.child(self.sidebar_button(cx)))
-            .when(!expanded, |header| {
-                header.child(
-                    button("toggle-graph", "Graph")
-                        .debug_selector(|| "toggle-graph".to_owned())
-                        .when(!self.graph_hidden, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_graph_hidden(cx))),
-                )
-            })
-            .when(!work, |header| {
-                header.child(
-                    button("toggle-files", "Files")
-                        .debug_selector(|| "toggle-files".to_owned())
-                        .when(files_visible, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_files_visible(cx))),
-                )
-            })
+            .children((!panels.is_empty()).then(|| segmented(panels)))
             .child(div().flex_none().font_family(MONO).text_xs().text_color(rgb(t().muted)).child(short))
             .child(
                 div()
@@ -69,13 +70,14 @@ impl Workspace {
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(t().text_strong))
                     .child(summary),
             )
             .child(
-                button("expand", if expanded { "Collapse (Esc)" } else { "Expand (⌘E)" })
+                ghost("expand", if expanded { "Collapse  Esc" } else { "Expand  ⌘E" })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
             )
-            .child(button("close-pane", "Close").on_click(cx.listener(|this, _, _, cx| this.close_pane(cx))));
+            .child(ghost("close-pane", "Close").on_click(cx.listener(|this, _, _, cx| this.close_pane(cx))));
 
         let body: AnyElement = match &commit.phase {
             Phase::Loading => text_panel("Loading commit…", t().muted),
@@ -140,10 +142,8 @@ impl Workspace {
         };
         let shown_all = !repo.filter.trim().is_empty() && rows == 0;
 
-        let toggle = |id: &'static str, label: &'static str, this: Layout| {
-            button(id, label)
-                .when(layout == this, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
-                .on_click(cx.listener(move |workspace, _, _, cx| workspace.set_layout(this, cx)))
+        let choice = |id: &'static str, label: &'static str, this: Layout| {
+            segment(id, label, layout == this).on_click(cx.listener(move |workspace, _, _, cx| workspace.set_layout(this, cx)))
         };
 
         let left = self.files_left.clone();
@@ -165,7 +165,7 @@ impl Workspace {
                     .gap_2()
                     .border_b_1()
                     .border_color(rgb(t().border))
-                    .child(div().flex().gap_1().child(toggle("layout-tree", "Tree", Layout::Tree)).child(toggle("layout-flat", "Flat", Layout::Flat)))
+                    .child(segmented(vec![choice("layout-tree", "Tree", Layout::Tree), choice("layout-flat", "Flat", Layout::Flat)]))
                     .child(self.filter_input.clone()),
             )
             .child(if shown_all {

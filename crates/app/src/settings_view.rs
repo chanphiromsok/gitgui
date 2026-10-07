@@ -14,7 +14,7 @@ use crate::icons;
 use crate::menu::modal;
 use crate::rows::Mode;
 use crate::theme::{Origin, t};
-use crate::ui::{MONO, button};
+use crate::ui::{MONO, button, segment, segmented};
 use crate::workspace::Workspace;
 
 const NAV_W: f32 = 184.;
@@ -68,29 +68,6 @@ fn switch(id: &'static str, on: bool) -> Stateful<gpui::Div> {
         .bg(rgb(if on { t().accent } else { t().element }))
         .when(on, |track| track.justify_end())
         .child(div().size(px(18.)).rounded_full().bg(rgb(0xffffff)))
-}
-
-/// One choice of a segmented control; the caller adds the click.
-fn segment(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, chosen: bool) -> Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .h(px(24.))
-        .px_3()
-        .rounded_sm()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_xs()
-        .cursor_pointer()
-        .when(chosen, |s| s.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
-        .when(!chosen, |s| s.hover(|style| style.bg(rgb(t().element_hover))))
-        .child(label.into())
-}
-
-/// A few choices side by side, in one rounded track.
-fn segmented(segments: Vec<Stateful<gpui::Div>>) -> AnyElement {
-    div().flex_none().flex().gap_0p5().p(px(2.)).rounded_md().bg(rgb(t().element)).children(segments).into_any_element()
 }
 
 /// One setting: its name and what it does, and its control.

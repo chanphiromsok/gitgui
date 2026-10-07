@@ -11,7 +11,7 @@
 //! select <text>           the first commit whose summary has the text (or a row number)
 //! file 0                  open the commit's nth changed file
 //! mode split|unified      layout tree|flat      expand      back      more
-//! review below|beside    where the file pane goes
+//! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
 //! settings [graph|files|appearance|projects]
@@ -94,6 +94,7 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             if rest == "beside" { gitgui_store::ReviewLayout::Beside } else { gitgui_store::ReviewLayout::Below },
             cx,
         ),
+        "theme" => workspace.set_theme(rest, cx),
         "sidebar" => workspace.toggle_sidebar(cx),
         "graph" => workspace.toggle_graph_hidden(cx),
         "files" => workspace.toggle_files_visible(cx),
