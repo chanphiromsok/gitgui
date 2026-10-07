@@ -58,6 +58,8 @@ const DIMMED: f32 = 0.22;
 const OFF_BRANCH: f32 = 0.45;
 /// How far each level of a group is pushed in, and the color of the guide beside it.
 const INDENT: f32 = 18.;
+/// A branch badge is cut short beyond this width; the whole name is in its right-click menu.
+const BADGE_MAX_W: f32 = 240.;
 
 /// How the dot of a row is drawn.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,8 @@ pub struct Note {
     pub probable: bool,
     /// A commit to jump to: where the squash landed, or the branch's tip.
     pub jump: Option<String>,
+    /// Says a branch tip is merged (a soft green tag); otherwise it is the quiet "squash of" line.
+    pub merged: bool,
 }
 
 /// One table row, ready to draw.
@@ -347,18 +351,33 @@ pub fn apply_clues(entries: &mut [Entry], clues: &[MergeClue]) {
                     detail: format!("{} was {verb} {}{landed}. {how}", clue.branch, clue.into).into(),
                     probable: clue.evidence.is_probable(),
                     jump: clue.commit.clone(),
+                    merged: true,
                 });
             }
             if clue.commit.is_some() && entry.commit == clue.commit {
+                // The row already links the pull request; say its number only when the row does not.
+                let linked = entry.pr.as_ref().is_some_and(|(n, _)| Some(*n) == clue.pr);
+                let pr = if linked { String::new() } else { pr.clone() };
                 entry.notes.push(Note {
-                    text: format!("squash of branch {}{pr}", clue.branch).into(),
+                    text: format!("squash of branch {}{pr}", short_name(&clue.branch)).into(),
                     detail: format!("This one commit holds all the changes of the branch {} (a squash merge), and the branch was merged into {} through it. {how}", clue.branch, clue.into).into(),
                     probable: clue.evidence.is_probable(),
                     jump: None,
+                    merged: false,
                 });
             }
         }
     }
+}
+
+/// A branch name for a line of text: without the `origin/` in front, and cut at 32 characters.
+fn short_name(name: &str) -> String {
+    let name = name.strip_prefix("origin/").unwrap_or(name);
+    if name.chars().count() <= 32 {
+        return name.to_owned();
+    }
+    let head: String = name.chars().take(31).collect();
+    format!("{head}…")
 }
 
 pub fn graph_width(widest_lanes: usize, density: Density) -> f32 {
@@ -405,6 +424,7 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
         .flex()
         .items_center()
         .gap_1()
+        .max_w(px(BADGE_MAX_W))
         .bg(bg)
         .text_color(fg)
         .when(label.head, |name| name.font_weight(FontWeight::BOLD))
@@ -412,7 +432,9 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
             name.child(gpui::img(icons::remote(fg_color)).flex_none().size(px(11.)))
                 .when(label.remotes.len() > 1, |name| name.child(format!("{}", label.remotes.len())))
         })
-        .child(SharedString::from(label.name.clone()));
+        .child(
+            div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(SharedString::from(label.name.clone())),
+        );
 
     let target = MenuTarget::Label(label.clone());
     // A detached HEAD is not a branch; right-clicking it gives the commit's menu, so let the row have it.
@@ -455,6 +477,20 @@ fn summary_text(entry: &Entry) -> StyledText {
         ..Default::default()
     };
     text.with_highlights([(0..entry.prefix, bold)])
+}
+
+/// What the merge scan found, kept quiet: "merged" is a soft green tag, "squash of" is plain dim text.
+fn note_label(note: &Note) -> impl IntoElement + use<> {
+    let green = rgb(t().added);
+    div()
+        .flex_none()
+        .text_xs()
+        .when(note.probable, |label| label.italic())
+        .when(note.merged, |label| {
+            label.px_1p5().rounded_sm().bg(Rgba { a: 0.14, ..green }).text_color(Rgba { a: 0.95, ..green })
+        })
+        .when(!note.merged, |label| label.text_color(rgb(t().muted)))
+        .child(note.text.clone())
 }
 
 fn chip(text: SharedString, color: u32, probable: bool) -> impl IntoElement {
@@ -527,7 +563,7 @@ pub fn render_entry(
     let fold_commit = entry.commit.clone();
     let mut chips: Vec<gpui::AnyElement> = Vec::new();
     for note in &entry.notes {
-        chips.push(chip(note.text.clone(), t().added, note.probable).into_any_element());
+        chips.push(note_label(note).into_any_element());
     }
     if entry.collapsed {
         chips.push(chip(format!("{} commits folded", entry.group_size).into(), t().muted, false).into_any_element());
