@@ -640,6 +640,12 @@ impl Workspace {
                 "Narrow lanes and thin lines, so a busy history leaves more room for the messages.",
                 cx.listener(|this, _, _, cx| this.toggle_compact_graph(cx)),
             ))
+            .child(scale_row(
+                "Graph size",
+                "How large the commit circles, lanes and rows are drawn. Larger is easier to read on a big screen.",
+                self.settings.graph_scale,
+                cx,
+            ))
             .child(choice_row(
                 "File list",
                 "How a commit's changed files are listed. Also the Tree / Flat buttons above the list.",
@@ -839,6 +845,26 @@ fn choice_row(
                 .child(pick(id_a, label_a, on_a).on_click(first))
                 .child(pick(id_b, label_b, on_b).on_click(second)),
         )
+        .into_any_element()
+}
+
+/// The Graph size setting: a row of presets, the chosen one lit.
+fn scale_row(title: &'static str, detail: &'static str, current: u32, cx: &mut Context<Workspace>) -> AnyElement {
+    const PRESETS: [u32; 5] = [75, 100, 125, 150, 200];
+    let buttons = PRESETS.map(|percent| {
+        button(("setting-scale", percent as usize), format!("{percent}%"))
+            .w(px(46.))
+            .justify_center()
+            .when(percent == current, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_graph_scale(percent, cx)))
+    });
+    div()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+        .child(div().text_xs().text_color(rgb(t().muted)).child(detail))
+        .child(div().flex().flex_wrap().gap_1().children(buttons))
         .into_any_element()
 }
 

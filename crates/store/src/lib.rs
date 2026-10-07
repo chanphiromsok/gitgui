@@ -77,6 +77,19 @@ pub struct Settings {
     pub file_layout: FileLayout,
     /// A file's diff unified or split. Remembered from one launch to the next.
     pub diff_mode: DiffMode,
+    /// How large the graph is drawn (commit circles, lanes, row height), in percent. 100 is the default.
+    pub graph_scale: u32,
+}
+
+/// The smallest and largest graph scale, in percent; a saved value outside is brought inside.
+pub const GRAPH_SCALE_MIN: u32 = 75;
+pub const GRAPH_SCALE_MAX: u32 = 200;
+
+impl Settings {
+    /// The graph scale as a factor (1.0 at the default), kept within the allowed range.
+    pub fn graph_factor(&self) -> f32 {
+        self.graph_scale.clamp(GRAPH_SCALE_MIN, GRAPH_SCALE_MAX) as f32 / 100.
+    }
 }
 
 impl Default for Settings {
@@ -90,6 +103,7 @@ impl Default for Settings {
             fetch_avatars: true,
             file_layout: FileLayout::Tree,
             diff_mode: DiffMode::Unified,
+            graph_scale: 100,
         }
     }
 }
@@ -549,5 +563,18 @@ mod tests {
         // A value from a newer version that this one does not know is an error, not a silent reset.
         fs::write(scratch.0.join("data/settings.json"), r#"{"diff_mode": "sideways"}"#).unwrap();
         assert!(matches!(scratch.store().settings(), Err(Error::Corrupt { .. })));
+    }
+
+    #[test]
+    fn the_graph_scale_defaults_to_100_is_remembered_and_stays_in_range() {
+        let scratch = Scratch::new("graph-scale");
+        let store = scratch.store();
+        assert_eq!(store.settings().unwrap().graph_scale, 100);
+        store.save_settings(&Settings { graph_scale: 150, ..Settings::default() }).unwrap();
+        let again = scratch.store().settings().unwrap();
+        assert_eq!((again.graph_scale, again.graph_factor()), (150, 1.5));
+        // A hand-edited value outside the range is brought inside rather than drawing a 0 px graph.
+        assert_eq!(Settings { graph_scale: 0, ..Settings::default() }.graph_factor(), 0.75);
+        assert_eq!(Settings { graph_scale: 9000, ..Settings::default() }.graph_factor(), 2.0);
     }
 }

@@ -34,15 +34,28 @@ pub struct Density {
     pub node: f32,
     /// Thickness of a line; the selected line is a step thicker.
     pub line: f32,
+    /// Height of a row.
+    pub row_h: f32,
+    /// The scale everything above was multiplied by (the Graph size setting).
+    pub scale: f32,
 }
 
 impl Density {
-    pub const ROOMY: Density = Density { lane_w: 20., dot_r: 4.5, line: 2., node: 17. };
+    const ROOMY: Density = Density { lane_w: 20., dot_r: 4.5, line: 2., node: 17., row_h: ROW_H, scale: 1. };
     /// Narrow lanes and thin lines, so a busy history leaves room for the messages.
-    pub const COMPACT: Density = Density { lane_w: 14., dot_r: 3.2, line: 1.5, node: 13. };
+    const COMPACT: Density = Density { lane_w: 14., dot_r: 3.2, line: 1.5, node: 13., row_h: ROW_H, scale: 1. };
 
-    pub fn of(compact: bool) -> Self {
-        if compact { Self::COMPACT } else { Self::ROOMY }
+    /// `scale` is the Graph size setting as a factor: 1.0 is the default, 1.5 draws everything half as large again.
+    pub fn of(compact: bool, scale: f32) -> Self {
+        let base = if compact { Self::COMPACT } else { Self::ROOMY };
+        Self {
+            lane_w: base.lane_w * scale,
+            dot_r: base.dot_r * scale,
+            line: base.line * scale,
+            node: base.node * scale,
+            row_h: base.row_h * scale,
+            scale,
+        }
     }
 
     /// Where a lane's center is, from the graph's left edge.
@@ -576,7 +589,7 @@ pub fn render_entry(
     div()
         .id(ix)
         .debug_selector(|| format!("row-{ix}"))
-        .h(px(ROW_H))
+        .h(px(density.row_h))
         .w_full()
         .px_2()
         .flex()
@@ -603,7 +616,7 @@ pub fn render_entry(
                 .relative()
                 .flex_none()
                 .w(px(graph_width))
-                .h(px(ROW_H))
+                .h(px(density.row_h))
                 .child(
                     canvas(
                         |_, _, _| (),
@@ -622,7 +635,7 @@ pub fn render_entry(
                         div()
                             .absolute()
                             .left(px(density.x(lane) - d / 2.))
-                            .top(px((ROW_H - d) / 2.))
+                            .top(px((density.row_h - d) / 2.))
                             .size(px(d))
                             .rounded_full()
                             .bg(rgb(lane_color))
@@ -635,14 +648,14 @@ pub fn render_entry(
                     )
                 })
                 .when(fold.is_some(), |cell| {
-                    let hit = 18.;
+                    let hit = 18. * density.scale;
                     cell.child(
                         div()
                             .id(("fold", ix))
                             .debug_selector(move || format!("fold-{ix}"))
                             .absolute()
                             .left(px(density.x(lane) - hit / 2.))
-                            .top(px((ROW_H - hit) / 2.))
+                            .top(px((density.row_h - hit) / 2.))
                             .size(px(hit))
                             .rounded_full()
                             .cursor_pointer()
@@ -726,7 +739,7 @@ pub fn render_entry(
                     .gap_1p5()
                     .overflow_hidden()
                     .text_color(rgb(t().muted))
-                    .when(entry.commit.is_some(), |cell| cell.child(ui::avatar(&entry.person.name, &entry.person.email, avatar, 16.)))
+                    .when(entry.commit.is_some(), |cell| cell.child(ui::avatar(&entry.person.name, &entry.person.email, avatar, 16. * density.scale)))
                     .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(entry.author.clone())),
             )
             .child(div().w(px(64.)).flex_none().font_family(MONO).text_color(rgb(t().muted)).child(entry.short_id.clone()))

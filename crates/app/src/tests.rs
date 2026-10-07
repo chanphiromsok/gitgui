@@ -1748,3 +1748,21 @@ async fn switching_projects_frees_the_old_history_before_the_new_one_loads(cx: &
     cx.run_until_parked();
     assert!(ws.read_with(cx, |ws, _| ws.kept_history()).is_some_and(|new| new.upgrade().is_some()));
 }
+
+#[gpui::test]
+async fn the_graph_size_setting_scales_the_rows_and_is_remembered(cx: &mut TestAppContext) {
+    let fx = merged_pr("graph-scale");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    let height = |cx: &mut VisualTestContext| cx.debug_bounds("row-1").expect("a row is drawn").size.height;
+    let normal = height(cx);
+    ws.update(cx, |ws, cx| ws.set_graph_scale(150, cx));
+    draw(cx, &ws);
+    let large = height(cx);
+    assert!((large / normal - 1.5).abs() < 0.01, "rows went from {normal:?} to {large:?}");
+    assert_eq!(Store::at(fx.data()).settings().unwrap().graph_scale, 150, "kept for the next start");
+    // Out of range values are brought inside.
+    ws.update(cx, |ws, cx| ws.set_graph_scale(5000, cx));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.settings.graph_scale), 200);
+}

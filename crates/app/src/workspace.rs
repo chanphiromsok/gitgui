@@ -135,7 +135,7 @@ impl RepoView {
         self.shown = commits.len();
         self.entries = built.entries;
         graph::apply_clues(&mut self.entries, &self.clues);
-        self.graph_width = graph::graph_width(built.widest, graph::Density::of(settings.compact_graph));
+        self.graph_width = graph::graph_width(built.widest, graph::Density::of(settings.compact_graph, settings.graph_factor()));
         self.lineages = built.lineages;
         self.names = built.names;
         self.base = base;
@@ -1472,6 +1472,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// How large the graph is drawn, in percent. Kept for the next launch.
+    pub fn set_graph_scale(&mut self, percent: u32, cx: &mut Context<Self>) {
+        let percent = percent.clamp(gitgui_store::GRAPH_SCALE_MIN, gitgui_store::GRAPH_SCALE_MAX);
+        if self.settings.graph_scale == percent {
+            return;
+        }
+        self.settings.graph_scale = percent;
+        self.save_settings();
+        let settings = self.settings.clone();
+        if let Some(repo) = self.repo.as_mut() {
+            repo.rebuild(&settings);
+        }
+        cx.notify();
+    }
+
     /// Unified or split diff. The choice is kept for the next launch.
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         self.settings.diff_mode = diff_mode_of(mode);
@@ -2070,7 +2085,7 @@ impl Workspace {
                         let Some(repo) = this.repo.as_ref() else { return Vec::new() };
                         let Phase::Ready(view) = &repo.phase else { return Vec::new() };
                         let selected = repo.selected;
-                        let density = graph::Density::of(this.settings.compact_graph);
+                        let density = graph::Density::of(this.settings.compact_graph, this.settings.graph_factor());
                         // The selected commit's branch line comes forward; the others step back.
                         let highlight = selected.and_then(|ix| view.entries.get(ix)).map(|entry| entry.row.lineage);
                         range
