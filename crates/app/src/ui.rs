@@ -116,6 +116,17 @@ pub const MONO: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub const MONO: &str = "DejaVu Sans Mono";
 
+/// Where a project lives, for a list: its parent folder with the home folder as `~`, since the project's own
+/// name is already shown. `~/Desktop/BSExpress` says more, in less room, than the whole path cut off at the end.
+pub fn tidy_parent(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    let parent = path.parent().unwrap_or(path);
+    match home.and_then(|home| parent.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => parent.display().to_string(),
+    }
+}
+
 /// A quiet button for the toolbars: no fill until the pointer is over it, so a row of them does not shout.
 /// Filled `button`s are for the one action that matters in a place.
 pub fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<gpui::Div> {
@@ -221,5 +232,21 @@ mod tests {
         assert_eq!(ago(59 * 60), "59 min ago");
         assert_eq!(ago(2 * 3600), "2 h ago");
         assert_eq!(ago(3 * 86_400), "3 d ago");
+    }
+}
+
+#[cfg(test)]
+mod tidy_tests {
+    use super::tidy_parent;
+    use std::path::Path;
+
+    #[test]
+    fn a_project_is_placed_by_its_parent_folder_with_the_home_folder_as_a_tilde() {
+        let home = Some(Path::new("/Users/ada"));
+        assert_eq!(tidy_parent(Path::new("/Users/ada/Desktop/BSExpress/userapp"), home), "~/Desktop/BSExpress");
+        assert_eq!(tidy_parent(Path::new("/Users/ada/gitgui"), home), "~");
+        assert_eq!(tidy_parent(Path::new("/srv/repos/app"), home), "/srv/repos");
+        assert_eq!(tidy_parent(Path::new("/Users/adam/app"), home), "/Users/adam", "a different user is not home");
+        assert_eq!(tidy_parent(Path::new("/Users/ada/app"), None), "/Users/ada");
     }
 }

@@ -18,7 +18,7 @@ use gitgui_core::{
 use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, FontWeight, ListAlignment, ListState, MouseButton, MouseMoveEvent,
-    PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
+    PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, rgba, uniform_list,
 };
 
 use crate::graph::{self, Entry};
@@ -26,7 +26,7 @@ use crate::layout;
 use crate::menu::{Dialog, MenuState, Notice, NoticeAction};
 use crate::rows::{Anchor, DisplayRow, Mode, display_rows};
 use crate::text_input::{TextInput, TextInputEvent};
-use crate::ui::{self, button};
+use crate::ui::{self, button, ghost};
 use crate::avatars::{self, Avatar, Avatars};
 use crate::changes::WORKTREE;
 use crate::icons::{self, IconTheme};
@@ -2045,21 +2045,27 @@ impl Workspace {
 
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let selected_path = self.repo.as_ref().map(|repo| repo.project.path.clone());
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
         let mut rows: Vec<AnyElement> = Vec::new();
         for (i, project) in self.projects.iter().enumerate() {
             let row = {
                 let selected = selected_path.as_deref() == Some(project.path.as_path());
                 let (open_path, remove_path) = (project.path.clone(), project.path.clone());
+                let place = ui::tidy_parent(&project.path, home.as_deref());
                 div()
                     .id(("project", i))
                     .group("project-row")
-                    .px_3()
-                    .py_2()
+                    .pl(px(10.))
+                    .pr_3()
+                    .py_1p5()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .cursor_pointer()
+                    // A bar down the left edge marks the open project; the others keep the space, so names line up.
+                    .border_l_2()
+                    .border_color(if selected { rgb(t().accent) } else { rgba(0x00000000) })
                     .when(selected, |row| row.bg(rgb(t().selected)))
                     .hover(|style| style.bg(rgb(if selected { t().selected } else { t().hover })))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_project(open_path.clone(), cx)))
@@ -2072,7 +2078,9 @@ impl Workspace {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
+                                    .text_sm()
                                     .font_weight(if selected { FontWeight::BOLD } else { FontWeight::MEDIUM })
+                                    .text_color(rgb(if selected { t().text_strong } else { t().text }))
                                     .child(SharedString::from(project.name.clone())),
                             )
                             .child(
@@ -2082,7 +2090,7 @@ impl Workspace {
                                     .text_ellipsis()
                                     .text_xs()
                                     .text_color(rgb(t().muted))
-                                    .child(SharedString::from(project.path.display().to_string())),
+                                    .child(SharedString::from(place)),
                             ),
                     )
                     .child(
@@ -2117,26 +2125,22 @@ impl Workspace {
             .flex_col()
             .bg(rgb(t().panel))
             .child(
+                // One row, as tall as the headers beside it: the title, and the two ways to add a project.
                 div()
+                    .h(px(38.))
                     .flex_none()
                     .px_3()
-                    .py_2()
                     .flex()
-                    .flex_col()
-                    .gap_2()
+                    .items_center()
+                    .gap_1()
                     .border_b_1()
                     .border_color(rgb(t().border))
-                    .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().muted)).child("PROJECTS"))
+                    .child(div().min_w_0().flex_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().muted)).child("PROJECTS"))
+                    .child(ghost("open-folder", "Open…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))))
                     .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(button("open-folder", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx))))
-                            .child(
-                                button("clone-repo", "Clone…")
-                                    .debug_selector(|| "clone-repo".to_owned())
-                                    .on_click(cx.listener(|this, _, window, cx| this.start_clone(window, cx))),
-                            ),
+                        ghost("clone-repo", "Clone…")
+                            .debug_selector(|| "clone-repo".to_owned())
+                            .on_click(cx.listener(|this, _, window, cx| this.start_clone(window, cx))),
                     ),
             )
             .child(div().id("projects").flex_1().overflow_y_scroll().children(rows).when(self.projects.is_empty(), |list| {
@@ -2295,7 +2299,7 @@ impl Workspace {
         };
         let header = div()
             .overflow_hidden()
-            .h(px(34.))
+            .h(px(38.))
             .flex_none()
             .px_3()
             .flex()
