@@ -481,14 +481,15 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
 
 /// The summary, its conventional-commit prefix (`docs:`, `fix(ui):`) in bold so the kind of change
 /// reads at a glance.
-fn summary_text(entry: &Entry) -> StyledText {
+fn summary_text(entry: &Entry, gray: bool) -> StyledText {
     let text = StyledText::new(entry.summary.clone());
     if entry.prefix == 0 || entry.merge {
         return text;
     }
     let bold = gpui::HighlightStyle {
         font_weight: Some(FontWeight::BOLD),
-        color: Some(rgb(t().text_strong).into()),
+        // The prefix is as gray as the rest of the line when another branch is the one in focus.
+        color: Some(rgb(if gray { t().muted } else { t().text_strong }).into()),
         ..Default::default()
     };
     text.with_highlights([(0..entry.prefix, bold)])
@@ -531,6 +532,17 @@ pub fn shows_face(mode: GraphFaces, entry: &Entry, highlight: Option<usize>) -> 
         GraphFaces::All => true,
         GraphFaces::Tips => entry.labels.iter().any(|l| matches!(l.kind, LabelKind::Branch | LabelKind::RemoteBranch)),
         GraphFaces::Selected => highlight == Some(entry.row.lineage),
+    }
+}
+
+/// The color of a row's words. With a commit selected, `in_focus` says whether this row is on the selected
+/// branch line (strongest text) or not (gray); with none selected a merge is gray and the rest normal.
+fn row_text_color(in_focus: Option<bool>, merge: bool) -> Rgba {
+    match in_focus {
+        Some(true) => rgb(t().text_strong),
+        Some(false) => rgb(t().muted),
+        None if merge => rgb(t().muted),
+        None => rgb(t().text),
     }
 }
 
@@ -600,7 +612,11 @@ pub fn render_entry(
         chips.push(chip(format!("{} commits folded", entry.group_size).into(), t().muted, false).into_any_element());
     }
 
-    let text_color = if entry.merge { rgb(t().muted) } else { rgb(t().text) };
+    // With a commit selected, the commits of its branch line read in the strongest text color and all the
+    // others in gray. Only the color of the words changes: nothing else is dimmed.
+    let in_focus = highlight.map(|h| entry.row.lineage == h);
+    let gray = in_focus == Some(false) && !uncommitted;
+    let text_color = row_text_color(in_focus, entry.merge);
     let commit = entry.commit.is_some();
     let target = entry.commit.clone().map(MenuTarget::Commit);
 
@@ -719,7 +735,7 @@ pub fn render_entry(
                         .text_ellipsis()
                         .text_color(text_color)
                         .when(uncommitted || current, |text| text.font_weight(FontWeight::BOLD))
-                        .child(summary_text(entry)),
+                        .child(summary_text(entry, gray)),
                 )
                 .children(entry.pr.clone().map(|(number, url)| {
                     // The pull request's page, in the browser.
@@ -897,6 +913,17 @@ fn paint_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selected_branch_reads_in_the_strongest_color_and_the_rest_in_gray() {
+        let theme = t();
+        assert_eq!(row_text_color(Some(true), false), rgb(theme.text_strong));
+        assert_eq!(row_text_color(Some(true), true), rgb(theme.text_strong), "a merge on the selected line is not gray");
+        assert_eq!(row_text_color(Some(false), false), rgb(theme.muted));
+        assert_eq!(row_text_color(None, false), rgb(theme.text), "nothing selected: as before");
+        assert_eq!(row_text_color(None, true), rgb(theme.muted));
+        assert_ne!(theme.text_strong, theme.muted);
+    }
     use gitgui_core::Ref;
 
     fn commit(id: &str, parents: &[&str], refs: &[(&str, RefKind)]) -> Commit {
