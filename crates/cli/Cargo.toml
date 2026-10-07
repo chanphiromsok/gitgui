@@ -1,0 +1,13 @@
+[package]
+name = "gitgui-cli"
+description = "Headless front end for gitgui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gitgui"
+path = "src/main.rs"
+
+[dependencies]
+gitgui-core = { path = "../core" }

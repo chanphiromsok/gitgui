@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/store", "crates/cli", "crates/app"]
+default-members = ["crates/core", "crates/store", "crates/cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+# GPUI draws text and paths on the CPU side before it hands them to the GPU; at opt-level 0 that is far
+# too slow to scroll. Optimize the dependencies even in dev builds; our own code stays easy to debug.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Smaller, faster release binaries; slower to build.
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

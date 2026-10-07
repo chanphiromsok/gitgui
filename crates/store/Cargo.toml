@@ -1,0 +1,10 @@
+[package]
+name = "gitgui-store"
+description = "Saved projects and line comments, kept as JSON in the app's data folder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

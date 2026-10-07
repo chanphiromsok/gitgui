@@ -1,0 +1,8 @@
+[package]
+name = "gitgui-core"
+description = "Repo model, git backend and commit-graph layout, with no UI dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

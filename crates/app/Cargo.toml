@@ -1,0 +1,20 @@
+[package]
+name = "gitgui-app"
+description = "GPUI front end for gitgui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gitgui-app"
+path = "src/main.rs"
+
+[dependencies]
+gitgui-core = { path = "../core" }
+gitgui-store = { path = "../store" }
+# runtime_shaders: compile Metal shaders at startup; Xcode 26 ships without the Metal Toolchain.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders", "test-support"] }
