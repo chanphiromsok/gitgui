@@ -731,8 +731,10 @@ pub fn render_entry(
                 .child(
                     div()
                         .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
+                        .flex_1()
+                        // One line with an ellipsis. Not `whitespace_nowrap`: GPUI only re-measures a text that can
+                        // wrap, so a no-wrap one keeps the width it first had and is cut off with no ellipsis.
+                        .line_clamp(1)
                         .text_ellipsis()
                         .text_color(text_color)
                         .when(uncommitted || current, |text| text.font_weight(FontWeight::BOLD))

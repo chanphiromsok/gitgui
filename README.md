@@ -133,7 +133,7 @@ Left to right: **projects** | **graph** with the **file pane** below it (or besi
 
 ## Seeing the window without anyone at the screen
 
-`GITGUI_SCRIPT=steps.txt GITGUI_SHOTS=folder cargo run -p gitgui-app` drives the app through the steps in the file (`size`, `open`, `select`, `file`, `mode`, `expand`, `settings`, `graph`, `files`, `peek`, `shot name`, `quit`; see `crates/app/src/script.rs`) and saves a PNG of the real window at each `shot`. macOS only. It is how the layout is checked on a small window.
+`GITGUI_SCRIPT=steps.txt GITGUI_SHOTS=folder cargo run -p gitgui-app` drives the app through the steps in the file (`size`, `open`, `select`, `file`, `mode`, `expand`, `settings`, `graph`, `files`, `peek`, `shot name`, `quit`; see `crates/app/src/script.rs`) and saves a PNG of the real window at each `shot`. macOS only. It is how the layout is checked on a small window. `GITGUI_PERF=1` adds lane count and read/layout timings to the graph header.
 
 ## Tests
 

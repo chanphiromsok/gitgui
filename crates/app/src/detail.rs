@@ -218,6 +218,7 @@ pub fn file_row(
             let path = path.clone();
             div()
             .id(("dir", ix))
+            .w_full()
             .h(px(ROW_H))
             .pl(indent(*depth))
             .flex()
@@ -239,6 +240,7 @@ pub fn file_row(
             let is_selected = selected == Some(index);
             div()
                 .id(("file", ix))
+                .w_full()
                 .h(px(ROW_H))
                 .pl(indent(*depth))
                 .pr_2()
@@ -257,8 +259,11 @@ pub fn file_row(
                 }))
                 .child(ui::file_icon(icons::file(name)))
                 .child(
+                    // Gives way (with an ellipsis) before the counts do, so a long name never pushes them out of view.
                     div()
-                        .flex_none()
+                        .min_w(px(40.))
+                        .line_clamp(1)
+                        .text_ellipsis()
                         .text_color(status_color(change.status))
                         .when(deleted, |name| name.line_through())
                         .child(SharedString::from(name.clone())),

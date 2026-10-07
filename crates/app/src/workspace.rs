@@ -152,12 +152,17 @@ impl RepoView {
         } else {
             format!("{} commits", self.commits.len())
         };
-        self.timing = SharedString::from(format!(
-            "{count} · read {:.0} ms · layout {:.1} ms · {} lanes",
-            self.read.as_secs_f64() * 1000.,
-            started.elapsed().as_secs_f64() * 1000.,
-            built.widest,
-        ));
+        // The timings are for whoever is working on the app, not for the person reading history.
+        self.timing = SharedString::from(if std::env::var_os("GITGUI_PERF").is_some() {
+            format!(
+                "{count} · {} lanes · read {:.0} ms · layout {:.1} ms",
+                built.widest,
+                self.read.as_secs_f64() * 1000.,
+                started.elapsed().as_secs_f64() * 1000.,
+            )
+        } else {
+            count
+        });
         self.apply_search(filter);
     }
 
@@ -2469,8 +2474,11 @@ impl Workspace {
                 None => format!("{} found · Enter for next", view.matches.len()),
             }),
         };
+        // Starts at a comfortable width, grows into spare room and gives way before anything else does.
         let search = div()
-            .flex_1()
+            .w(px(260.))
+            .flex_grow()
+            .flex_shrink()
             .min_w(px(if narrow { 70. } else { 160. }))
             .max_w(px(420.))
             .overflow_hidden()
