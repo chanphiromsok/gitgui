@@ -151,6 +151,7 @@ pub struct GraphStyle {
     pub badge: Badge,
 }
 
+#[allow(clippy::too_many_arguments)]
 const fn style(
     id: &'static str,
     name: &'static str,
@@ -327,10 +328,11 @@ pub fn lane(lineage: usize) -> u32 {
     if style.palette.is_empty() {
         return theme.lane(lineage);
     }
-    if let Some(fitted) = FITTED.read().ok().and_then(|f| f.as_ref().map(|f| (f.style, f.background, f.colors.clone()))) {
-        if fitted.0 == at && fitted.1 == theme.bg {
-            return fitted.2[lineage % fitted.2.len()];
-        }
+    if let Some(fitted) = FITTED.read().ok().and_then(|f| f.as_ref().map(|f| (f.style, f.background, f.colors.clone())))
+        && fitted.0 == at
+        && fitted.1 == theme.bg
+    {
+        return fitted.2[lineage % fitted.2.len()];
     }
     let colors = fitted_palette(style, theme.bg);
     let color = colors[lineage % colors.len()];
@@ -583,7 +585,7 @@ pub fn paint_preview(style: &GraphStyle, colors: &[u32], bounds: Bounds<Pixels>,
             // The name inside it, as a short bar in the label's ink.
             let ink = rgb(look.ink);
             let text_x = if look.dot.is_some() { left + px(10.) } else { left + px(6.) };
-            let text_w = if look.dot.is_some() { badge_w - 12. } else { badge_w - 12. };
+            let text_w = badge_w - 12.;
             window.paint_quad(quad(
                 Bounds { origin: point(text_x, mid(row) - px(1.75)), size: size(px(text_w), px(3.5)) },
                 px(1.75),

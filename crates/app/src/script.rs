@@ -15,7 +15,8 @@
 //! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light      style <id>   graph style, e.g. style neon
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
-//! settings [graph|files|appearance|projects]
+//! hover <text>   rest the pointer on the first diff line whose text has the text (nopeek-style: `hover` alone leaves)
+//! settings [graph|style|files|appearance|projects]
 //! shot name               save <folder>/name.png
 //! quit
 //! ```
@@ -107,6 +108,7 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         ),
         "theme" => workspace.set_theme(rest, cx),
         "style" => workspace.set_graph_style(rest, cx),
+        "hover" => workspace.script_hover(rest, cx),
         "search" => workspace.set_search(rest.to_owned(), cx),
         "menu" => {
             // menu authors|dates X Y: the menu a click there on that chip would open.

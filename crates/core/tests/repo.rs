@@ -41,6 +41,12 @@ impl TempRepo {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn commit_text(&self, file: &str, text: &str, message: &str) {
+        std::fs::write(self.0.join(file), text).unwrap();
+        self.git(&["add", file]);
+        self.git(&["commit", "-q", "-m", message]);
+    }
+
     fn commit(&self, file: &str, message: &str) {
         std::fs::write(self.0.join(file), message).unwrap();
         self.git(&["add", file]);
@@ -1129,4 +1135,44 @@ fn unstaging_works_before_the_first_commit() {
     assert!(git.work_status().unwrap()[0].staged);
     git.unstage(&["first.txt".into()]).unwrap();
     assert!(git.work_status().unwrap()[0].untracked);
+}
+
+#[test]
+fn blame_names_the_commit_of_each_line_and_marks_the_uncommitted_ones() {
+    let repo = TempRepo::new("blame");
+    repo.commit_text("f.txt", "one\ntwo\nthree\n", "add three lines");
+    // Grace changes the middle line.
+    std::fs::write(repo.path().join("f.txt"), "one\nTWO\nthree\n").unwrap();
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["-c", "commit.gpgsign=false", "commit", "-q", "-am", "shout the second line"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Grace")
+        .env("GIT_AUTHOR_EMAIL", "grace@example.com")
+        .env("GIT_COMMITTER_NAME", "Grace")
+        .env("GIT_COMMITTER_EMAIL", "grace@example.com")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // And a third line is edited but not committed.
+    std::fs::write(repo.path().join("f.txt"), "one\nTWO\nthree!\n").unwrap();
+
+    let git = GitCli::new(repo.path());
+    let committed = git.blame(Some("HEAD"), "f.txt").unwrap();
+    assert_eq!(committed.len(), 3);
+    assert_eq!(committed.line(1).unwrap().author, "Ada");
+    let second = committed.line(2).unwrap();
+    assert_eq!((second.author.as_str(), second.email.as_str(), second.summary.as_str()), ("Grace", "grace@example.com", "shout the second line"));
+    assert!(!committed.line(3).unwrap().uncommitted(), "at HEAD the third line is as committed");
+
+    let working = git.blame(None, "f.txt").unwrap();
+    assert!(working.line(3).unwrap().uncommitted(), "the edit is not in any commit yet");
+    assert_eq!(working.line(2).unwrap().author, "Grace");
+
+    // The parent's version: the second line was still Ada's.
+    let before = git.blame(Some("HEAD^"), "f.txt").unwrap();
+    assert_eq!(before.line(2).unwrap().author, "Ada");
+    assert!(git.blame(Some("HEAD"), "missing.txt").is_err());
 }

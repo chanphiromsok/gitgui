@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gitgui_core::{
-    Backend, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
+    Backend, Blame, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
     MergeClue, Operation, Query, ScanCache, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count,
     visible_rows, people, web_remote,
 };
@@ -281,6 +281,17 @@ pub struct FileState {
     /// The file is new or deleted, so there is only one side to show: it is drawn as one column whatever
     /// the diff mode is, instead of beside an empty half.
     pub single_column: bool,
+    /// Who last changed each line, read the first time the pointer rests on one.
+    pub blame: BlameState,
+}
+
+/// Blame for the open file: not asked for until a line is pointed at, then read in the background.
+pub enum BlameState {
+    NotAsked,
+    Loading,
+    /// The file as of the commit (for added and unchanged lines), and as of its parent (for removed lines).
+    Ready(Option<Arc<Blame>>, Option<Arc<Blame>>),
+    Failed,
 }
 
 impl FileState {
@@ -304,6 +315,7 @@ impl FileState {
             content_w: Default::default(),
             diff_bounds: Default::default(),
             single_column: false,
+            blame: BlameState::NotAsked,
         }
     }
 
@@ -461,6 +473,8 @@ pub struct Workspace {
     pub dialog_input: Entity<TextInput>,
     pub settings: Settings,
     pub settings_open: bool,
+    /// The diff line the pointer is on: its row, and which side of it (0 whole row, 1 left half, 2 right half).
+    pub hover_line: Option<(usize, u8)>,
     /// The hidden panel that is showing over the content because the pointer is at its edge.
     pub peek: Option<Panel>,
     /// The graph is hidden while a commit is open, leaving the file pane the whole width.
@@ -711,6 +725,7 @@ impl Workspace {
             dialog_input,
             settings,
             settings_open: false,
+            hover_line: None,
             peek: None,
             graph_hidden: false,
             files_width: FILES_WIDTH,
@@ -1373,6 +1388,7 @@ impl Workspace {
 
     pub fn close_file(&mut self, cx: &mut Context<Self>) {
         self.cancel_file_load();
+        self.hover_line = None;
         if let Some(repo) = self.repo.as_mut()
             && repo.file.take().is_some()
         {

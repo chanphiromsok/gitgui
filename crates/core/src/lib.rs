@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod blame;
 pub mod backend;
 pub mod clone;
 pub mod diff;
@@ -14,6 +15,7 @@ pub mod tree;
 pub mod worktree;
 
 pub use actions::{CheckoutTarget, Operation, Outcome};
+pub use blame::{Blame, BlameInfo};
 pub use backend::{Backend, Error, GitCli, LogOptions, ScanCache};
 pub use graph::{Half, LaneLayout, Lineage, Row, Stroke};
 pub use hosting::{Host, WebRemote, web_remote};

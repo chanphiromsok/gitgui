@@ -1581,6 +1581,90 @@ async fn the_settings_panel_fits_a_short_window(cx: &mut TestAppContext) {
     assert!(done.top() >= px(0.));
 }
 
+fn commit_text_as(fx: &Fixture, who: (&str, &str), file: &str, text: &str, message: &str) {
+    fx.write(file, text);
+    fx.git(&["add", "."]);
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(fx.repo())
+        .args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", message])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", who.0)
+        .env("GIT_AUTHOR_EMAIL", who.1)
+        .env("GIT_COMMITTER_NAME", who.0)
+        .env("GIT_COMMITTER_EMAIL", who.1)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git commit as {}", who.0);
+}
+
+/// Resting the pointer on a line of the diff says who last changed it, beside that line and nowhere else.
+#[gpui::test]
+async fn pointing_at_a_line_says_who_last_changed_it(cx: &mut TestAppContext) {
+    let fx = bare_fixture("blame-hover");
+    let before = "one\ntwo\nthree\nfour\nfive\nsix\nseven\n";
+    commit_text_as(&fx, ("Ada", "ada@example.com"), "f.txt", before, "add the file");
+    commit_text_as(&fx, ("Grace", "grace@example.com"), "f.txt", &before.replace("four", "FOUR"), "shout four");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx));
+    select(&ws, cx, "shout four");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+
+    // The row showing a line with this text, in the unified diff.
+    let row_of = |ws: &Entity<Workspace>, cx: &VisualTestContext, text: &str, kind: gitgui_core::LineKind| -> usize {
+        ws.read_with(cx, |ws, _| {
+            let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+            file.rows
+                .iter()
+                .position(|row| match *row {
+                    crate::rows::DisplayRow::Line { hunk, line } => {
+                        let line = &file.diff.hunks[hunk].lines[line];
+                        line.text == text && line.kind == kind
+                    }
+                    _ => false,
+                })
+                .unwrap_or_else(|| panic!("no row for {text:?}"))
+        })
+    };
+    let note = |ws: &Entity<Workspace>, cx: &VisualTestContext, row: usize| ws.read_with(cx, |ws, _| ws.blame_note(row));
+    use gitgui_core::LineKind::{Added, Context, Removed};
+
+    // Nothing is pointed at, so nothing is said.
+    let two = row_of(&ws, cx, "two", Context);
+    assert!(note(&ws, cx, two).is_none());
+    assert!(cx.debug_bounds("blame-note").is_none());
+
+    // An unchanged line is Ada's, from the first commit.
+    ws.update(cx, |ws, cx| ws.hover_diff_line(two, 0, true, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let said = note(&ws, cx, two).expect("a note on the pointed line").text.to_string();
+    assert!(said.contains("Ada") && said.contains("add the file"), "{said}");
+    assert!(cx.debug_bounds("blame-note").is_some(), "and it is drawn beside the line");
+    assert!(note(&ws, cx, row_of(&ws, cx, "seven", Context)).is_none(), "only on the line pointed at");
+
+    // The line this commit changed: it is this commit's own.
+    let shout = row_of(&ws, cx, "FOUR", Added);
+    ws.update(cx, |ws, cx| ws.hover_diff_line(shout, 0, true, cx));
+    assert_eq!(note(&ws, cx, shout).unwrap().text.to_string(), "This change");
+
+    // The line it removed was Ada's, as the commit's parent had it.
+    let gone = row_of(&ws, cx, "four", Removed);
+    ws.update(cx, |ws, cx| ws.hover_diff_line(gone, 0, true, cx));
+    let said = note(&ws, cx, gone).unwrap();
+    assert!(said.text.contains("Ada") && said.text.contains("add the file"), "{}", said.text);
+    assert!(said.commit.is_some(), "and a click on it goes to that commit");
+
+    // Leaving the line takes the note away.
+    ws.update(cx, |ws, cx| ws.hover_diff_line(gone, 0, false, cx));
+    assert!(note(&ws, cx, gone).is_none());
+}
+
 /// Clicking a style card in the settings changes how the graph is colored, at once, and is kept for the next launch.
 #[gpui::test]
 async fn choosing_a_graph_style_in_the_settings_recolors_the_graph_and_is_kept(cx: &mut TestAppContext) {

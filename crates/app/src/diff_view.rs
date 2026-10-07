@@ -1,9 +1,10 @@
 //! The file diff: a toolbar, the commit's files on the left, and the diff on the right, unified or
 //! side by side. Comments sit under their lines; a "+" appears on hover to start one.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gitgui_core::{DiffLine, FileStatus, LineKind};
+use gitgui_core::{DiffLine, FileStatus, GitCli, LineKind};
 use gitgui_store::{Comment, Side};
 use gpui::{
     AnyElement, Context, ElementId, FontWeight, ListOffset, MouseButton, SharedString, StyledText, Window, canvas, div, list,
@@ -18,7 +19,7 @@ use crate::preview::{self, Images, Preview};
 use crate::minimap::MarkKind;
 use crate::syntax::{FileColors, Span};
 use crate::ui::{self, MONO, button, ghost, segment, segmented};
-use crate::workspace::{Phase, WHOLE_FILE, Workspace};
+use crate::workspace::{BlameState, Phase, WHOLE_FILE, Workspace};
 use crate::theme::t;
 
 pub const LINE_H: f32 = 20.0;
@@ -318,16 +319,18 @@ impl Workspace {
         let sx = file.scroll_x.get().clamp(0., max_scroll_x(file, mode));
         // Uncommitted lines have no commit to hang a comment on.
         let comments = repo.commit.as_ref().is_some_and(|commit| commit.id != WORKTREE);
+        // Who last changed the line the pointer is on, said beside that line only.
+        let note = self.blame_note(ix);
 
         match row {
             DisplayRow::Hunk(h) => hunk_header(h, &file.diff.hunks[h].header, file.context < WHOLE_FILE && !file.single_column, cx),
             DisplayRow::Line { hunk, line } => {
                 let line = &file.diff.hunks[hunk].lines[line];
-                unified_line(ix, line, file.colors.of(line), comments, sx, cx)
+                unified_line(ix, line, file.colors.of(line), comments, sx, note.as_ref(), cx)
             }
             DisplayRow::Pair { hunk, left, right } => {
                 let lines = &file.diff.hunks[hunk].lines;
-                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, sx, cx)
+                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, sx, note.as_ref(), cx)
             }
             DisplayRow::Comment(i) => match file.comments.get(i) {
                 Some(comment) => comment_card(ix, comment, mode, cx),
@@ -505,6 +508,177 @@ fn notice_row(notice: Notice) -> AnyElement {
     div().w_full().py_2().px_3().text_xs().text_color(rgb(color)).child(text).into_any_element()
 }
 
+/// What to say beside a line: who last changed it, when, and why.
+pub struct BlameNote {
+    /// Which part of the row: 0 the whole of it, 1 its left half, 2 its right half.
+    pub side: u8,
+    pub text: SharedString,
+    /// The commit to go to when the note is clicked; none for a line not committed yet or from this very commit.
+    pub commit: Option<String>,
+}
+
+/// The note, drawn over the end of its line.
+fn blame_chip(ix: usize, side: u8, note: &BlameNote, edge: f32, cx: &mut Context<Workspace>) -> AnyElement {
+    let commit = note.commit.clone();
+    div()
+        .id(("blame", ix * 3 + side as usize))
+        .debug_selector(|| "blame-note".to_owned())
+        .absolute()
+        .top(px(1.))
+        .right(px(edge))
+        .h(px(LINE_H - 2.))
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(t().border))
+        .bg(rgb(t().card))
+        .text_color(rgb(t().muted))
+        .text_xs()
+        .italic()
+        .when(commit.is_some(), |chip| chip.cursor_pointer().hover(|style| style.text_color(rgb(t().text_strong))))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            if let Some(commit) = &commit {
+                this.select_commit_id(commit, cx);
+            }
+        }))
+        .child(note.text.clone())
+        .into_any_element()
+}
+
+/// `text` cut to `most` characters, with an ellipsis when it was longer.
+fn clip(text: &str, most: usize) -> String {
+    if text.chars().count() <= most {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(most.saturating_sub(1)).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
+}
+
+impl Workspace {
+    /// The pointer came onto a line of the diff, or left it. The first time one is pointed at, who wrote the file's
+    /// lines is read.
+    pub fn hover_diff_line(&mut self, row: usize, side: u8, on: bool, cx: &mut Context<Self>) {
+        if on {
+            if self.hover_line == Some((row, side)) {
+                return;
+            }
+            self.hover_line = Some((row, side));
+            self.ensure_blame(cx);
+            cx.notify();
+        } else if self.hover_line == Some((row, side)) {
+            self.hover_line = None;
+            cx.notify();
+        }
+    }
+
+    /// Reads who last changed each line of the open file, once, in the background: the file as of the commit, for the
+    /// lines it has, and as of the commit's parent, for the lines it removed.
+    fn ensure_blame(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        let Some(commit) = repo.commit.as_ref() else { return };
+        let Phase::Ready(view) = &commit.phase else { return };
+        let (id, project) = (commit.id.clone(), repo.project.path.clone());
+        let Some(file) = repo.file.as_mut() else { return };
+        if !matches!(file.blame, BlameState::NotAsked) {
+            return;
+        }
+        let Some(change) = view.files.get(file.index).cloned() else { return };
+        file.blame = BlameState::Loading;
+        let index = file.index;
+        let work = id == WORKTREE;
+        let (read_project, read_id) = (project.clone(), id.clone());
+        self.spawn_load(
+            cx,
+            move || {
+                let git = GitCli::new(&read_project);
+                let (now, before) = if work { (None, "HEAD".to_owned()) } else { (Some(read_id.as_str()), format!("{read_id}^1")) };
+                let new = (change.status != FileStatus::Deleted).then(|| git.blame(now, &change.path).ok()).flatten().map(Arc::new);
+                let old_path = change.old_path.as_deref().unwrap_or(&change.path);
+                let old = (change.status != FileStatus::Added).then(|| git.blame(Some(&before), old_path).ok()).flatten().map(Arc::new);
+                (new, old)
+            },
+            move |this, (new, old), cx| {
+                let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == project) else { return };
+                if repo.commit.as_ref().map(|commit| commit.id.as_str()) != Some(id.as_str()) {
+                    return;
+                }
+                let Some(file) = repo.file.as_mut().filter(|file| file.index == index) else { return };
+                file.blame = if new.is_none() && old.is_none() { BlameState::Failed } else { BlameState::Ready(new, old) };
+                cx.notify();
+            },
+        );
+    }
+
+    /// For the screenshot script: rests the pointer on the first line of the diff whose text contains `text`.
+    pub(crate) fn script_hover(&mut self, text: &str, cx: &mut Context<Self>) {
+        let found = self.repo.as_ref().and_then(|repo| repo.file.as_ref()).and_then(|file| {
+            file.rows.iter().enumerate().find_map(|(ix, row)| {
+                let lines = |hunk: usize| &file.diff.hunks[hunk].lines;
+                match *row {
+                    DisplayRow::Line { hunk, line } => lines(hunk)[line].text.contains(text).then_some((ix, 0u8)),
+                    DisplayRow::Pair { hunk, left, right } => right
+                        .filter(|&r| lines(hunk)[r].text.contains(text))
+                        .map(|_| (ix, 2u8))
+                        .or_else(|| left.filter(|&l| lines(hunk)[l].text.contains(text)).map(|_| (ix, 1u8))),
+                    _ => None,
+                }
+            })
+        });
+        match found {
+            Some((row, side)) => {
+                if let Some(file) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()) {
+                    file.list.scroll_to_reveal_item(row);
+                }
+                self.hover_diff_line(row, side, true, cx)
+            }
+            None => {
+                if let Some((row, side)) = self.hover_line {
+                    self.hover_diff_line(row, side, false, cx);
+                }
+            }
+        }
+    }
+
+    /// What to say beside the line the pointer is on, if it is on line `row`.
+    pub(crate) fn blame_note(&self, row: usize) -> Option<BlameNote> {
+        let (hovered, side) = self.hover_line?;
+        if hovered != row {
+            return None;
+        }
+        let repo = self.repo.as_ref()?;
+        let file = repo.file.as_ref()?;
+        let line = match *file.rows.get(row)? {
+            DisplayRow::Line { hunk, line } => &file.diff.hunks[hunk].lines[line],
+            DisplayRow::Pair { hunk, left, right } => &file.diff.hunks[hunk].lines[if side == 1 { left? } else { right? }],
+            _ => return None,
+        };
+        let note = |text: String, commit: Option<String>| Some(BlameNote { side, text: text.into(), commit });
+        match &file.blame {
+            BlameState::NotAsked | BlameState::Loading => note("Reading who changed this…".to_owned(), None),
+            BlameState::Failed => None,
+            BlameState::Ready(new, old) => {
+                // A removed line is in the parent's version of the file; every other line is in the commit's.
+                let (blame, number) = if line.kind == LineKind::Removed { (old, line.old_no?) } else { (new, line.new_no?) };
+                let info = blame.as_ref()?.line(number)?;
+                if info.uncommitted() {
+                    return note("Not committed yet".to_owned(), None);
+                }
+                if repo.commit.as_ref().is_some_and(|commit| commit.id == info.commit) {
+                    return note("This change".to_owned(), None);
+                }
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+                let text = format!("{} · {} · {}", info.author, ui::ago(now - info.time), clip(&info.summary, 56));
+                note(text, Some(info.commit.clone()))
+            }
+        }
+    }
+}
+
 /// The "+" that appears when the pointer is over a row; clicking it starts a comment on `anchor`.
 fn plus(id: impl Into<ElementId>, anchor: Option<Anchor>, group: &'static str, cx: &mut Context<Workspace>) -> AnyElement {
     let cell = div().id(id).w(px(18.)).h_full().flex_none().flex().items_center().justify_center();
@@ -576,12 +750,22 @@ fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str, spans: &[Spa
     StyledText::new(text).with_highlights(highlights)
 }
 
-fn unified_line(ix: usize, line: &DiffLine, spans: &[Span], comments: bool, sx: f32, cx: &mut Context<Workspace>) -> AnyElement {
+fn unified_line(
+    ix: usize,
+    line: &DiffLine,
+    spans: &[Span],
+    comments: bool,
+    sx: f32,
+    note: Option<&BlameNote>,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let (sign, sign_color) = marker(line.kind);
     let gutter = format!("{} {}", column(line.old_no, 5), column(line.new_no, 5));
     div()
         .id(("line", ix))
         .group("diff-line")
+        .relative()
+        .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_diff_line(ix, 0, *on, cx)))
         .w_full()
         .h(px(LINE_H))
         .flex()
@@ -594,9 +778,11 @@ fn unified_line(ix: usize, line: &DiffLine, spans: &[Span], comments: bool, sx: 
         .child(plus(("plus", ix), anchor_of(line).filter(|_| comments), "diff-line", cx))
         .text_color(rgb(t().editor_fg))
         .child(div().flex_none().ml(px(-sx)).child(diff_text(&gutter, sign, sign_color, &line.text, spans)))
+        .when_some(note, |row, note| row.child(blame_chip(ix, 0, note, MINIMAP_W + 6., cx)))
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn split_row(
     ix: usize,
     left: Option<&DiffLine>,
@@ -604,6 +790,7 @@ fn split_row(
     colors: &FileColors,
     comments: bool,
     sx: f32,
+    note: Option<&BlameNote>,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let half = |left_side: bool, line: Option<&DiffLine>, cx: &mut Context<Workspace>| -> AnyElement {
@@ -614,12 +801,19 @@ fn split_row(
         };
         let (sign, sign_color) = marker(line.kind);
         let shown = if left_side { line.old_no } else { line.new_no };
-        cell.group(group)
+        let side = if left_side { 1u8 } else { 2 };
+        // The strip down the right edge covers the right half's end; the left half has its own edge.
+        let edge = if left_side { 6. } else { MINIMAP_W + 6. };
+        cell.id(("half", ix * 3 + side as usize))
+            .group(group)
+            .relative()
+            .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_diff_line(ix, side, *on, cx)))
             .flex()
             .items_center()
             .when_some(line_bg(line.kind), |cell, bg| cell.bg(rgb(bg)))
             .child(plus((if left_side { "plus-l" } else { "plus-r" }, ix), anchor_of(line).filter(|_| comments), group, cx))
             .child(div().flex_none().ml(px(-sx)).child(diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side))))
+            .when_some(note.filter(|note| note.side == side), |cell, note| cell.child(blame_chip(ix, side, note, edge, cx)))
             .into_any_element()
     };
 
