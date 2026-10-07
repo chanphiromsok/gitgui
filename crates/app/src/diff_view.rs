@@ -151,13 +151,7 @@ impl Workspace {
     fn minimap(&self, file: &crate::workspace::FileState, cx: &mut Context<Self>) -> AnyElement {
         let map = &file.minimap;
         let total = map.total().max(1.);
-        let theme = t();
-        let color = |kind: MarkKind| match kind {
-            MarkKind::Added => theme.added,
-            MarkKind::Removed => theme.removed,
-            MarkKind::Changed => theme.modified,
-            MarkKind::Comment => theme.accent,
-        };
+        let marks = map.marks.clone();
         // What is in view, from the list's real pixel positions.
         let viewport = file.list.viewport_bounds().size.height;
         let content = (file.list.max_offset_for_scrollbar().height + viewport).max(px(1.));
@@ -178,18 +172,53 @@ impl Workspace {
             .border_color(rgb(t().border))
             .cursor_pointer()
             .occlude()
-            .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
-            .children(map.marks.iter().map(|mark| {
-                div()
-                    .absolute()
-                    .left(px(3.))
-                    .right(px(3.))
-                    .top(relative(mark.top / total))
-                    .h(relative(mark.height / total))
-                    .min_h(px(2.))
-                    .rounded_sm()
-                    .bg(rgb(color(mark.kind)))
-            }))
+            // One layer paints every tick: a diff with thousands of changed runs must not be thousands of elements.
+            .child(
+                canvas(
+                    move |b, _, _| bounds.set(b),
+                    move |b, _, window, _| {
+                        let theme = t();
+                        // Ticks smaller than a few pixels are merged first: every quad costs the same however
+                        // small, and a diff with thousands of changes would otherwise paint thousands.
+                        let cell = px(3.);
+                        let cells = ((b.size.height / cell) as usize).clamp(1, 600);
+                        let mut filled: Vec<Option<MarkKind>> = vec![None; cells];
+                        for mark in marks.iter() {
+                            let from = ((mark.top / total) * cells as f32) as usize;
+                            let to = (((mark.top + mark.height) / total) * cells as f32).ceil() as usize;
+                            for slot in &mut filled[from.min(cells - 1)..to.clamp(from.min(cells - 1) + 1, cells)] {
+                                // A comment shows over a change, and a change over its neighbor in the same cell.
+                                if *slot != Some(MarkKind::Comment) {
+                                    *slot = Some(mark.kind);
+                                }
+                            }
+                        }
+                        let step = b.size.height / cells as f32;
+                        let mut at = 0;
+                        while at < cells {
+                            let Some(kind) = filled[at] else {
+                                at += 1;
+                                continue;
+                            };
+                            let run = filled[at..].iter().take_while(|slot| **slot == Some(kind)).count();
+                            let color = match kind {
+                                MarkKind::Added => theme.added,
+                                MarkKind::Removed => theme.removed,
+                                MarkKind::Changed => theme.modified,
+                                MarkKind::Comment => theme.accent,
+                            };
+                            let tick = gpui::Bounds::new(
+                                gpui::point(b.origin.x + px(3.), b.origin.y + step * at as f32),
+                                gpui::size(b.size.width - px(6.), (step * run as f32).max(px(2.))),
+                            );
+                            window.paint_quad(gpui::fill(tick, rgb(color)));
+                            at += run;
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(
                 div()
                     .absolute()

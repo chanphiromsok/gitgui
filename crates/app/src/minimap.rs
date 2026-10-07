@@ -29,7 +29,8 @@ pub struct Mark {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Minimap {
-    pub marks: Vec<Mark>,
+    /// Shared, so drawing a frame copies a pointer, not thousands of ticks.
+    pub marks: std::sync::Arc<Vec<Mark>>,
     /// Where each row starts, in estimated pixels, and (last) the total.
     pub offsets: Vec<f32>,
 }
@@ -109,7 +110,7 @@ pub fn build(diff: &FileDiff, rows: &[DisplayRow], line_h: f32) -> Minimap {
         y += height;
     }
     offsets.push(y);
-    Minimap { marks, offsets }
+    Minimap { marks: std::sync::Arc::new(marks), offsets }
 }
 
 #[cfg(test)]
