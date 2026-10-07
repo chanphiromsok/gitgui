@@ -120,7 +120,7 @@ They do not check how anything looks.
 - Comments are one line each and local only. Syncing with GitHub/GitLab review comments is not built.
 - No word-level highlight inside changed lines; long lines are clipped, not scrolled.
 - Divider positions and folded groups are not remembered between launches.
-- The merge scan looks at each trunk's newest 500 commits and gives up after 25 s (it says how many branches it skipped).
+- The merge scan looks at each trunk's newest 500 commits and gives up after 25 s (it says how many branches it skipped; the next refresh carries on from there). It remembers its answers, so a refresh only re-checks branches and trunks that moved.
 - Menu items from Sourcetree not built: *Create Archive*, *Unselect in Branches Dropdown* (there is no branch dropdown yet).
 - `crates/app/src/text_input.rs` is adapted from gpui's `input` example (Apache-2.0, Zed Industries).
 - 
