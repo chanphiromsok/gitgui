@@ -26,6 +26,12 @@ scripts/bundle-macos.sh --universal # Apple Silicon + Intel in one app
 
 This writes `dist/gitgui.app` and `dist/gitgui-<version>.dmg`. Drag the app to Applications.
 
+**The icon** is `crates/app/assets/app-icon/icon.svg`. After changing it, make `AppIcon.icns` again:
+
+```sh
+cargo run -p gitgui-app --example app_icon -- /tmp/AppIcon.iconset && iconutil -c icns /tmp/AppIcon.iconset -o crates/app/assets/app-icon/AppIcon.icns
+```
+
 **Signing.** The script signs ad hoc, which is enough to run on the Mac that built it. On another Mac, Gatekeeper blocks it: right-click the app and choose Open once, or run `xattr -dr com.apple.quarantine gitgui.app`.
 To distribute properly you need an Apple Developer ID: sign with `codesign --force --deep --options runtime --sign "Developer ID Application: NAME (TEAMID)" dist/gitgui.app`, then notarize with `xcrun notarytool submit dist/gitgui-<version>.dmg --keychain-profile PROFILE --wait` and `xcrun stapler staple dist/gitgui-<version>.dmg`.
 
@@ -70,30 +76,44 @@ and `cargo run -p gitgui-app -- [PATH]` for the window.
 Left to right: **projects** | **graph** | **file pane**. Both dividers drag to resize.
 
 - **Projects:** *Open Folder…* (Cmd-O) adds a repository (a folder inside one adds the repo). Kept between launches; hover a row and click × to remove.
+- **Local changes** list under the open project, staged and not: click one to see its diff, hover for **+** / **−** to stage or unstage (or a whole group). The box below commits what is staged (or everything, when nothing is), Enter to commit.
 - **Graph:** Sourcetree-style table.
   - Each branch is one line with one color from its tip down to the commit it was branched from. Lines are not bent into their parent early, so the fork point is visible.
-  - A fork commit gets a ring and a *branch point · feat/x* chip. Selecting a commit brings its branch line forward and dims the rest.
+  - A fork commit gets a ring; its details name the branches cut from it. Selecting a commit brings its branch line forward and dims the rest.
+  - Each commit's node shows its author's initials (Rom → R, Kim heang → KH) on its branch's color.
   - Icons tell a pull request, a merge and a plain commit apart. A local branch and its remote share one badge; the current branch is ringed and bold.
   - Stashes are one `stash@{n}` commit; an *Uncommitted Changes* row sits on top.
-- **Grouping** (Settings… / Cmd-,, on by default): a pull request's commits are listed one level in under it, with a guide line, and fold away with the arrow.
+- **Grouping** (Settings… / Cmd-,, on by default): a pull request's commits are listed one level in under it, with a guide line, and fold away with the chevron on the merge's dot in the graph. *Compact graph* (Settings) narrows the lanes and thins the lines.
   Squash-merged branches go under their squash commit.
 - **Already merged?** A background scan marks branches that are merged even when git cannot tell (squash and rebase merges): *squash-merged into release/1.0.0 · #37*, and *squash of feat/x* on the commit that carries it.
   Evidence, strongest first: identical changes in one trunk commit; the same pull request number; a trunk commit repeating the branch's commit messages. The last two are shown in italics as guesses.
+- **Pull requests** link to their page: *#42 ↗* beside a merge or squash commit, in its details, and *Open Pull Request / Open Commit in Browser* on right-click (GitHub, GitLab and Bitbucket remotes).
 - **Right-click** a branch badge or a commit: checkout, rename, delete, merge into current, rebase current onto, push, new branch / tag here, cherry-pick, copy name / SHA / message.
   Anything that rewrites history, deletes, or reaches a remote asks first. Nothing is forced: no force-push, no `reset --hard`, and an unmerged branch is deleted only after a second, explicit yes.
   A merge, rebase or cherry-pick that meets conflicts stops and the banner offers **Abort**, which puts everything back.
 - **File pane** (click a commit): overview, and the changed files as a **tree or flat list** with a filter. A file opens as a **unified or split** diff. **Expand** (Cmd-E) gives it the whole area.
+- **Filter bar** above the graph: show the *current branch*, *local* branches or *all*; *hide merged* branches; show or hide *stashes* (a stash shows where the commit it was made on does); search (Cmd-F) by message, author, branch or id, `path:` for commits touching a file, `code:` for commits adding or removing text. Enter goes to the next match.
+- **Syntax highlighting** in diffs (tree-sitter, 20 languages). Each line is colored from the whole file it came from, so hunks that start mid-string still color right.
+- **Themes** (Settings): Zed's theme format. gitgui Dark, One Dark and One Light are built in; themes installed in Zed show up, or drop a Zed theme file in `<data folder>/themes/`.
+- **File icons:** the Material Icon Theme is built in; icon themes installed in Zed can be picked instead. A deleted file is marked *(Deleted)*; folders in the file tree fold.
+- **Authors** show their picture beside their name (GitHub's for GitHub no-reply emails, else Gravatar's), or their initials. Pictures are kept for a week in `<data folder>/avatars`; Settings turns fetching off. One person under several identities (a laptop's git config, GitHub's web merges) gets one picture, initials and color: identities are joined when they are the same GitHub account, or when one committed the other's work and no one else's. A `.mailmap` is honored too.
+- **Images** (PNG, JPEG, GIF, WebP, BMP, TIFF, SVG) show before and after, with their size in pixels and bytes.
+- **Sidebar:** the button at the top left of the graph, Cmd-B, or drag its divider all the way left hides it.
 - **Comments:** hover a diff line and click **+**. Saved locally per repository by commit, file, side and line, so they never go stale.
-- **Shortcuts:** Cmd-O open, Cmd-, settings, Cmd-R refresh, Cmd-E full view, Esc back (closes a menu, dialog or settings first), Cmd-W close window, Cmd-M minimize, Cmd-Q quit.
+- **Shortcuts:** Cmd-O open, Cmd-, settings, Cmd-R refresh, Cmd-F search commits, Cmd-B show or hide the sidebar, Up / Down step through the open commit's (or local changes') files, Cmd-E full view, Esc back (closes a menu, dialog or settings first), Cmd-W close window, Cmd-M minimize, Cmd-Q quit.
 
 `gitgui merges PATH` prints the merge scan for a repository from the terminal (read-only).
 
 ## Tests
 
-`cargo test --workspace`: 155 tests. Core and store run against real temporary git repositories, including real squash merges, conflicts, a local "remote" for push, and a 300-case random test that grouping never puts a commit above its parent.
+`cargo test --workspace`: 217 tests. Core and store run against real temporary git repositories, including real squash merges, conflicts, a local "remote" for push, and a 300-case random test that grouping never puts a commit above its parent.
 The app tests run the real window headlessly (GPUI's test platform) through every flow and draw a frame after each step, so a view that panics on real data fails.
 Frame-time checks keep a 10,000-row diff and a 4,400-row graph under 8 ms per frame in release builds.
 They do not check how anything looks.
+
+## Third-party assets
+
+`crates/app/assets/material-icons/` is the [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme) by Philipp Kief and contributors, MIT licensed (its `LICENSE` is beside it).
 
 ## Known gaps
 

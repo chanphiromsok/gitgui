@@ -12,8 +12,10 @@ use gpui::{
     rgb, rgba,
 };
 
-use crate::ui::{ACCENT, BORDER, MUTED, PANEL, TEXT, button};
+use crate::ui::button;
 use crate::workspace::{Phase, Workspace};
+use crate::icons;
+use crate::theme::{Origin, t};
 
 const MENU_WIDTH: f32 = 300.;
 const ITEM_HEIGHT: f32 = 26.;
@@ -45,6 +47,8 @@ pub enum Action {
     CreateTag(String),
     CherryPick(String),
     Copy { text: String, what: &'static str },
+    /// Open a page (a pull request, a commit) in the browser.
+    OpenUrl(String),
 }
 
 pub struct MenuState {
@@ -101,7 +105,7 @@ impl Notice {
 }
 
 /// Git's own words, trimmed, for the banner.
-fn explain(error: &Error) -> String {
+pub(crate) fn explain(error: &Error) -> String {
     let text = match error {
         Error::Git { stderr, .. } => stderr.trim().to_owned(),
         other => other.to_string(),
@@ -192,7 +196,20 @@ impl Workspace {
             }
             MenuTarget::Commit(id) => {
                 let summary = self.summary_of(id).unwrap_or_default();
-                vec![
+                let web = match self.repo.as_ref().map(|repo| &repo.phase) {
+                    Some(Phase::Ready(view)) => view.web.clone(),
+                    _ => None,
+                };
+                let mut links = Vec::new();
+                if let Some(web) = &web {
+                    if let Some(number) = gitgui_core::subject_pr(&summary) {
+                        let label = format!("Open {} #{number} in Browser", web.pull_request_name());
+                        links.push(item(&label, Action::OpenUrl(web.pull_request(number)), true));
+                    }
+                    links.push(item("Open Commit in Browser", Action::OpenUrl(web.commit(id)), true));
+                    links.push(separator());
+                }
+                links.extend(vec![
                     item("Checkout Commit (detached HEAD)", Action::Checkout(CheckoutTarget::Detached(id.clone())), true),
                     item("Create Branch Here…", Action::CreateBranch(id.clone()), true),
                     item("Create Tag Here…", Action::CreateTag(id.clone()), true),
@@ -200,7 +217,8 @@ impl Workspace {
                     separator(),
                     item("Copy Commit SHA", copy(id, "commit id"), true),
                     item("Copy Commit Message", copy(&summary, "commit message"), !summary.is_empty()),
-                ]
+                ]);
+                links
             }
         }
     }
@@ -210,6 +228,9 @@ impl Workspace {
         if let Action::Copy { text, what } = action {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             return self.say(Notice::info(format!("Copied the {what}.")), cx);
+        }
+        if let Action::OpenUrl(url) = action {
+            return cx.open_url(&url);
         }
         if self.busy.is_some() {
             return self.say(Notice::warn("Another operation is still running."), cx);
@@ -324,7 +345,7 @@ impl Workspace {
                 false,
                 Some(String::new()),
             ),
-            Action::Checkout(_) | Action::Copy { .. } => return,
+            Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) => return,
         };
         if let Some(initial) = &prompt {
             let initial = initial.clone();
@@ -386,7 +407,7 @@ impl Workspace {
                 let shown = short(&at);
                 self.run(format!("Tagging {shown}…"), format!("Tagged {shown} as {typed}."), None, move |git| git.create_tag(&typed, &at).map(Outcome::Done), cx);
             }
-            Action::Checkout(_) | Action::Copy { .. } => {}
+            Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) => {}
         }
     }
 
@@ -488,7 +509,7 @@ impl Workspace {
             .into_iter()
             .enumerate()
             .map(|(i, item)| match item.action {
-                None => div().h(px(SEPARATOR_HEIGHT)).flex().items_center().child(div().w_full().h(px(1.)).bg(rgb(BORDER))).into_any_element(),
+                None => div().h(px(SEPARATOR_HEIGHT)).flex().items_center().child(div().w_full().h(px(1.)).bg(rgb(t().border))).into_any_element(),
                 Some(action) => {
                     let enabled = item.enabled;
                     div()
@@ -498,10 +519,10 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .rounded_sm()
-                        .text_color(rgb(if enabled { TEXT } else { 0x5c5c5c }))
+                        .text_color(rgb(if enabled { t().text } else { t().muted }))
                         .when(enabled, |row| {
                             row.cursor_pointer()
-                                .hover(|style| style.bg(rgb(0x094771)).text_color(rgb(0xffffff)))
+                                .hover(|style| style.bg(rgb(t().selected)).text_color(rgb(t().text_strong)))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.close_menu(cx);
                                     this.choose(action.clone(), window, cx);
@@ -539,9 +560,9 @@ impl Workspace {
                         .w(px(MENU_WIDTH))
                         .p_1()
                         .rounded_md()
-                        .bg(rgb(0x2b2d30))
+                        .bg(rgb(t().card))
                         .border_1()
-                        .border_color(rgb(0x454545))
+                        .border_color(rgb(t().border))
                         .shadow_lg()
                         .occlude()
                         .text_sm()
@@ -554,8 +575,8 @@ impl Workspace {
     fn render_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let dialog = self.dialog.as_ref()?;
         let confirm = button("dialog-confirm", dialog.confirm.clone())
-            .bg(rgb(if dialog.danger { 0xc0392b } else { ACCENT }))
-            .text_color(rgb(if dialog.danger { 0xffffff } else { 0x111111 }))
+            .bg(rgb(if dialog.danger { 0xc0392b } else { t().accent }))
+            .text_color(rgb(if dialog.danger { 0xffffff } else { t().on_accent }))
             .font_weight(FontWeight::BOLD)
             .on_click(cx.listener(|this, _, _, cx| this.confirm_dialog(cx)));
         Some(modal(
@@ -565,8 +586,8 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child(dialog.title.clone()))
-                .child(div().text_color(rgb(TEXT)).child(dialog.body.clone()))
+                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(dialog.title.clone()))
+                .child(div().text_color(rgb(t().text)).child(dialog.body.clone()))
                 .when(dialog.prompt.is_some(), |panel| panel.child(self.dialog_input.clone()))
                 .child(
                     div()
@@ -591,49 +612,196 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child("Settings"))
-                .child(
-                    div()
-                        .id("setting-group")
-                        .flex()
-                        .gap_3()
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_group_by_parent(cx)))
-                        .child(
-                            div()
-                                .flex_none()
-                                .mt(px(2.))
-                                .size(px(16.))
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(rgb(if on { ACCENT } else { MUTED }))
-                                .when(on, |b| b.bg(rgb(ACCENT)))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(rgb(0x111111))
-                                .text_xs()
-                                .font_weight(FontWeight::BOLD)
-                                .child(if on { "✓" } else { "" }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(div().font_weight(FontWeight::SEMIBOLD).child("Group commits under their pull request"))
-                                .child(
-                                    div().text_xs().text_color(rgb(MUTED)).child(
-                                        "List the commits of a pull request or merged branch indented under it, with a guide line, \
-                                         and fold them away with the arrow. Squash-merged branches go under their squash commit. \
-                                         Turn off to list every commit in date order.",
-                                    ),
-                                ),
-                        ),
-                )
+                .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("Settings"))
+                .child(setting_toggle(
+                    "setting-group",
+                    on,
+                    "Group commits under their pull request",
+                    "List the commits of a pull request or merged branch indented under it, with a guide line, \
+                     and fold them away with the chevron on the merge in the graph. Squash-merged branches go under \
+                     their squash commit. Turn off to list every commit in date order.",
+                    cx.listener(|this, _, _, cx| this.toggle_group_by_parent(cx)),
+                ))
+                .child(setting_toggle(
+                    "setting-avatars",
+                    self.settings.fetch_avatars,
+                    "Show authors' pictures",
+                    "Fetch profile pictures from GitHub (for GitHub no-reply emails) and Gravatar, which is sent a \
+                     SHA-256 of each author's email. Pictures are kept for a week. Off shows initials only.",
+                    cx.listener(|this, _, _, cx| this.toggle_fetch_avatars(cx)),
+                ))
+                .child(setting_toggle(
+                    "setting-compact",
+                    self.settings.compact_graph,
+                    "Compact graph",
+                    "Narrow lanes and thin lines, so a busy history leaves more room for the messages.",
+                    cx.listener(|this, _, _, cx| this.toggle_compact_graph(cx)),
+                ))
+                .child(self.render_theme_picker(cx))
+                .child(self.render_icon_picker(cx))
                 .child(div().flex().justify_end().child(button("settings-done", "Done").on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))))),
         ))
     }
+
+    /// The built-in icons, then each icon theme installed in Zed.
+    fn render_icon_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.settings.icon_theme.clone();
+        let names: Vec<Option<String>> =
+            std::iter::once(None).chain(self.icon_themes.iter().map(|t| Some(t.name.clone()))).collect();
+        let rows = names.into_iter().enumerate().map(|(ix, name)| {
+            let chosen = name == current;
+            let label = name.clone().unwrap_or_else(|| icons::BUILT_IN.to_owned());
+            div()
+                .id(("icon-theme", ix))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(chosen, |row| row.bg(rgb(t().selected)))
+                .hover(|style| style.bg(rgb(t().hover)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_icon_theme(name.as_deref(), cx)))
+                .child(div().flex_1().child(label))
+                .when(ix > 0, |row| row.child(div().text_xs().text_color(rgb(t().muted)).child("from Zed")))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("File icons"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(t().muted))
+                    .child("Icon themes installed in Zed (Material, Catppuccin, …) show up here."),
+            )
+            .child(
+                div()
+                    .id("icon-theme-list")
+                    .max_h(px(120.))
+                    .overflow_y_scroll()
+                    .border_1()
+                    .border_color(rgb(t().border))
+                    .rounded_sm()
+                    .p_1()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// Every theme found, each with a small preview of its colors; click one to use it.
+    fn render_theme_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = t().name.clone();
+        let where_from = |origin: &Origin| match origin {
+            Origin::BuiltIn => "built in",
+            Origin::User(_) => "your themes",
+            Origin::Zed(_) => "from Zed",
+        };
+        let rows = self.themes.iter().enumerate().map(|(ix, theme)| {
+            let chosen = theme.name == current;
+            let name = theme.name.clone();
+            let swatch = div()
+                .flex_none()
+                .w(px(44.))
+                .h(px(18.))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(t().border))
+                .bg(rgb(theme.editor_bg))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(3.))
+                .children([theme.accent, theme.syntax_hint(), theme.added, theme.removed].map(|color| {
+                    div().size(px(6.)).rounded_full().bg(rgb(color))
+                }));
+            div()
+                .id(("theme", ix))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .when(chosen, |row| row.bg(rgb(t().selected)))
+                .hover(|style| style.bg(rgb(t().hover)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_theme(&name, cx)))
+                .child(swatch)
+                .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(theme.name.clone()))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(t().muted))
+                        .child(format!("{} · {}", if theme.dark { "dark" } else { "light" }, where_from(&theme.origin))),
+                )
+        });
+        let folder = self.store_dir().map(|dir| dir.join("themes").display().to_string()).unwrap_or_default();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child("Theme"))
+            .child(div().text_xs().text_color(rgb(t().muted)).child(format!(
+                "Zed themes work as they are: themes installed in Zed show up here, or put a Zed theme file in {folder}."
+            )))
+            .child(
+                div()
+                    .id("theme-list")
+                    .max_h(px(240.))
+                    .overflow_y_scroll()
+                    .border_1()
+                    .border_color(rgb(t().border))
+                    .rounded_sm()
+                    .p_1()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+}
+
+/// A checkbox with a title and a line saying what it does.
+fn setting_toggle(
+    id: &'static str,
+    on: bool,
+    title: &'static str,
+    detail: &'static str,
+    toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .gap_3()
+        .cursor_pointer()
+        .on_click(toggle)
+        .child(
+            div()
+                .flex_none()
+                .mt(px(2.))
+                .size(px(16.))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if on { t().accent } else { t().muted }))
+                .when(on, |b| b.bg(rgb(t().accent)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(t().on_accent))
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .child(if on { "✓" } else { "" }),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+                .child(div().text_xs().text_color(rgb(t().muted)).child(detail)),
+        )
 }
 
 /// A dimmed backdrop with `content` centered on a panel.
@@ -652,12 +820,12 @@ fn modal(content: impl IntoElement) -> AnyElement {
         .child(
             div()
                 .rounded_lg()
-                .bg(rgb(PANEL))
+                .bg(rgb(t().panel))
                 .border_1()
-                .border_color(rgb(0x454545))
+                .border_color(rgb(t().border))
                 .shadow_lg()
                 .text_sm()
-                .text_color(rgb(TEXT))
+                .text_color(rgb(t().text))
                 .child(content),
         )
         .into_any_element()

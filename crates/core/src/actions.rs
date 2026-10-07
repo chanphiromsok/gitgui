@@ -64,7 +64,7 @@ fn check_name(name: &str) -> Result<(), Error> {
 
 impl GitCli {
     /// Runs a command that changes things. Terminal prompts and editors are turned off so it cannot hang.
-    fn write(&self, args: &[&str]) -> Result<String, Error> {
+    pub(crate) fn write(&self, args: &[&str]) -> Result<String, Error> {
         let output = self.write_output(args)?;
         if output.status.success() {
             Ok(text_of(&output))

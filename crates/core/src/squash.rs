@@ -235,6 +235,8 @@ mod tests {
             summary: id.into(),
             refs: refs.iter().map(|(n, k)| crate::model::Ref { name: (*n).into(), kind: *k }).collect(),
             stash: None,
+            committer: String::new(),
+            committer_email: String::new(),
         }
     }
 

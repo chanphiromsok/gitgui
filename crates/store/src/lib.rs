@@ -45,11 +45,21 @@ impl std::error::Error for Error {}
 pub struct Settings {
     /// List a pull request's commits under it, one level in, instead of in date order among the rest.
     pub group_by_parent: bool,
+    /// The color theme, by name; `None` for the default one.
+    pub theme: Option<String>,
+    /// The file icon theme, by name; `None` for the built-in icons.
+    pub icon_theme: Option<String>,
+    /// The projects sidebar is hidden.
+    pub sidebar_hidden: bool,
+    /// Draw the graph with narrow lanes and thin lines.
+    pub compact_graph: bool,
+    /// Fetch authors' pictures from GitHub and Gravatar; off draws their initials only.
+    pub fetch_avatars: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { group_by_parent: true }
+        Self { group_by_parent: true, theme: None, icon_theme: None, sidebar_hidden: false, compact_graph: false, fetch_avatars: true }
     }
 }
 
@@ -107,6 +117,11 @@ impl Store {
 
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
+    }
+
+    /// The data folder. Themes the user adds go in `themes/` under it.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     // ---- projects -------------------------------------------------------------------------
@@ -446,7 +461,7 @@ mod tests {
         let store = scratch.store();
         assert!(store.settings().unwrap().group_by_parent, "on until the user turns it off");
 
-        store.save_settings(&Settings { group_by_parent: false }).unwrap();
+        store.save_settings(&Settings { group_by_parent: false, ..Default::default() }).unwrap();
         assert!(!scratch.store().settings().unwrap().group_by_parent, "and it survives a restart");
 
         store.save_settings(&Settings::default()).unwrap();

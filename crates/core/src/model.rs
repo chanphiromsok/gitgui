@@ -23,6 +23,9 @@ pub struct Commit {
     pub parents: Vec<String>,
     pub author: String,
     pub email: String,
+    /// Who made the commit, when that is not the author (a rebase, a cherry-pick, a merge on GitHub).
+    pub committer: String,
+    pub committer_email: String,
     /// Author time, seconds since the Unix epoch.
     pub time: i64,
     /// Author time in the user's time zone, like `6 Oct 2026 15:22`.

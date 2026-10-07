@@ -1,7 +1,7 @@
 //! Names for the branch lines of the graph, and which branches count as trunks.
 
 use crate::graph::Lineage;
-use crate::model::{Commit, LabelKind, labels};
+use crate::model::{Commit, LabelKind, RefKind, labels};
 use crate::squash::subject_pr;
 
 /// What a commit is, for the icon beside it.
@@ -45,6 +45,43 @@ pub fn commit_rank(commit: &Commit) -> i32 {
         .map(|label| branch_rank(&label.name))
         .max()
         .unwrap_or(0)
+}
+
+/// The branches pointing at this commit, local and remote alike, without the remote's name:
+/// `origin/feat/x` is the same branch as `feat/x`.
+pub fn commit_branches(commit: &Commit) -> Vec<String> {
+    let mut names: Vec<String> = commit
+        .refs
+        .iter()
+        .filter_map(|r| match r.kind {
+            RefKind::LocalBranch => Some(r.name.clone()),
+            RefKind::RemoteBranch => r.name.split_once('/').map(|(_, name)| name.to_owned()),
+            _ => None,
+        })
+        .filter(|name| name != "HEAD")
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// How long the conventional-commit prefix of a subject is, through its colon: `fix(moment):` in
+/// `fix(moment): display wrong desc`, `feat!:` in `feat!: drop v1`. `None` when there is none.
+pub fn conventional_prefix(subject: &str) -> Option<usize> {
+    let colon = subject.find(": ")?;
+    let head = &subject[..colon];
+    let head = head.strip_suffix('!').unwrap_or(head);
+    let kind = match head.split_once('(') {
+        Some((kind, scope)) => {
+            let scope = scope.strip_suffix(')')?;
+            if scope.is_empty() || scope.len() > 40 || scope.contains(['(', ')']) {
+                return None;
+            }
+            kind
+        }
+        None => head,
+    };
+    (!kind.is_empty() && kind.len() <= 16 && kind.chars().all(|c| c.is_ascii_alphabetic())).then_some(colon + 1)
 }
 
 /// The branch a merge commit brought in, read from its subject:
@@ -97,7 +134,7 @@ pub fn lineage_names<'a>(lineages: &[Lineage], commit_at: impl Fn(usize) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Ref, RefKind};
+    use crate::model::Ref;
 
     #[test]
     fn trunks_outrank_features_and_remote_prefixes_do_not_matter() {
@@ -121,6 +158,8 @@ mod tests {
             summary: summary.into(),
             refs: refs.iter().map(|(name, kind)| Ref { name: (*name).into(), kind: *kind }).collect(),
             stash: None,
+            committer: String::new(),
+            committer_email: String::new(),
         }
     }
 
@@ -129,6 +168,38 @@ mod tests {
         let c = commit("s", &[("feat/x", RefKind::LocalBranch), ("origin/release/1.0.0", RefKind::RemoteBranch), ("v1", RefKind::Tag)]);
         assert_eq!(commit_rank(&c), branch_rank("release/1.0.0"));
         assert_eq!(commit_rank(&commit("s", &[("v1", RefKind::Tag)])), 0);
+    }
+
+    #[test]
+    fn a_commit_names_its_branches_without_remotes() {
+        let c = commit(
+            "s",
+            &[
+                ("HEAD", RefKind::Head),
+                ("feat/x", RefKind::LocalBranch),
+                ("origin/feat/x", RefKind::RemoteBranch),
+                ("origin/HEAD", RefKind::RemoteBranch),
+                ("upstream/release/1.0.0", RefKind::RemoteBranch),
+                ("v1", RefKind::Tag),
+            ],
+        );
+        assert_eq!(commit_branches(&c), ["feat/x", "release/1.0.0"]);
+    }
+
+    #[test]
+    fn conventional_prefixes_are_found_with_scopes_and_bangs_and_nothing_else() {
+        fn prefix(s: &str) -> Option<&str> {
+            conventional_prefix(s).map(|n| &s[..n])
+        }
+        assert_eq!(prefix("docs: add VIP QR"), Some("docs:"));
+        assert_eq!(prefix("fix(moment): display wrong desc"), Some("fix(moment):"));
+        assert_eq!(prefix("feat(api)!: drop v1"), Some("feat(api)!:"));
+        assert_eq!(prefix("feat!: drop v1"), Some("feat!:"));
+        assert_eq!(prefix("Merge pull request #42 from x"), None);
+        assert_eq!(prefix("Feat/booking detail tracking status (#37)"), None);
+        assert_eq!(prefix("note:no space"), None);
+        assert_eq!(prefix("two words: no"), None);
+        assert_eq!(prefix("fix(): empty scope"), None);
     }
 
     #[test]

@@ -1,0 +1,3 @@
+Material Icon Theme 5.39.0 by Philipp Kief and contributors, MIT licensed (see LICENSE).
+From the npm package material-icon-theme: icons/ and dist/material-icons.json.
+https://github.com/material-extensions/vscode-material-icon-theme

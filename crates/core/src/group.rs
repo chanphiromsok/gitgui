@@ -121,6 +121,8 @@ mod tests {
             summary: id.into(),
             refs: Vec::new(),
             stash: None,
+            committer: String::new(),
+            committer_email: String::new(),
         }
     }
 

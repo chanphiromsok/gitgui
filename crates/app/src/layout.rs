@@ -26,6 +26,9 @@ pub fn pane_width(requested: Option<f32>, total: f32, sidebar: f32) -> f32 {
     requested.unwrap_or((total - sidebar) * PANE_SHARE).clamp(PANE_MIN, most)
 }
 
+/// Dragging the sidebar's divider left of this hides the sidebar, as in VS Code and Zed.
+pub const SIDEBAR_HIDE_AT: f32 = SIDEBAR_MIN / 2.;
+
 /// The sidebar's new width when its divider is dragged to `x`, measured from the window's left edge.
 pub fn sidebar_at(x: f32, total: f32, pane_open: bool) -> f32 {
     sidebar_width(x, total, pane_open)

@@ -6,11 +6,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gitgui_core::{
-    Backend, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, GitCli, Layout, Lineage, LogOptions,
-    MergeClue, Operation, TreeRow, scan_inputs, visible_rows,
+    Backend, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Layout, Lineage, LogOptions, People, WorkFile,
+    MergeClue, Operation, Query, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count, visible_rows,
+    people, web_remote,
 };
 use gitgui_store::{Comment, NewComment, Project, Settings, Store};
 use gpui::{
@@ -23,7 +25,13 @@ use crate::layout;
 use crate::menu::{Dialog, MenuState, Notice, NoticeAction};
 use crate::rows::{Anchor, DisplayRow, Mode, display_rows};
 use crate::text_input::{TextInput, TextInputEvent};
-use crate::ui::{self, ACCENT, BG, BORDER, MUTED, PANEL, TEXT, WARNING, button};
+use crate::ui::{self, button};
+use crate::avatars::{self, Avatar, Avatars};
+use crate::changes::WORKTREE;
+use crate::icons::{self, IconTheme};
+use crate::preview;
+use crate::syntax;
+use crate::theme::{self, Theme, t};
 
 const LOAD_LIMIT: usize = 20_000;
 const DIFF_CONTEXT: u32 = 3;
@@ -46,6 +54,18 @@ pub struct RepoView {
     read: Duration,
     pub lineages: Vec<Lineage>,
     pub names: Vec<Option<String>>,
+    /// The branch the current one was cut from, and how far apart they are.
+    pub base: Option<graph::Base>,
+    /// The repository's web home, for pull request and commit links.
+    pub web: Option<WebRemote>,
+    /// Who is who among the authors.
+    pub people: People,
+    /// How many commits the filters leave in the graph.
+    pub shown: usize,
+    /// How many stashes there are, shown or not.
+    pub stashes: usize,
+    /// Rows the search found, in order.
+    pub matches: Vec<usize>,
     /// Branches found to be merged already, once the scan has run.
     pub clues: Vec<MergeClue>,
     /// Branch name → the commit it pointed at when scanned.
@@ -66,26 +86,104 @@ impl RepoView {
             .collect()
     }
 
-    /// Makes the rows again from the commits.
-    fn rebuild(&mut self, settings: &Settings, collapsed: &HashSet<String>) {
+    /// Makes the rows again from the commits, narrowed by `filter`.
+    fn rebuild(&mut self, settings: &Settings, collapsed: &HashSet<String>, filter: &GraphFilter) {
         let started = Instant::now();
         let squashed = self.squashed();
+        let hidden: HashSet<String> =
+            if filter.hide_merged { self.clues.iter().map(|clue| clue.branch.clone()).collect() } else { HashSet::new() };
+        let narrowed = filter.scope != Scope::All || !hidden.is_empty() || filter.hide_stashes;
+        let shown =
+            if narrowed { filter_commits(&self.commits, filter.scope, &hidden, !filter.hide_stashes) } else { Vec::new() };
+        self.stashes = stash_count(&self.commits);
+        let commits = if narrowed { &shown } else { &self.commits };
         let built = graph::build_entries(
-            &self.commits,
-            &graph::Options { changed: self.changed, group: settings.group_by_parent, squashed: &squashed, collapsed },
+            commits,
+            &graph::Options {
+                changed: self.changed,
+                group: settings.group_by_parent,
+                squashed: &squashed,
+                collapsed,
+                web: self.web.as_ref(),
+                people: Some(&self.people),
+            },
         );
+        // Ahead and behind count against the whole history, not just what is shown.
+        let base = if narrowed {
+            let none = HashSet::new();
+            let options =
+                graph::Options { changed: 0, group: false, squashed: &squashed, collapsed: &none, web: None, people: None };
+            graph::build_entries(&self.commits, &options).base
+        } else {
+            built.base.clone()
+        };
+        self.shown = commits.len();
         self.entries = built.entries;
         graph::apply_clues(&mut self.entries, &self.clues);
-        self.graph_width = graph::graph_width(built.widest);
+        self.graph_width = graph::graph_width(built.widest, graph::Density::of(settings.compact_graph));
         self.lineages = built.lineages;
         self.names = built.names;
+        self.base = base;
+        let count = if narrowed {
+            format!("{} of {} commits", self.shown, self.commits.len())
+        } else {
+            format!("{} commits", self.commits.len())
+        };
         self.timing = SharedString::from(format!(
-            "{} commits · read {:.0} ms · layout {:.1} ms · {} lanes",
-            self.commits.len(),
+            "{count} · read {:.0} ms · layout {:.1} ms · {} lanes",
             self.read.as_secs_f64() * 1000.,
             started.elapsed().as_secs_f64() * 1000.,
             built.widest,
         ));
+        self.apply_search(filter);
+    }
+
+    /// Marks the rows the search does not find, and lists the ones it does.
+    fn apply_search(&mut self, filter: &GraphFilter) {
+        let query = filter.query();
+        let by_id: HashMap<&str, &Commit> = self.commits.iter().map(|c| (c.id.as_str(), c)).collect();
+        let found = filter.found_now();
+        self.matches.clear();
+        for (ix, entry) in self.entries.iter_mut().enumerate() {
+            let commit = entry.commit.as_deref();
+            let hit = match &query {
+                Query::None => None,
+                Query::Text(text) => Some(commit.and_then(|id| by_id.get(id)).is_some_and(|c| matches_text(c, text))),
+                // Until git has answered, nothing is dimmed.
+                Query::Path(_) | Query::Code(_) => found.map(|ids| commit.is_some_and(|id| ids.contains(id))),
+            };
+            entry.search_miss = hit == Some(false);
+            if hit == Some(true) {
+                self.matches.push(ix);
+            }
+        }
+    }
+}
+
+/// What the filter bar above the graph narrows it to.
+#[derive(Clone, Debug, Default)]
+pub struct GraphFilter {
+    pub scope: Scope,
+    /// Leave out branches the merge scan found already merged.
+    pub hide_merged: bool,
+    /// Leave out stashes.
+    pub hide_stashes: bool,
+    /// The search box's text.
+    pub search: String,
+    /// What git found for a `path:` or `code:` search, and the text it was asked for.
+    pub found: Option<(String, HashSet<String>)>,
+    /// A `path:` or `code:` search is running.
+    pub searching: bool,
+}
+
+impl GraphFilter {
+    pub fn query(&self) -> Query {
+        Query::parse(&self.search)
+    }
+
+    /// What git found for the search as it reads now; `None` when it has not been asked.
+    fn found_now(&self) -> Option<&HashSet<String>> {
+        self.found.as_ref().filter(|(text, _)| text == self.search.trim()).map(|(_, ids)| ids)
     }
 }
 
@@ -106,6 +204,10 @@ pub struct FileState {
     pub index: usize,
     pub phase: Phase<()>,
     pub diff: FileDiff,
+    /// Syntax colors for the diff's lines; empty until read, or for a language not known.
+    pub colors: syntax::FileColors,
+    /// The picture before and after, for an image file.
+    pub images: Option<preview::Images>,
     pub comments: Vec<Comment>,
     pub composing: Option<Anchor>,
     pub rows: Vec<DisplayRow>,
@@ -118,6 +220,8 @@ impl FileState {
             index,
             phase: Phase::Loading,
             diff: FileDiff::default(),
+            colors: syntax::FileColors::default(),
+            images: None,
             comments: Vec::new(),
             composing: None,
             rows: Vec::new(),
@@ -158,15 +262,23 @@ pub struct RepoState {
     pub file_rows: Vec<TreeRow>,
     /// Commits whose group of commits is folded away.
     pub collapsed: HashSet<String>,
+    /// Folders folded in the changed-files tree, by path. Kept from commit to commit.
+    pub folded_dirs: HashSet<String>,
+    /// What has changed in the working tree, staged first.
+    pub work: Vec<WorkFile>,
     /// Which load this is, so a slow answer for an earlier one is ignored.
     pub generation: u64,
+    pub graph_filter: GraphFilter,
 }
 
 impl RepoState {
     fn loading(project: Project, generation: u64) -> Self {
         Self {
             collapsed: HashSet::new(),
+            folded_dirs: HashSet::new(),
+            work: Vec::new(),
             generation,
+            graph_filter: GraphFilter::default(),
             project,
             phase: Phase::Loading,
             selected: None,
@@ -182,10 +294,10 @@ impl RepoState {
     }
 
     /// Makes the graph rows again and keeps the same commit selected if it is still shown.
-    fn rebuild(&mut self, settings: &Settings) {
+    pub(crate) fn rebuild(&mut self, settings: &Settings) {
         let selected = self.selected_id();
         if let Phase::Ready(view) = &mut self.phase {
-            view.rebuild(settings, &self.collapsed);
+            view.rebuild(settings, &self.collapsed, &self.graph_filter);
             self.selected = selected.and_then(|id| view.entries.iter().position(|e| e.commit.as_deref() == Some(id.as_str())));
         }
     }
@@ -199,9 +311,9 @@ impl RepoState {
     }
 
     /// Rebuilds the file list rows from the selected commit's files, the filter and the layout.
-    fn refresh_file_rows(&mut self) {
+    pub(crate) fn refresh_file_rows(&mut self) {
         let rows = match self.commit.as_ref().map(|commit| &commit.phase) {
-            Some(Phase::Ready(view)) => visible_rows(&view.files, &self.filter, self.layout),
+            Some(Phase::Ready(view)) => visible_rows(&view.files, &self.filter, self.layout, &self.folded_dirs),
             _ => Vec::new(),
         };
         self.file_rows = rows;
@@ -215,17 +327,32 @@ pub enum Splitter {
     Pane,
 }
 
+gpui::actions!(workspace, [PreviousFile, NextFile]);
+
 pub struct Workspace {
+    /// The window's own keyboard focus: a click outside a text field comes back here, so keys like
+    /// Up and Down reach the window instead of the field typed in last.
+    focus: gpui::FocusHandle,
     store: Option<Store>,
     pub projects: Vec<Project>,
     pub notice: Option<Notice>,
     pub repo: Option<RepoState>,
     pub input: Entity<TextInput>,
     pub filter_input: Entity<TextInput>,
+    /// The search box above the graph.
+    pub search_input: Entity<TextInput>,
+    /// The commit message, under the open project's changes.
+    pub commit_input: Entity<TextInput>,
     /// The text field in the rename / new branch / new tag dialog.
     pub dialog_input: Entity<TextInput>,
     pub settings: Settings,
     pub settings_open: bool,
+    /// Every color theme found, built in first.
+    pub themes: Vec<Arc<Theme>>,
+    /// Icon themes from Zed's extensions; the built-in icons are not in the list.
+    pub icon_themes: Vec<Arc<IconTheme>>,
+    /// Authors' pictures, fetched as rows that show them are drawn.
+    avatars: std::cell::RefCell<Avatars>,
     pub menu: Option<MenuState>,
     pub dialog: Option<Dialog>,
     /// What is being done right now, while a git operation runs.
@@ -246,6 +373,9 @@ struct RepoData {
     read: Duration,
     /// A merge, rebase or cherry-pick that an earlier session left half done.
     in_progress: Option<Operation>,
+    /// The repository's web home, from its remote, for pull request and commit links.
+    web: Option<WebRemote>,
+    work: Vec<WorkFile>,
 }
 
 fn read_repo(path: &Path) -> Result<RepoData, gitgui_core::Error> {
@@ -255,7 +385,9 @@ fn read_repo(path: &Path) -> Result<RepoData, gitgui_core::Error> {
     let current_branch = git.current_branch()?;
     let changed = git.changed_files()?;
     let in_progress = git.in_progress();
-    Ok(RepoData { commits, current_branch, changed, read: started.elapsed(), in_progress })
+    let web = git.remote_url().ok().flatten().and_then(|url| web_remote(&url));
+    let work = git.work_status().unwrap_or_default();
+    Ok(RepoData { commits, current_branch, changed, read: started.elapsed(), in_progress, web, work })
 }
 
 fn read_commit(path: &Path, id: &str) -> Result<CommitView, gitgui_core::Error> {
@@ -293,6 +425,25 @@ impl Workspace {
         })
         .detach();
 
+        let search_input = cx.new(|cx| TextInput::new("Search commits…   path:file   code:text", cx));
+        cx.subscribe(&search_input, |this, input, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Changed => {
+                let text = input.read(cx).text().to_owned();
+                this.set_search(text, cx);
+            }
+            TextInputEvent::Submit => this.submit_search(cx),
+            TextInputEvent::Cancel => input.update(cx, |input, cx| input.clear(cx)),
+        })
+        .detach();
+
+        let commit_input = cx.new(|cx| TextInput::new("Commit message (Enter to commit)", cx));
+        cx.subscribe(&commit_input, |this, _input, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Submit => this.commit_work(cx),
+            TextInputEvent::Changed => cx.notify(),
+            TextInputEvent::Cancel => {}
+        })
+        .detach();
+
         let dialog_input = cx.new(|cx| TextInput::new("Type a name…", cx));
         cx.subscribe(&dialog_input, |this, _input, event: &TextInputEvent, cx| match event {
             TextInputEvent::Submit => this.confirm_dialog(cx),
@@ -321,13 +472,27 @@ impl Workspace {
             }
             None => Settings::default(),
         };
+        let themes = theme::all(store.as_ref().map(Store::dir));
+        let chosen = settings.theme.as_deref().unwrap_or(theme::DEFAULT);
+        if let Some(found) = themes.iter().find(|t| t.name == chosen).or(themes.first()) {
+            theme::set(found.clone());
+        }
+        let icon_themes = icons::all();
+        icons::set(settings.icon_theme.as_ref().and_then(|name| icon_themes.iter().find(|t| &t.name == name).cloned()));
+        let avatars = std::cell::RefCell::new(Avatars::new(store.as_ref().map(|s| s.dir().join("avatars"))));
         Self {
+            focus: cx.focus_handle(),
+            themes,
+            icon_themes,
+            avatars,
             store,
             projects,
             notice: notice.map(Notice::warn),
             repo: None,
             input,
             filter_input,
+            search_input,
+            commit_input,
             dialog_input,
             settings,
             settings_open: false,
@@ -350,7 +515,11 @@ impl Workspace {
     }
 
     pub fn end_resize(&mut self, cx: &mut Context<Self>) {
-        if self.resizing.take().is_some() {
+        if let Some(which) = self.resizing.take() {
+            if which == Splitter::Sidebar {
+                // Dragged shut or open: keep that, as the button does.
+                self.save_settings();
+            }
             cx.notify();
         }
     }
@@ -366,9 +535,16 @@ impl Workspace {
         let x = f32::from(event.position.x);
         let pane_open = self.repo.as_ref().is_some_and(|repo| repo.commit.is_some());
         match which {
-            Splitter::Sidebar => self.sidebar_width = layout::sidebar_at(x, total, pane_open),
+            Splitter::Sidebar => {
+                // Far enough left hides it; dragging back out shows it again, from its smallest width.
+                let hide = x < layout::SIDEBAR_HIDE_AT && self.repo.is_some();
+                self.settings.sidebar_hidden = hide;
+                if !hide {
+                    self.sidebar_width = layout::sidebar_at(x, total, pane_open);
+                }
+            }
             Splitter::Pane => {
-                let sidebar = layout::sidebar_width(self.sidebar_width, total, pane_open);
+                let sidebar = self.shown_sidebar_width(total, pane_open);
                 self.pane_width = Some(layout::pane_at(x, total, sidebar));
             }
         }
@@ -460,8 +636,23 @@ impl Workspace {
         let Some(project) = self.projects.iter().find(|p| p.path == path).cloned() else { return };
         self.loads += 1;
         let generation = self.loads;
-        self.repo = Some(RepoState::loading(project, generation));
+        // Reading the same repository again keeps its filters; another one starts with none.
+        let kept = self.repo.as_ref().filter(|repo| repo.project.path == path).map(|repo| GraphFilter {
+            found: None,
+            searching: false,
+            ..repo.graph_filter.clone()
+        });
+        if kept.is_none() {
+            self.search_input.update(cx, |input, cx| input.clear(cx));
+        }
+        let mut state = RepoState::loading(project, generation);
+        state.graph_filter = kept.unwrap_or_default();
+        let rerun = matches!(state.graph_filter.query(), Query::Path(_) | Query::Code(_));
+        self.repo = Some(state);
         cx.notify();
+        if rerun {
+            self.run_search(cx);
+        }
 
         let read_path = path.clone();
         self.spawn_load(
@@ -473,6 +664,8 @@ impl Workspace {
                 match result {
                     Ok(data) => {
                         let in_progress = data.in_progress;
+                        repo.work = data.work;
+                        let everyone = people(&data.commits);
                         let mut view = RepoView {
                             commits: data.commits,
                             changed: data.changed,
@@ -483,12 +676,18 @@ impl Workspace {
                             read: data.read,
                             lineages: Vec::new(),
                             names: Vec::new(),
+                            base: None,
+                            web: data.web,
+                            people: everyone,
+                            shown: 0,
+                            stashes: 0,
+                            matches: Vec::new(),
                             clues: Vec::new(),
                             tips: HashMap::new(),
                             scanning: true,
                             unchecked: 0,
                         };
-                        view.rebuild(&settings, &repo.collapsed);
+                        view.rebuild(&settings, &repo.collapsed, &repo.graph_filter);
                         let (branches, targets) = scan_inputs(&view.commits);
                         view.tips = branches.iter().chain(&targets).map(|t| (t.name.clone(), t.id.clone())).collect();
                         view.scanning = !branches.is_empty() && !targets.is_empty();
@@ -562,8 +761,8 @@ impl Workspace {
     pub fn select_entry(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.as_mut() else { return };
         let Phase::Ready(view) = &repo.phase else { return };
-        // The working-tree row has no commit to show yet.
-        let Some(id) = view.entries.get(ix).and_then(|entry| entry.commit.clone()) else { return };
+        // The working-tree row opens what has changed.
+        let Some(id) = view.entries.get(ix).and_then(|entry| entry.commit.clone()) else { return self.open_work(cx) };
 
         repo.selected = Some(ix);
         repo.file = None;
@@ -642,17 +841,63 @@ impl Workspace {
         let read_path = path.clone();
         let read_id = id.clone();
         let read_change = change.clone();
+        // An uncommitted change is read from the working tree and the index, not from a commit.
+        let work = (id == WORKTREE).then(|| repo.work.get(index).cloned()).flatten();
         self.spawn_load(
             cx,
-            move || GitCli::new(&read_path).file_diff(&read_id, &read_change, DIFF_CONTEXT),
+            move || -> Result<(FileDiff, syntax::FileColors, Option<preview::Images>), gitgui_core::Error> {
+                let git = GitCli::new(&read_path);
+                let path = read_change.path.as_str();
+                let image = preview::is_image(path);
+                let language = syntax::language_of(path).is_some();
+                // The diff, and the whole file before and after (only read when there is a use for it:
+                // coloring, so each line is colored knowing what comes before it, or a picture).
+                let (diff, old, new) = match &work {
+                    Some(work) => {
+                        let diff = git.work_diff(work, DIFF_CONTEXT)?;
+                        let (old, new) = if image || language { git.work_sides(work) } else { (None, None) };
+                        (diff, old, new)
+                    }
+                    None => {
+                        let diff = git.file_diff(&read_id, &read_change, DIFF_CONTEXT)?;
+                        let (old, new) = if image || language {
+                            let old_path = read_change.old_path.as_deref().unwrap_or(path);
+                            let old = (read_change.status != FileStatus::Added)
+                                .then(|| git.file_bytes_at(&format!("{read_id}^1"), old_path).ok().flatten())
+                                .flatten();
+                            let new = (read_change.status != FileStatus::Deleted)
+                                .then(|| git.file_bytes_at(&read_id, path).ok().flatten())
+                                .flatten();
+                            (old, new)
+                        } else {
+                            (None, None)
+                        };
+                        (diff, old, new)
+                    }
+                };
+                // A picture is shown before and after, as well as (for an SVG) diffed as text.
+                let images = image.then(|| preview::Images {
+                    old: old.clone().and_then(|bytes| preview::preview(path, bytes)),
+                    new: new.clone().and_then(|bytes| preview::preview(path, bytes)),
+                });
+                let colors = if language && !diff.binary {
+                    let text = |bytes: &Option<Vec<u8>>| bytes.as_ref().and_then(|b| String::from_utf8(b.clone()).ok());
+                    syntax::for_diff(path, text(&old).as_deref(), text(&new).as_deref(), &diff)
+                } else {
+                    syntax::FileColors::default()
+                };
+                Ok((diff, colors, images))
+            },
             move |this, result, cx| {
                 let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == path) else { return };
                 let mode = repo.mode;
                 let still_open = repo.commit.as_ref().is_some_and(|commit| commit.id == id);
                 let Some(file) = repo.file.as_mut().filter(|file| still_open && file.index == index) else { return };
                 match result {
-                    Ok(diff) => {
+                    Ok((diff, colors, images)) => {
                         file.diff = diff;
+                        file.colors = colors;
+                        file.images = images;
                         file.phase = Phase::Ready(());
                         file.rebuild(mode, false);
                     }
@@ -735,6 +980,16 @@ impl Workspace {
         }
     }
 
+    /// Folds or unfolds a folder in the changed-files tree.
+    pub fn toggle_dir(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        if !repo.folded_dirs.remove(path) {
+            repo.folded_dirs.insert(path.to_owned());
+        }
+        repo.refresh_file_rows();
+        cx.notify();
+    }
+
     /// Folds or unfolds the commits listed under a pull request or merge.
     pub fn toggle_group(&mut self, commit: &str, cx: &mut Context<Self>) {
         let settings = self.settings.clone();
@@ -748,7 +1003,85 @@ impl Workspace {
 
     pub fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_open = true;
+        // Themes installed in Zed since the app started show up here.
+        self.themes = theme::all(self.store.as_ref().map(Store::dir));
+        self.icon_themes = icons::all();
         cx.notify();
+    }
+
+    /// Switches file icons to the Zed icon theme named `name`, or the built-in ones for `None`.
+    pub fn set_icon_theme(&mut self, name: Option<&str>, cx: &mut Context<Self>) {
+        let found = name.and_then(|name| self.icon_themes.iter().find(|t| t.name == name).cloned());
+        self.settings.icon_theme = found.as_ref().map(|t| t.name.clone());
+        icons::set(found);
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Switches to the color theme named `name` and keeps the choice.
+    pub fn set_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(found) = self.themes.iter().find(|t| t.name == name).cloned() else { return };
+        theme::set(found);
+        // Icons drawn in the old theme's colors are drawn again.
+        icons::set(self.settings.icon_theme.as_ref().and_then(|n| self.icon_themes.iter().find(|t| &t.name == n).cloned()));
+        self.settings.theme = (name != theme::DEFAULT).then(|| name.to_owned());
+        self.save_settings();
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    /// The picture for an author, asking for it in the background the first time.
+    pub fn avatar_for(&self, email: &str, cx: &mut Context<Self>) -> Avatar {
+        if !self.settings.fetch_avatars || email.is_empty() {
+            return Avatar::None;
+        }
+        let (avatar, ask) = self.avatars.borrow_mut().get(email);
+        if ask {
+            let (email, dir) = (email.to_owned(), self.avatars.borrow().dir.clone());
+            let task = cx.background_executor().spawn({
+                let email = email.clone();
+                // Tests never reach the network.
+                async move { avatars::load(&email, dir.as_deref(), if cfg!(test) { |_: &str| None } else { avatars::fetch }) }
+            });
+            cx.spawn(async move |this, cx| {
+                let avatar = task.await;
+                this.update(cx, |this, cx| {
+                    this.avatars.borrow_mut().set(&email, avatar);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        avatar
+    }
+
+    /// Turns fetching authors' pictures on or off, and keeps the choice.
+    pub fn toggle_fetch_avatars(&mut self, cx: &mut Context<Self>) {
+        self.settings.fetch_avatars = !self.settings.fetch_avatars;
+        self.avatars.borrow_mut().clear();
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// A text field has the keyboard, so keys like the arrows are its own.
+    pub fn typing(&self, window: &Window, cx: &App) -> bool {
+        [&self.input, &self.filter_input, &self.search_input, &self.commit_input, &self.dialog_input]
+            .into_iter()
+            .any(|input| gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window))
+    }
+
+    /// The app's data folder, when there is one.
+    pub fn store_dir(&self) -> Option<&Path> {
+        self.store.as_ref().map(Store::dir)
+    }
+
+    fn save_settings(&mut self) {
+        if let Some(store) = &self.store
+            && let Err(err) = store.save_settings(&self.settings)
+        {
+            self.notice = Some(Notice::warn(format!("The choice could not be saved: {err}")));
+        }
     }
 
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -766,6 +1099,112 @@ impl Workspace {
         {
             self.notice = Some(Notice::warn(format!("The choice could not be saved: {err}")));
         }
+        let settings = self.settings.clone();
+        if let Some(repo) = self.repo.as_mut() {
+            repo.rebuild(&settings);
+        }
+        cx.notify();
+    }
+
+    // ---- graph filters ----------------------------------------------------------------------
+
+    /// Changes the graph's filters with `change`, then lays the graph out again.
+    fn change_filter(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut GraphFilter)) {
+        let settings = self.settings.clone();
+        let Some(repo) = self.repo.as_mut() else { return };
+        change(&mut repo.graph_filter);
+        repo.rebuild(&settings);
+        cx.notify();
+    }
+
+    pub fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        self.change_filter(cx, |filter| filter.scope = scope);
+    }
+
+    pub fn toggle_hide_merged(&mut self, cx: &mut Context<Self>) {
+        self.change_filter(cx, |filter| filter.hide_merged = !filter.hide_merged);
+    }
+
+    pub fn toggle_stashes(&mut self, cx: &mut Context<Self>) {
+        self.change_filter(cx, |filter| filter.hide_stashes = !filter.hide_stashes);
+    }
+
+    /// The search box changed: a plain search dims what it misses right away; `path:` and `code:`
+    /// wait for Enter, since they ask git.
+    pub fn set_search(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        if repo.graph_filter.search == text {
+            return;
+        }
+        repo.graph_filter.search = text;
+        let filter = repo.graph_filter.clone();
+        if let Phase::Ready(view) = &mut repo.phase {
+            view.apply_search(&filter);
+        }
+        cx.notify();
+    }
+
+    /// Enter in the search box: run a `path:` or `code:` search that has not run yet, else go to
+    /// the next commit found.
+    pub fn submit_search(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_ref() else { return };
+        let filter = &repo.graph_filter;
+        if matches!(filter.query(), Query::Path(_) | Query::Code(_)) && filter.found_now().is_none() {
+            if !filter.searching {
+                self.run_search(cx);
+            }
+            return;
+        }
+        self.next_match(cx);
+    }
+
+    /// Selects the next commit the search found after the selected one, wrapping round.
+    pub fn next_match(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_ref() else { return };
+        let Phase::Ready(view) = &repo.phase else { return };
+        let after = repo.selected;
+        let Some(&ix) = view.matches.iter().find(|&&ix| after.is_none_or(|at| ix > at)).or(view.matches.first()) else {
+            return;
+        };
+        self.graph_scroll.scroll_to_item(ix, gpui::ScrollStrategy::Center);
+        self.select_entry(ix, cx);
+    }
+
+    /// Asks git for the commits a `path:` or `code:` search finds, then dims the rest.
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        let query = repo.graph_filter.query();
+        let text = repo.graph_filter.search.trim().to_owned();
+        let path = repo.project.path.clone();
+        let generation = repo.generation;
+        repo.graph_filter.searching = true;
+        cx.notify();
+        self.spawn_load(
+            cx,
+            move || GitCli::new(&path).search(&query),
+            move |this, result, cx| {
+                let Some(repo) = this.repo.as_mut().filter(|repo| repo.generation == generation) else { return };
+                repo.graph_filter.searching = false;
+                match result {
+                    Ok(ids) => {
+                        repo.graph_filter.found = Some((text, ids));
+                        let filter = repo.graph_filter.clone();
+                        if let Phase::Ready(view) = &mut repo.phase {
+                            view.apply_search(&filter);
+                        }
+                        this.next_match(cx);
+                    }
+                    Err(err) => this.fail(format!("The search failed: {err}"), cx),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Switches between the roomy graph and the compact one, keeps the choice, and redraws.
+    pub fn toggle_compact_graph(&mut self, cx: &mut Context<Self>) {
+        self.settings.compact_graph = !self.settings.compact_graph;
+        self.save_settings();
         let settings = self.settings.clone();
         if let Some(repo) = self.repo.as_mut() {
             repo.rebuild(&settings);
@@ -891,19 +1330,36 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let total = f32::from(window.viewport_size().width);
         let pane_open = self.repo.as_ref().is_some_and(|repo| repo.commit.is_some());
-        let sidebar_width = layout::sidebar_width(self.sidebar_width, total, pane_open);
+        let sidebar_width = self.shown_sidebar_width(total, pane_open);
+        // A hidden sidebar leaves its divider at the window's edge, to drag it back out.
+        let sidebar = (sidebar_width > 0.).then(|| self.render_sidebar(sidebar_width, cx));
+        let divider = self.splitter("sidebar-divider", Splitter::Sidebar, cx);
 
         div()
             .relative()
             .size_full()
             .flex()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .track_focus(&self.focus)
+            .key_context("Workspace")
+            // Before anything under the pointer: a text field that is clicked focuses itself after this.
+            .capture_any_mouse_down(cx.listener(|this, _, window, _| window.focus(&this.focus)))
+            .on_action(cx.listener(|this, _: &PreviousFile, window, cx| {
+                if !this.typing(window, cx) {
+                    this.step_file(-1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NextFile, window, cx| {
+                if !this.typing(window, cx) {
+                    this.step_file(1, cx);
+                }
+            }))
+            .bg(rgb(t().bg))
+            .text_color(rgb(t().text))
             .text_sm()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| this.drag_divider(event, window, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_resize(cx)))
-            .child(self.render_sidebar(sidebar_width, cx))
-            .child(self.splitter("sidebar-divider", Splitter::Sidebar, cx))
+            .children(sidebar)
+            .child(divider)
             .child(
                 div()
                     .flex_1()
@@ -919,6 +1375,43 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// The sidebar can be hidden only while a repository is open, so there is always a way to pick one.
+    pub fn sidebar_shown(&self) -> bool {
+        !self.settings.sidebar_hidden || self.repo.is_none()
+    }
+
+    /// How wide the sidebar is drawn: nothing while it is hidden.
+    fn shown_sidebar_width(&self, total: f32, pane_open: bool) -> f32 {
+        if self.sidebar_shown() { layout::sidebar_width(self.sidebar_width, total, pane_open) } else { 0. }
+    }
+
+    /// Shows or hides the projects sidebar, and keeps the choice.
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.repo.is_none() {
+            return;
+        }
+        self.settings.sidebar_hidden = self.sidebar_shown();
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// The button that shows or hides the sidebar: a window with its left panel filled in while shown.
+    fn sidebar_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let shown = self.sidebar_shown();
+        div()
+            .id("toggle-sidebar")
+            .flex_none()
+            .size(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(t().hover)))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+            .child(ui::file_icon(icons::sidebar(shown)))
+    }
+
     /// A thin draggable line between two panes.
     pub fn splitter(&self, id: &'static str, which: Splitter, cx: &mut Context<Self>) -> AnyElement {
         let active = self.resizing == Some(which);
@@ -930,20 +1423,18 @@ impl Workspace {
             .flex()
             .justify_center()
             .cursor(CursorStyle::ResizeLeftRight)
-            .hover(|style| style.bg(rgb(0x24323f)))
-            .when(active, |divider| divider.bg(rgb(0x24323f)))
+            .hover(|style| style.bg(rgb(t().selected)))
+            .when(active, |divider| divider.bg(rgb(t().selected)))
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.begin_resize(which, cx)))
-            .child(div().w(px(if active { 2. } else { 1. })).h_full().bg(rgb(if active { ACCENT } else { BORDER })))
+            .child(div().w(px(if active { 2. } else { 1. })).h_full().bg(rgb(if active { t().accent } else { t().border })))
             .into_any_element()
     }
 
     fn render_sidebar(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
         let selected_path = self.repo.as_ref().map(|repo| repo.project.path.clone());
-        let rows: Vec<_> = self
-            .projects
-            .iter()
-            .enumerate()
-            .map(|(i, project)| {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (i, project) in self.projects.iter().enumerate() {
+            let row = {
                 let selected = selected_path.as_deref() == Some(project.path.as_path());
                 let (open_path, remove_path) = (project.path.clone(), project.path.clone());
                 div()
@@ -956,8 +1447,8 @@ impl Workspace {
                     .justify_between()
                     .gap_2()
                     .cursor_pointer()
-                    .when(selected, |row| row.bg(rgb(ui::SELECTED)))
-                    .hover(|style| style.bg(rgb(if selected { ui::SELECTED } else { ui::HOVER })))
+                    .when(selected, |row| row.bg(rgb(t().selected)))
+                    .hover(|style| style.bg(rgb(if selected { t().selected } else { t().hover })))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_project(open_path.clone(), cx)))
                     .child(
                         div()
@@ -977,7 +1468,7 @@ impl Workspace {
                                     .whitespace_nowrap()
                                     .text_ellipsis()
                                     .text_xs()
-                                    .text_color(rgb(MUTED))
+                                    .text_color(rgb(t().muted))
                                     .child(SharedString::from(project.path.display().to_string())),
                             ),
                     )
@@ -986,18 +1477,24 @@ impl Workspace {
                             .id(("remove", i))
                             .flex_none()
                             .px_1()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(t().muted))
                             .opacity(0.)
                             .group_hover("project-row", |style| style.opacity(1.))
-                            .hover(|style| style.text_color(rgb(0xffffff)))
+                            .hover(|style| style.text_color(rgb(t().text_strong)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.remove_project(&remove_path, cx);
                             }))
                             .child("×"),
                     )
-            })
-            .collect();
+            };
+            let selected = selected_path.as_deref() == Some(project.path.as_path());
+            rows.push(row.into_any_element());
+            // The open project's changes sit under its name.
+            if selected && let Some(changes) = self.render_changes(cx) {
+                rows.push(changes);
+            }
+        }
 
         div()
             .w(px(width))
@@ -1005,7 +1502,7 @@ impl Workspace {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgb(PANEL))
+            .bg(rgb(t().panel))
             .child(
                 div()
                     .h(px(34.))
@@ -1015,8 +1512,8 @@ impl Workspace {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(BORDER))
-                    .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(MUTED)).child("PROJECTS"))
+                    .border_color(rgb(t().border))
+                    .child(div().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().muted)).child("PROJECTS"))
                     .child(button("open-folder", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx)))),
             )
             .child(div().id("projects").flex_1().overflow_y_scroll().children(rows).when(self.projects.is_empty(), |list| {
@@ -1024,10 +1521,11 @@ impl Workspace {
                     div()
                         .p_3()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(t().muted))
                         .child("No projects yet. Open a folder that is a git repository, or one inside it."),
                 )
             }))
+            .children(self.render_commit_box(cx))
             .into_any_element()
     }
 
@@ -1039,16 +1537,17 @@ impl Workspace {
                     .flex_none()
                     .px_3()
                     .py_1()
-                    .bg(rgb(0x14283a))
+                    .bg(rgb(t().head_row))
                     .border_t_1()
-                    .border_color(rgb(0x1f4a6e))
-                    .text_color(rgb(ACCENT))
+                    .border_color(rgb(t().selected))
+                    .text_color(rgb(t().accent))
                     .child(busy.clone())
                     .into_any_element(),
             );
         }
         let notice = self.notice.clone()?;
-        let (bg, border, color) = if notice.warn { (0x3a2f12, 0x5a4a1a, WARNING) } else { (0x12301f, 0x1f5a3a, 0x7ee2a8) };
+        let tone = if notice.warn { t().warning } else { t().added };
+        let (bg, border, color) = (crate::theme::mix(t().bg, tone, 0.14), crate::theme::mix(t().bg, tone, 0.35), tone);
         let action = notice.action.clone().map(|(label, action)| {
             button("notice-action", label).on_click(cx.listener(move |this, _, _, cx| {
                 this.dismiss_notice(cx);
@@ -1085,19 +1584,19 @@ impl Workspace {
                     .flex_col()
                     .items_center()
                     .gap_3()
-                    .child(div().text_color(rgb(MUTED)).child("Pick a project, or open a folder to see its history."))
+                    .child(div().text_color(rgb(t().muted)).child("Pick a project, or open a folder to see its history."))
                     .child(button("open-folder-empty", "Open Folder…").on_click(cx.listener(|this, _, _, cx| this.open_folder(cx)))),
             );
         };
         match &repo.phase {
-            Phase::Loading => centered(div().text_color(rgb(MUTED)).child(format!("Loading {}…", repo.project.name))),
+            Phase::Loading => centered(div().text_color(rgb(t().muted)).child(format!("Loading {}…", repo.project.name))),
             Phase::Failed(message) => centered(
                 div()
                     .flex()
                     .flex_col()
                     .items_center()
                     .gap_2()
-                    .child(div().text_color(rgb(ui::REMOVED)).child(message.clone()))
+                    .child(div().text_color(rgb(t().removed)).child(message.clone()))
                     .child(button("retry", "Try again").on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))),
             ),
             Phase::Ready(_) => {
@@ -1122,10 +1621,11 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(ui::ring(rgb(ACCENT)))
-                .child(div().text_color(rgb(MUTED)).child("Current branch"))
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(0xffffff)).child(name.clone())),
-            None => div().text_color(rgb(WARNING)).child("HEAD is detached"),
+                .child(ui::ring(rgb(t().accent)))
+                .child(div().text_color(rgb(t().muted)).child("Current branch"))
+                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(name.clone()))
+                .children(view.base.clone().map(|base| self.render_base(base, cx))),
+            None => div().text_color(rgb(t().warning)).child("HEAD is detached"),
         };
         let header = div()
             .h(px(34.))
@@ -1135,7 +1635,8 @@ impl Workspace {
             .items_center()
             .gap_4()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(t().border))
+            .child(self.sidebar_button(cx))
             .child(current)
             .child(
                 div()
@@ -1144,7 +1645,7 @@ impl Workspace {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(t().muted))
                     .child(if view.scanning {
                         SharedString::from(format!("{} · checking which branches are already merged…", view.timing))
                     } else if view.unchecked > 0 {
@@ -1162,8 +1663,105 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(header)
+            .child(self.render_filter_bar(repo, view, cx))
             .child(self.render_graph(compact, cx))
             .into_any_element()
+    }
+
+    /// Which branches the graph shows, whether merged ones are left out, and the search box.
+    fn render_filter_bar(&self, repo: &RepoState, view: &RepoView, cx: &mut Context<Self>) -> AnyElement {
+        let filter = &repo.graph_filter;
+        let scope = filter.scope;
+        let segment = |id: &'static str, label: &'static str, this: Scope| {
+            button(id, label)
+                .rounded_none()
+                .when(scope == this, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+                .on_click(cx.listener(move |workspace, _, _, cx| workspace.set_scope(this, cx)))
+        };
+        let scopes = div()
+            .flex()
+            .flex_none()
+            .rounded_sm()
+            .overflow_hidden()
+            .child(segment("scope-current", "Current branch", Scope::Current))
+            .child(segment("scope-local", "Local", Scope::Local))
+            .child(segment("scope-all", "All", Scope::All));
+
+        let merged = view.clues.len();
+        let hide = filter.hide_merged;
+        let hide_merged = bar_checkbox(
+            "hide-merged",
+            hide,
+            if view.scanning { "Hide merged (checking…)".to_owned() } else { format!("Hide merged ({merged})") },
+            cx.listener(|this, _, _, cx| this.toggle_hide_merged(cx)),
+        );
+        let stashes = bar_checkbox(
+            "show-stashes",
+            !filter.hide_stashes,
+            format!("Stashes ({})", view.stashes),
+            cx.listener(|this, _, _, cx| this.toggle_stashes(cx)),
+        );
+
+        let query = filter.query();
+        let asks_git = matches!(query, Query::Path(_) | Query::Code(_));
+        let status: Option<String> = match query {
+            Query::None => None,
+            _ if filter.searching => Some("searching…".into()),
+            _ if asks_git && filter.found_now().is_none() => Some("Enter to search".into()),
+            _ if view.matches.is_empty() => Some("no matches".into()),
+            _ => Some(match repo.selected.and_then(|at| view.matches.iter().position(|&ix| ix == at)) {
+                Some(at) => format!("{} of {}", at + 1, view.matches.len()),
+                None => format!("{} found · Enter for next", view.matches.len()),
+            }),
+        };
+        let search = div()
+            .flex_1()
+            .min_w(px(160.))
+            .max_w(px(420.))
+            .overflow_hidden()
+            .child(self.search_input.clone());
+
+        div()
+            .w_full()
+            .h(px(36.))
+            .flex_none()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(t().border))
+            .child(scopes)
+            .child(hide_merged)
+            .child(stashes)
+            .child(search)
+            .children(status.map(|text| div().flex_none().text_xs().text_color(rgb(t().muted)).child(text)))
+            .into_any_element()
+    }
+
+    /// "2 ahead · 1 behind release/1.0.0": click it to go to the commit the branch was cut from.
+    fn render_base(&self, base: graph::Base, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let count = |n: usize, word: &str, color: u32| {
+            div().text_color(rgb(if n > 0 { color } else { t().muted })).child(format!("{n} {word}"))
+        };
+        let fork = base.fork.clone();
+        div()
+            .id("branch-base")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .rounded_md()
+            .text_xs()
+            .text_color(rgb(t().muted))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(t().hover)))
+            .on_click(cx.listener(move |this, _, _, cx| this.select_commit_id(&fork, cx)))
+            .child(count(base.ahead, "ahead", t().added))
+            .child("·")
+            .child(count(base.behind, "behind", t().modified))
+            .child(div().text_color(rgb(t().text)).child(base.name))
     }
 
     fn render_graph(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -1183,15 +1781,36 @@ impl Workspace {
                     "commits",
                     count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        // Authors' pictures first: asking for one needs the workspace, not just the rows.
+                        let emails: Vec<String> = match this.repo.as_ref().map(|repo| &repo.phase) {
+                            Some(Phase::Ready(view)) => {
+                                range.clone().filter_map(|ix| Some(view.entries.get(ix)?.person.avatar_email.clone())).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let mut avatars: Vec<Avatar> = emails.iter().map(|email| this.avatar_for(email, cx)).collect();
+                        avatars.reverse();
                         let Some(repo) = this.repo.as_ref() else { return Vec::new() };
                         let Phase::Ready(view) = &repo.phase else { return Vec::new() };
                         let selected = repo.selected;
+                        let density = graph::Density::of(this.settings.compact_graph);
                         // The selected commit's branch line comes forward; the others step back.
                         let highlight = selected.and_then(|ix| view.entries.get(ix)).map(|entry| entry.row.lineage);
                         range
                             .filter_map(|ix| {
                                 let entry = view.entries.get(ix)?;
-                                Some(graph::render_entry(ix, entry, view.graph_width, selected == Some(ix), highlight, compact, cx))
+                                let avatar = avatars.pop().unwrap_or(Avatar::None);
+                                Some(graph::render_entry(
+                                    ix,
+                                    entry,
+                                    avatar,
+                                    view.graph_width,
+                                    selected == Some(ix),
+                                    highlight,
+                                    compact,
+                                    density,
+                                    cx,
+                                ))
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -1201,6 +1820,41 @@ impl Workspace {
             )
             .into_any_element()
     }
+}
+
+/// A small checkbox and its label, for the filter bar.
+fn bar_checkbox(
+    id: &'static str,
+    on: bool,
+    label: String,
+    toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .cursor_pointer()
+        .text_color(rgb(if on { t().text } else { t().muted }))
+        .hover(|style| style.text_color(rgb(t().text_strong)))
+        .on_click(toggle)
+        .child(
+            div()
+                .size(px(13.))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if on { t().accent } else { t().muted }))
+                .when(on, |b| b.bg(rgb(t().accent)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(t().on_accent))
+                .text_size(px(10.))
+                .when(on, |b| b.child("✓")),
+        )
+        .child(label)
 }
 
 fn centered(content: impl IntoElement) -> AnyElement {

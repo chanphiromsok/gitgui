@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use gitgui_core::{Backend, Commit, Evidence, GitCli, Half, LabelKind, LaneLayout, LogOptions, Row, labels, scan_inputs};
+use gitgui_core::{
+    Backend, Commit, Evidence, GitCli, Half, LabelKind, LaneLayout, LogOptions, Row, commit_branches, commit_rank, labels,
+    scan_inputs,
+};
 
 const USAGE: &str = "usage: gitgui log [PATH] [-n COUNT]\n       gitgui merges [PATH]   which branches are already merged, squash merges included";
 
@@ -84,7 +87,7 @@ fn log(args: &[String]) -> Result<(), String> {
 
     let mut layout = LaneLayout::new();
     for commit in &commits {
-        let row = layout.push(&commit.id, &commit.parents);
+        let row = layout.push_branch(&commit.id, &commit.parents, commit_rank(commit), &commit_branches(commit));
         println!("{}", render(commit, &row));
     }
     Ok(())

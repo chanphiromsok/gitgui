@@ -1,13 +1,14 @@
 //! Lays a commit's changed files out as a folder tree or a flat list, optionally filtered.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::model::FileChange;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreeRow {
     /// A folder. A chain of folders that each hold only the next one is one row: `api / query`.
-    Dir { depth: usize, name: String },
+    /// `path` is the whole folder path (`src/api/query`), which names it for folding.
+    Dir { depth: usize, name: String, path: String },
     /// A file; `index` points into the slice given to [`file_tree`] or [`visible_rows`]. `dir` is the
     /// folder it is in, filled in only for a flat list, where the row has to say where the file is.
     File { depth: usize, name: String, dir: String, index: usize },
@@ -40,20 +41,22 @@ pub fn file_tree(changes: &[FileChange]) -> Vec<TreeRow> {
         node.files.push((name, index));
     }
     let mut rows = Vec::new();
-    flatten(&root, 0, &mut rows);
+    flatten(&root, "", 0, &mut rows);
     rows
 }
 
-fn flatten(node: &Node, depth: usize, rows: &mut Vec<TreeRow>) {
+fn flatten(node: &Node, parent: &str, depth: usize, rows: &mut Vec<TreeRow>) {
     for (name, child) in &node.dirs {
         let (mut label, mut node) = (name.clone(), child);
+        let mut path = if parent.is_empty() { name.clone() } else { format!("{parent}/{name}") };
         while node.files.is_empty() && node.dirs.len() == 1 {
             let (next_name, next) = node.dirs.iter().next().expect("one child");
             label = format!("{label} / {next_name}");
+            path = format!("{path}/{next_name}");
             node = next;
         }
-        rows.push(TreeRow::Dir { depth, name: label });
-        flatten(node, depth + 1, rows);
+        rows.push(TreeRow::Dir { depth, name: label, path: path.clone() });
+        flatten(node, &path, depth + 1, rows);
     }
     let mut files: Vec<&(String, usize)> = node.files.iter().collect();
     files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0)));
@@ -81,7 +84,8 @@ pub fn flat_list(changes: &[FileChange]) -> Vec<TreeRow> {
 
 /// The rows to show for `changes` in `layout`, keeping only files whose path contains `filter`
 /// (ignoring case; a blank filter keeps everything). `index` always points into `changes`.
-pub fn visible_rows(changes: &[FileChange], filter: &str, layout: Layout) -> Vec<TreeRow> {
+/// What is inside a folder in `folded` is left out, unless a filter is on: then every match shows.
+pub fn visible_rows(changes: &[FileChange], filter: &str, layout: Layout, folded: &HashSet<String>) -> Vec<TreeRow> {
     let needle = filter.trim().to_lowercase();
     let kept: Vec<usize> = (0..changes.len())
         .filter(|&i| needle.is_empty() || changes[i].path.to_lowercase().contains(&needle))
@@ -91,12 +95,26 @@ pub fn visible_rows(changes: &[FileChange], filter: &str, layout: Layout) -> Vec
         Layout::Tree => file_tree(&subset),
         Layout::Flat => flat_list(&subset),
     };
-    rows.into_iter()
-        .map(|row| match row {
+    let mut shown = Vec::with_capacity(rows.len());
+    // The depth of the folded folder being skipped, while inside one.
+    let mut skipping: Option<usize> = None;
+    for row in rows {
+        let depth = match &row {
+            TreeRow::Dir { depth, .. } | TreeRow::File { depth, .. } => *depth,
+        };
+        if skipping.is_some_and(|folded_at| depth > folded_at) {
+            continue;
+        }
+        skipping = match &row {
+            TreeRow::Dir { depth, path, .. } if needle.is_empty() && folded.contains(path) => Some(*depth),
+            _ => None,
+        };
+        shown.push(match row {
             TreeRow::File { depth, name, dir, index } => TreeRow::File { depth, name, dir, index: kept[index] },
             dir => dir,
-        })
-        .collect()
+        });
+    }
+    shown
 }
 
 #[cfg(test)]
@@ -111,13 +129,34 @@ mod tests {
     fn show(rows: &[TreeRow]) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
-                TreeRow::Dir { depth, name } => format!("{}{name}/", "  ".repeat(*depth)),
+                TreeRow::Dir { depth, name, .. } => format!("{}{name}/", "  ".repeat(*depth)),
                 TreeRow::File { depth, name, dir, index } if dir.is_empty() => {
                     format!("{}{name} #{index}", "  ".repeat(*depth))
                 }
                 TreeRow::File { name, dir, index, .. } => format!("{name} ({dir}) #{index}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_folded_folder_hides_what_is_inside_it_unless_a_filter_is_on() {
+        let changes = [change("src/api/query/a.ts"), change("src/b.ts"), change("src/components/c.tsx"), change("d.md")];
+        let folded: HashSet<String> = ["src/api/query".to_owned()].into();
+        assert_eq!(
+            show(&visible_rows(&changes, "", Layout::Tree, &folded)),
+            ["src/", "  api / query/", "  components/", "    c.tsx #2", "  b.ts #1", "d.md #3"]
+        );
+        let folded: HashSet<String> = ["src".to_owned()].into();
+        assert_eq!(show(&visible_rows(&changes, "", Layout::Tree, &folded)), ["src/", "d.md #3"]);
+        assert_eq!(show(&visible_rows(&changes, "a.ts", Layout::Tree, &folded)), ["src / api / query/", "  a.ts #0"]);
+        let paths: Vec<String> = file_tree(&changes)
+            .into_iter()
+            .filter_map(|row| match row {
+                TreeRow::Dir { path, .. } => Some(path),
+                TreeRow::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(paths, ["src", "src/api/query", "src/components"]);
     }
 
     #[test]
@@ -202,16 +241,16 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(kept(visible_rows(&changes, "BUTTON", Layout::Flat)), [2, 0]);
-        assert_eq!(kept(visible_rows(&changes, "api/", Layout::Tree)), [1]);
-        assert_eq!(kept(visible_rows(&changes, "  ", Layout::Tree)).len(), 3, "blank filter keeps everything");
-        assert!(visible_rows(&changes, "nothing like this", Layout::Tree).is_empty());
+        assert_eq!(kept(visible_rows(&changes, "BUTTON", Layout::Flat, &HashSet::new())), [2, 0]);
+        assert_eq!(kept(visible_rows(&changes, "api/", Layout::Tree, &HashSet::new())), [1]);
+        assert_eq!(kept(visible_rows(&changes, "  ", Layout::Tree, &HashSet::new())).len(), 3, "blank filter keeps everything");
+        assert!(visible_rows(&changes, "nothing like this", Layout::Tree, &HashSet::new()).is_empty());
     }
 
     #[test]
     fn filtered_rows_still_index_the_full_list_and_drop_empty_folders() {
         let changes = [change("a/x.rs"), change("b/y.rs"), change("b/z.rs")];
-        let rows = visible_rows(&changes, "z.rs", Layout::Tree);
+        let rows = visible_rows(&changes, "z.rs", Layout::Tree, &HashSet::new());
         assert_eq!(show(&rows), ["b/", "  z.rs #2"], "index 2 is z.rs in the original list; folder a is gone");
     }
 }

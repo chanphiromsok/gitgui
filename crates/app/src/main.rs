@@ -2,16 +2,22 @@
 //!
 //! usage: gitgui-app [PATH]
 
+mod avatars;
+mod changes;
 mod detail;
 mod diff_view;
 mod graph;
+mod icons;
 mod layout;
 mod menu;
 mod pane;
+mod preview;
 mod rows;
+mod syntax;
 #[cfg(test)]
 mod tests;
 mod text_input;
+mod theme;
 mod ui;
 mod workspace;
 
@@ -28,6 +34,8 @@ actions!(
         OpenFolder,
         OpenSettings,
         Refresh,
+        FindCommits,
+        ToggleSidebar,
         Back,
         ToggleFullView,
         CloseWindow,
@@ -48,6 +56,10 @@ fn main() {
             KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-r", Refresh, None),
+            KeyBinding::new("cmd-f", FindCommits, None),
+            KeyBinding::new("cmd-b", ToggleSidebar, None),
+            KeyBinding::new("up", workspace::PreviousFile, None),
+            KeyBinding::new("down", workspace::NextFile, None),
             KeyBinding::new("escape", Back, None),
             KeyBinding::new("cmd-e", ToggleFullView, None),
             KeyBinding::new("cmd-w", CloseWindow, None),
@@ -80,6 +92,15 @@ fn main() {
         cx.on_action(move |_: &OpenSettings, cx| target.update(cx, |this, cx| this.open_settings(cx)));
         let target = workspace.clone();
         cx.on_action(move |_: &Refresh, cx| target.update(cx, |this, cx| this.refresh(cx)));
+        let target = workspace.clone();
+        cx.on_action(move |_: &ToggleSidebar, cx| target.update(cx, |this, cx| this.toggle_sidebar(cx)));
+        let target = workspace.clone();
+        cx.on_action(move |_: &FindCommits, cx| {
+            let input = target.read(cx).search_input.clone();
+            if let Some(window) = cx.active_window() {
+                window.update(cx, |_, window, cx| input.read(cx).focus(window)).ok();
+            }
+        });
         let target = workspace.clone();
         cx.on_action(move |_: &Back, cx| target.update(cx, |this, cx| this.back(cx)));
         let target = workspace.clone();
@@ -137,6 +158,8 @@ fn main() {
             Menu {
                 name: "View".into(),
                 items: vec![
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::action("Find Commits…", FindCommits),
                     MenuItem::action("Toggle Full View of the File Pane", ToggleFullView),
                     MenuItem::action("Enter Full Screen", ToggleFullScreen),
                 ],

@@ -72,6 +72,8 @@ pub struct LaneLayout {
     /// For each lane, the commit it is waiting to reach and the line it belongs to.
     waiting: Vec<Option<Wait>>,
     lineages: Vec<Lineage>,
+    /// For each lineage, the branches it is the line of (empty when it is not known yet).
+    branches: Vec<Vec<String>>,
     rows: usize,
 }
 
@@ -97,32 +99,58 @@ impl LaneLayout {
 
     /// Lays out the next commit. `rank` is how trunk-like the branch at this commit is, and only
     /// matters when the commit starts a new line.
+    pub fn push_ranked<S: AsRef<str>>(&mut self, id: &str, parents: &[S], rank: i32) -> Row {
+        self.push_branch(id, parents, rank, &[] as &[&str])
+    }
+
+    /// Lays out the next commit, which the `branches` point at (names without a remote prefix).
     ///
     /// A commit takes the lane of the line waiting for it; if several wait, the highest ranked one
-    /// carries on (ties go to the older line) and the others end here. With none waiting it starts
+    /// carries on (ties go to the older line) and the others end here. A line does not carry on into
+    /// the tip of a branch that outranks it, unless it is that branch's line: a feature line that
+    /// reaches the tip of the trunk it was cut from ends there, bending into a fresh lane where the
+    /// trunk's line starts, so the fork point shows. With none carrying on the commit starts
     /// a line in the first free lane. Its first parent carries on in its lane. Any other parent
     /// starts a new line in a free lane, which runs down to that parent.
-    pub fn push_ranked<S: AsRef<str>>(&mut self, id: &str, parents: &[S], rank: i32) -> Row {
+    pub fn push_branch<S: AsRef<str>, B: AsRef<str>>(&mut self, id: &str, parents: &[S], rank: i32, branches: &[B]) -> Row {
         let row = self.rows;
         self.rows += 1;
         let before = self.waiting.len();
+        let branches: Vec<String> = branches.iter().map(|b| b.as_ref().to_owned()).collect();
 
         let waiting_here: Vec<usize> = (0..self.waiting.len())
             .filter(|&at| self.waiting[at].as_ref().is_some_and(|wait| wait.id == id))
             .collect();
+        // A line only stops at the tip of a more trunk-like branch than its own. A trunk runs on through
+        // the tips of branches that were fast-forwarded or rebased into it: those commits are its own.
+        let carries_on = |line: usize| {
+            let own = &self.branches[line];
+            branches.is_empty()
+                || own.is_empty()
+                || self.lineages[line].rank >= rank
+                || own.iter().any(|name| branches.contains(name))
+        };
         let (lane, lineage) = match waiting_here
             .iter()
             .copied()
+            .filter(|&at| carries_on(self.waiting[at].as_ref().map_or(0, |wait| wait.lineage)))
             .max_by_key(|&at| {
                 let line = self.waiting[at].as_ref().map_or(0, |wait| wait.lineage);
                 (self.lineages[line].rank, std::cmp::Reverse(line), std::cmp::Reverse(at))
             }) {
             Some(at) => (at, self.waiting[at].as_ref().map_or(0, |wait| wait.lineage)),
             None => {
+                // Lanes of the lines ending here are still taken, so this is a lane of its own.
                 let lane = self.take_free_lane();
                 (lane, self.start_line(row, None, rank))
             }
         };
+        if self.branches[lineage].is_empty() && !branches.is_empty() {
+            // A line opened by a merge learns its branch, and how trunk-like it is, at its first commit with one.
+            self.branches[lineage] = branches;
+            let line = &mut self.lineages[lineage];
+            line.rank = line.rank.max(rank);
+        }
 
         let mut strokes = Vec::new();
         let mut joins = Vec::new();
@@ -185,6 +213,7 @@ impl LaneLayout {
             base: None,
             rank,
         });
+        self.branches.push(Vec::new());
         self.lineages.len() - 1
     }
 
@@ -280,6 +309,67 @@ mod tests {
         // And t2 sits on the trunk's lane, with the feature's line curving into it.
         assert_eq!(rows[3].lane, 1);
         assert!(rows[3].strokes.contains(&stroke(0, 1, Half::Top, 0)));
+    }
+
+    #[test]
+    fn a_feature_line_ends_at_the_tip_of_the_branch_it_was_cut_from() {
+        // feat: f2 -> f1 -> r1 (the tip of release) -> r0. Only the feature line reaches r1.
+        let mut layout = LaneLayout::new();
+        let rows: Vec<Row> = [
+            ("f2", &["f1"][..], 10, &["feat/x"][..]),
+            ("f1", &["r1"][..], 0, &[][..]),
+            ("r1", &["r0"][..], 60, &["release/1.0.0", "feat/old"][..]),
+            ("r0", &[][..], 0, &[][..]),
+        ]
+        .into_iter()
+        .map(|(id, parents, rank, branches)| layout.push_branch(id, parents, rank, branches))
+        .collect();
+
+        assert_eq!((rows[1].lane, rows[1].lineage), (0, 0));
+        // Release starts its own line in a lane of its own, and the feature bends into it and ends.
+        assert_eq!((rows[2].lane, rows[2].lineage, rows[2].joins.clone()), (1, 1, vec![0]));
+        assert!(rows[2].strokes.contains(&stroke(0, 1, Half::Top, 0)));
+        assert_eq!(layout.lineages()[0].fork_row, Some(2));
+        assert_eq!((rows[3].lane, rows[3].lineage), (1, 1));
+        assert_eq!(layout.open_lanes(), 0);
+    }
+
+    #[test]
+    fn a_line_carries_on_through_its_own_branch_and_learns_a_branch_from_its_first_commit() {
+        // A local branch ahead of its remote side; a merged-in line reaching a branch tip.
+        let mut layout = LaneLayout::new();
+        let rows: Vec<Row> = [
+            ("m", &["a", "b"][..], 60, &["release"][..]),
+            ("a", &["c"][..], 10, &["release"][..]),
+            ("b", &["x"][..], 10, &["feat/y"][..]),
+            ("x", &["c"][..], 10, &["feat/z"][..]),
+            ("c", &[][..], 0, &[][..]),
+        ]
+        .into_iter()
+        .map(|(id, parents, rank, branches)| layout.push_branch(id, parents, rank, branches))
+        .collect();
+
+        assert_eq!(rows[1].lineage, 0, "release carries on into its own remote side");
+        assert_eq!(rows[2].lineage, 1, "the merged-in line is the line of the branch it reaches");
+        assert_eq!(rows[3].lineage, 1, "a branch stacked on one of the same rank stays on its line");
+        assert!(rows[3].joins.is_empty());
+    }
+
+    #[test]
+    fn a_trunk_runs_on_through_the_tips_of_branches_fast_forwarded_into_it() {
+        // main: m2 -> fix/b's tip -> fix/a's tip -> m0, all one line of history.
+        let mut layout = LaneLayout::new();
+        let rows: Vec<Row> = [
+            ("m2", &["b"][..], 100, &["main"][..]),
+            ("b", &["a"][..], 10, &["fix/b"][..]),
+            ("a", &["m0"][..], 10, &["fix/a", "fix/c"][..]),
+            ("m0", &[][..], 0, &[][..]),
+        ]
+        .into_iter()
+        .map(|(id, parents, rank, branches)| layout.push_branch(id, parents, rank, branches))
+        .collect();
+        assert!(rows.iter().all(|row| row.lane == 0 && row.lineage == 0 && row.joins.is_empty()));
+        assert_eq!(layout.lineages().len(), 1);
     }
 
     #[test]

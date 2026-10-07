@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use std::process::{Command as Process, Stdio};
 
 use crate::diff::{self, FileDiff};
+use crate::filter::Query;
 use crate::model::{Commit, CommitDetail, FileChange, FileStatus, Ref, RefKind};
 use crate::squash::{BranchTip, Evidence, MergeClue, MergeScan, repeats_subjects, shared_pr, subject_pr};
 
@@ -96,7 +97,7 @@ impl GitCli {
         Ok(PathBuf::from(path))
     }
 
-    fn run(&self, args: &[&str]) -> Result<Vec<u8>, Error> {
+    pub(crate) fn run(&self, args: &[&str]) -> Result<Vec<u8>, Error> {
         let output = self.command(args).output().map_err(Error::Spawn)?;
         if output.status.success() {
             Ok(output.stdout)
@@ -108,11 +109,55 @@ impl GitCli {
         }
     }
 
-    fn command(&self, args: &[&str]) -> Process {
+    pub(crate) fn command(&self, args: &[&str]) -> Process {
         let mut process = Process::new("git");
         // A viewer must not take `index.lock`; it would make the user's own `git add` fail.
         process.arg("--no-optional-locks").arg("-C").arg(&self.root).args(args);
         process
+    }
+
+    /// Where `origin` points, else the first remote; `None` with no remotes.
+    pub fn remote_url(&self) -> Result<Option<String>, Error> {
+        let names = String::from_utf8_lossy(&self.run(&["remote"])?).lines().map(str::to_owned).collect::<Vec<_>>();
+        let Some(name) = names.iter().find(|n| *n == "origin").or(names.first()) else { return Ok(None) };
+        let url = String::from_utf8_lossy(&self.run(&["remote", "get-url", name])?).trim().to_owned();
+        Ok((!url.is_empty()).then_some(url))
+    }
+
+    /// The text of `path` as it was at `rev` (`abc123`, `abc123^1`); `None` when the file is not
+    /// there or is not UTF-8 text.
+    pub fn file_at(&self, rev: &str, path: &str) -> Result<Option<String>, Error> {
+        Ok(self.file_bytes_at(rev, path)?.and_then(|bytes| String::from_utf8(bytes).ok()))
+    }
+
+    /// The bytes of `path` as it was at `rev`; `None` when the file is not there.
+    pub fn file_bytes_at(&self, rev: &str, path: &str) -> Result<Option<Vec<u8>>, Error> {
+        let spec = format!("{rev}:{path}");
+        match self.run(&["cat-file", "blob", &spec]) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(Error::Git { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Ids of the commits a `path:` or `code:` query finds, across every branch, remote and tag the
+    /// graph shows. Other queries find nothing here; they are matched against the loaded commits.
+    pub fn search(&self, query: &Query) -> Result<HashSet<String>, Error> {
+        let pickaxe;
+        let mut args: Vec<&str> = vec!["log", "--format=%H", "--branches", "--remotes", "--tags"];
+        if self.has_head() {
+            args.push("HEAD");
+        }
+        match query {
+            Query::Path(path) => args.extend(["--", path.as_str()]),
+            Query::Code(code) => {
+                pickaxe = format!("-S{code}");
+                args.insert(1, &pickaxe);
+            }
+            Query::None | Query::Text(_) => return Ok(HashSet::new()),
+        }
+        let out = self.run(&args)?;
+        Ok(String::from_utf8_lossy(&out).lines().map(str::to_owned).collect())
     }
 
     /// `stash@{n}` commit ids, newest first.
@@ -249,7 +294,7 @@ impl GitCli {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
-    fn has_head(&self) -> bool {
+    pub(crate) fn has_head(&self) -> bool {
         self.command(&["rev-parse", "--verify", "--quiet", "HEAD"])
             .output()
             .is_ok_and(|output| output.status.success())
@@ -271,7 +316,8 @@ struct TargetScan {
 const RECORD: char = '\x1e';
 const FIELD: char = '\x1f';
 const RECORD_END: char = '\x1e';
-const LOG_FORMAT: &str = "--format=%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%ad%x1f%D%x1f%s";
+// Names and emails through `.mailmap` (%aN, %cN…), so a repository can say which identities are one person.
+const LOG_FORMAT: &str = "--format=%x1e%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%ad%x1f%D%x1f%cN%x1f%cE%x1f%s";
 const DATE_FORMAT: &str = "--date=format-local:%e %b %Y %H:%M";
 const LONG_DATE_FORMAT: &str = "--date=format-local:%a %b %e %Y %H:%M:%S %z";
 const DETAIL_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%ad%x1f%B";
@@ -427,7 +473,7 @@ fn parse_detail(output: &str) -> Result<CommitDetail, Error> {
 }
 
 /// Joins `git diff --name-status -z` with `--numstat -z`. Both name the new path last, so it is the key.
-fn parse_changes(name_status: &[u8], numstat: &[u8]) -> Vec<FileChange> {
+pub(crate) fn parse_changes(name_status: &[u8], numstat: &[u8]) -> Vec<FileChange> {
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
 
     // numstat: `adds\tdels\tpath\0`, or `adds\tdels\t\0old\0new\0` for a rename. Binary files say `-`.
@@ -501,15 +547,17 @@ pub(crate) fn parse_log(output: &str) -> Result<Vec<Commit>, Error> {
 }
 
 fn parse_record(record: &str) -> Result<Commit, Error> {
-    let fields: Vec<&str> = record.trim_end_matches('\n').splitn(8, FIELD).collect();
-    let [id, parents, author, email, time, date, refs, summary] = fields[..] else {
-        return Err(Error::Parse(format!("expected 8 fields, got {}", fields.len())));
+    let fields: Vec<&str> = record.trim_end_matches('\n').splitn(10, FIELD).collect();
+    let [id, parents, author, email, time, date, refs, committer, committer_email, summary] = fields[..] else {
+        return Err(Error::Parse(format!("expected 10 fields, got {}", fields.len())));
     };
     Ok(Commit {
         id: id.to_owned(),
         parents: parents.split_whitespace().map(str::to_owned).collect(),
         author: author.to_owned(),
         email: email.to_owned(),
+        committer: committer.to_owned(),
+        committer_email: committer_email.to_owned(),
         time: time.parse().map_err(|_| Error::Parse(format!("bad time {time:?}")))?,
         date: date.trim().to_owned(),
         summary: summary.to_owned(),
@@ -593,7 +641,7 @@ mod tests {
     #[test]
     fn parses_a_record_with_two_parents_and_a_separator_free_subject() {
         let out = format!(
-            "{RECORD}abc123{FIELD}p1 p2{FIELD}Ada{FIELD}ada@example.com{FIELD}1700000000{FIELD} 6 Oct 2026 15:22{FIELD}HEAD -> refs/heads/main{FIELD}Merge: it | works\n"
+            "{RECORD}abc123{FIELD}p1 p2{FIELD}Ada{FIELD}ada@example.com{FIELD}1700000000{FIELD} 6 Oct 2026 15:22{FIELD}HEAD -> refs/heads/main{FIELD}Bob{FIELD}bob@example.com{FIELD}Merge: it | works\n"
         );
         let commits = parse_log(&out).unwrap();
         assert_eq!(commits.len(), 1);
@@ -603,12 +651,13 @@ mod tests {
         assert_eq!(c.time, 1_700_000_000);
         assert_eq!(c.date, "6 Oct 2026 15:22", "git pads the day with a space; we trim it");
         assert_eq!(c.summary, "Merge: it | works");
+        assert_eq!((c.committer.as_str(), c.committer_email.as_str()), ("Bob", "bob@example.com"));
         assert_eq!(c.short_id(), "abc123");
     }
 
     #[test]
     fn a_root_commit_has_no_parents_and_no_refs() {
-        let out = format!("{RECORD}abc{FIELD}{FIELD}A{FIELD}a@b{FIELD}1{FIELD}d{FIELD}{FIELD}init\n");
+        let out = format!("{RECORD}abc{FIELD}{FIELD}A{FIELD}a@b{FIELD}1{FIELD}d{FIELD}{FIELD}A{FIELD}a@b{FIELD}init\n");
         let c = &parse_log(&out).unwrap()[0];
         assert!(c.parents.is_empty());
         assert!(c.refs.is_empty());
@@ -631,6 +680,8 @@ mod tests {
             summary: id.into(),
             refs: Vec::new(),
             stash: None,
+            committer: String::new(),
+            committer_email: String::new(),
         }
     }
 

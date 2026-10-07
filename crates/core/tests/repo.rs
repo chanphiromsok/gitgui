@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitgui_core::{
-    Backend, BranchTip, CheckoutTarget, Error, Evidence, GitCli, LaneLayout, LogOptions, Operation, Outcome, RefKind,
+    Backend, BranchTip, CheckoutTarget, Error, Evidence, GitCli, LaneLayout, LogOptions, Operation, Outcome, Query, RefKind,
 };
 
 struct TempRepo(PathBuf);
@@ -103,6 +103,41 @@ fn layout_of_a_real_merge_uses_two_lanes_and_closes_them() {
     assert_eq!(rows[0].lane, 0, "the merge sits on the main lane");
     assert_eq!(rows.iter().map(|r| r.width).max(), Some(2));
     assert_eq!(layout.open_lanes(), 0, "nothing is left waiting after the root commit");
+}
+
+#[test]
+fn a_file_reads_as_it_was_at_a_commit_and_is_none_where_it_is_missing() {
+    let repo = merged_repo("file-at");
+    let git = GitCli::new(repo.path());
+    let commits = git.log(&LogOptions::default()).unwrap();
+    let c = &commits.iter().find(|c| c.summary == "c").unwrap().id;
+    assert_eq!(git.file_at(c, "c.txt").unwrap().as_deref(), Some("c"));
+    assert_eq!(git.file_at(&format!("{c}^1"), "c.txt").unwrap(), None, "not there before c");
+    assert_eq!(git.file_at(c, "b.txt").unwrap(), None, "b is on the other branch");
+}
+
+#[test]
+fn the_remote_url_is_origin_s_or_none() {
+    let repo = merged_repo("remote-url");
+    let git = GitCli::new(repo.path());
+    assert_eq!(git.remote_url().unwrap(), None);
+    repo.git(&["remote", "add", "upstream", "git@github.com:a/up.git"]);
+    assert_eq!(git.remote_url().unwrap().as_deref(), Some("git@github.com:a/up.git"), "the only one");
+    repo.git(&["remote", "add", "origin", "https://github.com/a/b.git"]);
+    assert_eq!(git.remote_url().unwrap().as_deref(), Some("https://github.com/a/b.git"), "origin first");
+}
+
+#[test]
+fn search_finds_commits_by_the_file_they_touched_and_the_text_they_changed() {
+    let repo = merged_repo("search");
+    let git = GitCli::new(repo.path());
+    let commits = git.log(&LogOptions::default()).unwrap();
+    let id = |summary: &str| commits.iter().find(|c| c.summary == summary).unwrap().id.clone();
+
+    assert_eq!(git.search(&Query::Path("c.txt".into())).unwrap(), [id("c")].into());
+    assert_eq!(git.search(&Query::Code("b".into())).unwrap(), [id("b")].into());
+    assert!(git.search(&Query::Path("nothing-here".into())).unwrap().is_empty());
+    assert!(git.search(&Query::Text("b".into())).unwrap().is_empty(), "text is matched in the app, not by git");
 }
 
 #[test]
@@ -843,4 +878,59 @@ fn many_branches_are_checked_together_and_each_gets_its_own_answer() {
         assert_eq!(clue.branch, format!("done-{n}"));
         assert_eq!((clue.evidence, clue.pr), (Evidence::SamePatch, Some(100 + n as u32)));
     }
+}
+
+#[test]
+fn the_working_tree_stages_unstages_diffs_and_commits() {
+    let repo = merged_repo("worktree");
+    let git = GitCli::new(repo.path());
+    std::fs::write(repo.path().join("a.txt"), "a\nmore\n").unwrap();
+    std::fs::write(repo.path().join("new.txt"), "one\ntwo\n").unwrap();
+    std::fs::remove_file(repo.path().join("c.txt")).unwrap();
+
+    let show = |git: &GitCli| -> Vec<(String, bool, bool)> {
+        git.work_status().unwrap().into_iter().map(|f| (f.change.path, f.staged, f.untracked)).collect()
+    };
+    assert_eq!(
+        show(&git),
+        [("a.txt".into(), false, false), ("c.txt".into(), false, false), ("new.txt".into(), false, true)]
+    );
+    let files = git.work_status().unwrap();
+    assert_eq!((files[2].change.additions, files[2].change.deletions), (Some(2), Some(0)), "a new file's lines");
+
+    // A new file diffs against nothing; an edit against the index.
+    let new = git.work_diff(&files[2], 3).unwrap();
+    assert_eq!(new.hunks[0].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+    let edit = git.work_diff(&files[0], 3).unwrap();
+    assert!(edit.hunks[0].lines.iter().any(|l| l.text == "more"));
+    assert_eq!(git.work_sides(&files[0]), (Some(b"a".to_vec()), Some(b"a\nmore\n".to_vec())));
+
+    git.stage(&["a.txt".into(), "c.txt".into(), "new.txt".into()]).unwrap();
+    assert_eq!(
+        show(&git),
+        [("a.txt".into(), true, false), ("c.txt".into(), true, false), ("new.txt".into(), true, false)]
+    );
+    let staged = git.work_status().unwrap();
+    assert!(git.work_diff(&staged[0], 3).unwrap().hunks[0].lines.iter().any(|l| l.text == "more"));
+    assert_eq!(git.work_sides(&staged[1]).1, None, "a staged deletion has no after");
+
+    git.unstage(&["new.txt".into()]).unwrap();
+    assert_eq!(show(&git)[2], ("new.txt".into(), false, true));
+
+    assert!(git.commit_staged("  ").is_err(), "a message is needed");
+    git.commit_staged("chore: tidy").unwrap();
+    assert_eq!(show(&git), [("new.txt".into(), false, true)], "only what was not staged is left");
+    let log = git.log(&LogOptions::default()).unwrap();
+    assert_eq!(log[0].summary, "chore: tidy");
+}
+
+#[test]
+fn unstaging_works_before_the_first_commit() {
+    let repo = TempRepo::new("worktree-empty");
+    let git = GitCli::new(repo.path());
+    std::fs::write(repo.path().join("first.txt"), "hi\n").unwrap();
+    git.stage(&["first.txt".into()]).unwrap();
+    assert!(git.work_status().unwrap()[0].staged);
+    git.unstage(&["first.txt".into()]).unwrap();
+    assert!(git.work_status().unwrap()[0].untracked);
 }

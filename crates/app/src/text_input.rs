@@ -11,9 +11,10 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
-    UnderlineStyle, Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
+    UnderlineStyle, Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgb, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
+use crate::theme::t;
 
 actions!(
     text_input,
@@ -519,7 +520,7 @@ impl Element for TextElement {
                 None,
                 Some(fill(
                     Bounds::new(point(bounds.left() + cursor_pos, bounds.top()), size(px(1.5), bounds.bottom() - bounds.top())),
-                    rgb(0x4fc1ff),
+                    rgb(t().accent),
                 )),
             )
         } else {
@@ -529,7 +530,7 @@ impl Element for TextElement {
                         point(bounds.left() + line.x_for_index(selected_range.start), bounds.top()),
                         point(bounds.left() + line.x_for_index(selected_range.end), bounds.bottom()),
                     ),
-                    rgba(0x4fc1ff55),
+                    gpui::Rgba { a: 0.33, ..rgb(t().accent) },
                 )),
                 None,
             )
@@ -598,13 +599,14 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .h(px(28.))
             .w_full()
+            .overflow_hidden()
             .px_2()
             .rounded_sm()
             .border_1()
-            .border_color(if focused { rgb(0x4fc1ff) } else { rgb(0x3c3c3c) })
-            .bg(rgb(0x2a2a2a))
+            .border_color(if focused { rgb(t().accent) } else { rgb(t().input_border) })
+            .bg(rgb(t().input_bg))
             .text_sm()
-            .text_color(rgb(0xe0e0e0))
+            .text_color(rgb(t().text))
             .child(div().w_full().child(TextElement { input: cx.entity() }))
     }
 }

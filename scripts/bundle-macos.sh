@@ -21,6 +21,9 @@ else
     cp target/release/gitgui-app "$APP/Contents/MacOS/gitgui"
 fi
 
+# The icon: crates/app/assets/app-icon/icon.svg, drawn to AppIcon.icns by the app_icon example.
+cp crates/app/assets/app-icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -29,6 +32,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>gitgui</string>
   <key>CFBundleIdentifier</key><string>dev.gitgui.app</string>
   <key>CFBundleExecutable</key><string>gitgui</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>

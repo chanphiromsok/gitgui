@@ -3,19 +3,21 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gitgui_core::{DiffLine, LineKind};
+use gitgui_core::{DiffLine, FileStatus, LineKind};
 use gitgui_store::{Comment, Side};
 use gpui::{AnyElement, Context, ElementId, FontWeight, SharedString, StyledText, Window, div, list, prelude::*, px, rgb};
 
-use crate::detail::{stats, status_color};
+use crate::changes::WORKTREE;
+use crate::detail::{deleted_tag, stats, status_color};
+use crate::icons;
 use crate::rows::{Anchor, DisplayRow, Mode, Notice, anchor_of};
-use crate::ui::{self, ACCENT, ADDED, BG, BORDER, HOVER, MONO, MUTED, REMOVED, WARNING, button};
+use crate::preview::{self, Images, Preview};
+use crate::syntax::{FileColors, Span};
+use crate::ui::{self, MONO, button};
 use crate::workspace::{Phase, Workspace};
+use crate::theme::t;
 
 const LINE_H: f32 = 20.0;
-const ADDED_BG: u32 = 0x1d3b2c;
-const REMOVED_BG: u32 = 0x4b2326;
-const EMPTY_BG: u32 = 0x232323;
 
 fn side_name(side: Side) -> &'static str {
     match side {
@@ -40,7 +42,7 @@ impl Workspace {
 
         let toggle = |id: &'static str, label: &'static str, this: Mode| {
             button(id, label)
-                .when(mode == this, |b| b.bg(rgb(ACCENT)).text_color(rgb(0x111111)).font_weight(FontWeight::BOLD))
+                .when(mode == this, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
                 .on_click(cx.listener(move |workspace, _, _, cx| workspace.set_mode(this, cx)))
         };
 
@@ -52,12 +54,14 @@ impl Workspace {
             .items_center()
             .gap_3()
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(t().border))
             .child(button("overview", "Overview").on_click(cx.listener(|this, _, _, cx| this.close_file(cx))))
+            .child(ui::file_icon(icons::file(change.path.rsplit('/').next().unwrap_or(&change.path))))
             .child(div().font_weight(FontWeight::SEMIBOLD).text_color(status_color(change.status)).child(SharedString::from(title)))
+            .when(change.status == FileStatus::Deleted, |bar| bar.child(deleted_tag()))
             .child(stats(change))
             .child(
-                div().min_w_0().flex_1().text_xs().text_color(rgb(MUTED)).child(match count {
+                div().min_w_0().flex_1().text_xs().text_color(rgb(t().muted)).child(match count {
                     0 => "Click + beside a line to comment".to_owned(),
                     1 => "1 comment on this file".to_owned(),
                     n => format!("{n} comments on this file"),
@@ -66,14 +70,26 @@ impl Workspace {
             .child(div().flex().gap_1().child(toggle("mode-unified", "Unified", Mode::Unified)).child(toggle("mode-split", "Split", Mode::Split)));
 
         let body: AnyElement = match &file.phase {
-            Phase::Loading => centered_text("Loading diff…", MUTED),
-            Phase::Failed(message) => centered_text(message.clone(), REMOVED),
-            Phase::Ready(()) => list(
-                file.list.clone(),
-                cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx)),
-            )
-            .size_full()
-            .into_any_element(),
+            Phase::Loading => centered_text("Loading diff…", t().muted),
+            Phase::Failed(message) => centered_text(message.clone(), t().removed),
+            Phase::Ready(()) => {
+                let diff = list(file.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx)))
+                    .size_full()
+                    .into_any_element();
+                match &file.images {
+                    // A picture: before and after, then (for an SVG) its text diff below.
+                    Some(images) => div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(image_compare(images))
+                        .when(!file.diff.binary && !file.diff.hunks.is_empty(), |col| {
+                            col.child(div().flex_1().min_h_0().border_t_1().border_color(rgb(t().border)).child(diff))
+                        })
+                        .into_any_element(),
+                    None => diff,
+                }
+            }
         };
 
         div()
@@ -81,7 +97,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(div().flex_1().min_h_0().bg(rgb(BG)).child(body))
+            .child(div().flex_1().min_h_0().bg(rgb(t().editor_bg)).child(body))
             .into_any_element()
     }
 
@@ -90,13 +106,18 @@ impl Workspace {
         let Some(file) = repo.file.as_ref() else { return div().into_any_element() };
         let Some(row) = file.rows.get(ix).copied() else { return div().into_any_element() };
         let mode = repo.mode;
+        // Uncommitted lines have no commit to hang a comment on.
+        let comments = repo.commit.as_ref().is_some_and(|commit| commit.id != WORKTREE);
 
         match row {
             DisplayRow::Hunk(h) => hunk_header(&file.diff.hunks[h].header),
-            DisplayRow::Line { hunk, line } => unified_line(ix, &file.diff.hunks[hunk].lines[line], cx),
+            DisplayRow::Line { hunk, line } => {
+                let line = &file.diff.hunks[hunk].lines[line];
+                unified_line(ix, line, file.colors.of(line), comments, cx)
+            }
             DisplayRow::Pair { hunk, left, right } => {
                 let lines = &file.diff.hunks[hunk].lines;
-                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), cx)
+                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, cx)
             }
             DisplayRow::Comment(i) => match file.comments.get(i) {
                 Some(comment) => comment_card(ix, comment, mode, cx),
@@ -117,8 +138,8 @@ impl Workspace {
                 div()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(ACCENT))
-                    .bg(rgb(0x252a31))
+                    .border_color(rgb(t().accent))
+                    .bg(rgb(t().card))
                     .p_2()
                     .flex()
                     .flex_col()
@@ -126,7 +147,7 @@ impl Workspace {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(t().muted))
                             .child(format!("Comment on {} line {}", side_name(anchor.side), anchor.line)),
                     )
                     .child(self.input.clone())
@@ -138,8 +159,8 @@ impl Workspace {
                             .child(button("cancel-comment", "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_comment(cx))))
                             .child(
                                 button("save-comment", "Comment")
-                                    .bg(rgb(ACCENT))
-                                    .text_color(rgb(0x111111))
+                                    .bg(rgb(t().accent))
+                                    .text_color(rgb(t().on_accent))
                                     .on_click(cx.listener(|this, _, _, cx| this.submit_comment(cx))),
                             ),
                     ),
@@ -156,6 +177,60 @@ fn card_indent(mode: Mode) -> gpui::Pixels {
     }
 }
 
+/// The image before and after, side by side, each with its size in pixels and bytes.
+fn image_compare(images: &Images) -> AnyElement {
+    let side = |label: &'static str, preview: Option<&Preview>, change: Option<String>| {
+        let caption = match preview {
+            Some(p) => format!("{} × {} px · {}", p.width, p.height, preview::human_size(p.bytes)),
+            None => "not there".to_owned(),
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(t().text_strong)).child(label))
+                    .child(div().text_color(rgb(t().muted)).child(caption))
+                    .children(change.map(|text| div().text_color(rgb(t().muted)).child(format!("({text})")))),
+            )
+            .child(
+                div()
+                    .h(px(320.))
+                    .w_full()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(t().border))
+                    .bg(rgb(t().empty_bg))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(match preview {
+                        Some(p) => gpui::img(p.source.source()).size_full().object_fit(gpui::ObjectFit::ScaleDown).into_any_element(),
+                        None => div().text_xs().text_color(rgb(t().muted)).child("—").into_any_element(),
+                    }),
+            )
+    };
+    let change = images.old.as_ref().zip(images.new.as_ref()).map(|(old, new)| preview::size_change(old.bytes, new.bytes));
+    let mut row = div().flex_none().p_3().flex().gap_3();
+    match (&images.old, &images.new) {
+        (Some(_), Some(_)) => {
+            row = row.child(side("Before", images.old.as_ref(), None)).child(side("After", images.new.as_ref(), change))
+        }
+        (None, Some(_)) => row = row.child(side("Added", images.new.as_ref(), None)),
+        (Some(_), None) => row = row.child(side("Deleted", images.old.as_ref(), None)),
+        (None, None) => row = row.child(div().text_xs().text_color(rgb(t().muted)).child("This image could not be read.")),
+    }
+    row.into_any_element()
+}
+
 fn centered_text(text: impl Into<SharedString>, color: u32) -> AnyElement {
     div().size_full().flex().items_center().justify_center().text_color(rgb(color)).child(text.into()).into_any_element()
 }
@@ -167,8 +242,8 @@ fn hunk_header(header: &str) -> AnyElement {
         .px_3()
         .flex()
         .items_center()
-        .bg(rgb(0x1f2a36))
-        .text_color(rgb(0x7aa2c8))
+        .bg(rgb(t().hunk_bg))
+        .text_color(rgb(t().hunk_fg))
         .font_family(MONO)
         .text_xs()
         .child(SharedString::from(header.to_owned()))
@@ -177,12 +252,12 @@ fn hunk_header(header: &str) -> AnyElement {
 
 fn notice_row(notice: Notice) -> AnyElement {
     let (text, color) = match notice {
-        Notice::Binary => ("Binary file: there is no text diff to show.".to_owned(), MUTED),
-        Notice::NoChanges => ("No textual changes (an empty file, or only the file mode changed).".to_owned(), MUTED),
-        Notice::Truncated => (format!("The diff was cut after {} lines.", gitgui_core::diff::MAX_LINES), WARNING),
+        Notice::Binary => ("Binary file: there is no text diff to show.".to_owned(), t().muted),
+        Notice::NoChanges => ("No textual changes (an empty file, or only the file mode changed).".to_owned(), t().muted),
+        Notice::Truncated => (format!("The diff was cut after {} lines.", gitgui_core::diff::MAX_LINES), t().warning),
         Notice::HiddenComments(n) => (
             format!("{n} comment{} on lines outside the changes shown here.", if n == 1 { " is" } else { "s are" }),
-            WARNING,
+            t().warning,
         ),
     };
     div().w_full().py_2().px_3().text_xs().text_color(rgb(color)).child(text).into_any_element()
@@ -194,11 +269,11 @@ fn plus(id: impl Into<ElementId>, anchor: Option<Anchor>, group: &'static str, c
     match anchor {
         Some(anchor) => cell
             .cursor_pointer()
-            .text_color(rgb(ACCENT))
+            .text_color(rgb(t().accent))
             .font_weight(FontWeight::BOLD)
             .opacity(0.)
             .group_hover(group, |style| style.opacity(1.))
-            .hover(|style| style.bg(rgb(ACCENT)).text_color(rgb(0x111111)))
+            .hover(|style| style.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
             .on_click(cx.listener(move |this, _, window, cx| this.start_comment(anchor, window, cx)))
             .child("+")
             .into_any_element(),
@@ -210,17 +285,17 @@ fn plus(id: impl Into<ElementId>, anchor: Option<Anchor>, group: &'static str, c
 /// other element, and there are far more of them.
 fn line_bg(kind: LineKind) -> Option<u32> {
     match kind {
-        LineKind::Added => Some(ADDED_BG),
-        LineKind::Removed => Some(REMOVED_BG),
+        LineKind::Added => Some(t().added_bg),
+        LineKind::Removed => Some(t().removed_bg),
         LineKind::Context => None,
     }
 }
 
 fn marker(kind: LineKind) -> (&'static str, u32) {
     match kind {
-        LineKind::Added => ("+", ADDED),
-        LineKind::Removed => ("-", REMOVED),
-        LineKind::Context => (" ", MUTED),
+        LineKind::Added => ("+", t().added),
+        LineKind::Removed => ("-", t().removed),
+        LineKind::Context => (" ", t().muted),
     }
 }
 
@@ -238,13 +313,28 @@ fn tint(color: u32) -> gpui::HighlightStyle {
 
 /// One text element for a whole row: `gutter  sign  code`, with the gutter and sign colored. The font is
 /// monospace, so padding the numbers lines the columns up, and a row costs one element, not six.
-fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str) -> StyledText {
+fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str, spans: &[Span]) -> StyledText {
+    let theme = t();
     let text = format!("{gutter} {sign} {}", code.replace('\t', "    "));
     let end = gutter.len();
-    StyledText::new(text).with_highlights([(0..end, tint(MUTED)), (end + 1..end + 2, tint(sign_color))])
+    // Where code begins in the row's text, and where each tab before a byte pushed it along.
+    let start = end + sign.len() + 2;
+    let tabs: Vec<usize> = code.match_indices('\t').map(|(at, _)| at).collect();
+    let at = |byte: usize| start + byte + 3 * tabs.partition_point(|&tab| tab < byte);
+    let mut highlights = vec![(0..end, tint(theme.line_number)), (end + 1..end + 1 + sign.len(), tint(sign_color))];
+    for (range, name) in spans {
+        let (from, to) = (range.start as usize, (range.end as usize).min(code.len()));
+        if from >= to || !code.is_char_boundary(from) || !code.is_char_boundary(to) {
+            continue;
+        }
+        if let Some(style) = theme.syntax_style(*name) {
+            highlights.push((at(from)..at(to), style));
+        }
+    }
+    StyledText::new(text).with_highlights(highlights)
 }
 
-fn unified_line(ix: usize, line: &DiffLine, cx: &mut Context<Workspace>) -> AnyElement {
+fn unified_line(ix: usize, line: &DiffLine, spans: &[Span], comments: bool, cx: &mut Context<Workspace>) -> AnyElement {
     let (sign, sign_color) = marker(line.kind);
     let gutter = format!("{} {}", column(line.old_no, 5), column(line.new_no, 5));
     div()
@@ -259,17 +349,25 @@ fn unified_line(ix: usize, line: &DiffLine, cx: &mut Context<Workspace>) -> AnyE
         .when_some(line_bg(line.kind), |row, bg| row.bg(rgb(bg)))
         .font_family(MONO)
         .text_xs()
-        .child(plus(("plus", ix), anchor_of(line), "diff-line", cx))
-        .child(diff_text(&gutter, sign, sign_color, &line.text))
+        .child(plus(("plus", ix), anchor_of(line).filter(|_| comments), "diff-line", cx))
+        .text_color(rgb(t().editor_fg))
+        .child(diff_text(&gutter, sign, sign_color, &line.text, spans))
         .into_any_element()
 }
 
-fn split_row(ix: usize, left: Option<&DiffLine>, right: Option<&DiffLine>, cx: &mut Context<Workspace>) -> AnyElement {
+fn split_row(
+    ix: usize,
+    left: Option<&DiffLine>,
+    right: Option<&DiffLine>,
+    colors: &FileColors,
+    comments: bool,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let half = |left_side: bool, line: Option<&DiffLine>, cx: &mut Context<Workspace>| -> AnyElement {
         let group = if left_side { "split-left" } else { "split-right" };
         let cell = div().h_full().flex_1().min_w_0().overflow_hidden().whitespace_nowrap();
         let Some(line) = line else {
-            return cell.bg(rgb(EMPTY_BG)).into_any_element();
+            return cell.bg(rgb(t().empty_bg)).into_any_element();
         };
         let (sign, sign_color) = marker(line.kind);
         let shown = if left_side { line.old_no } else { line.new_no };
@@ -277,8 +375,8 @@ fn split_row(ix: usize, left: Option<&DiffLine>, right: Option<&DiffLine>, cx: &
             .flex()
             .items_center()
             .when_some(line_bg(line.kind), |cell, bg| cell.bg(rgb(bg)))
-            .child(plus((if left_side { "plus-l" } else { "plus-r" }, ix), anchor_of(line), group, cx))
-            .child(diff_text(&column(shown, 5), sign, sign_color, &line.text))
+            .child(plus((if left_side { "plus-l" } else { "plus-r" }, ix), anchor_of(line).filter(|_| comments), group, cx))
+            .child(diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side)))
             .into_any_element()
     };
 
@@ -289,9 +387,10 @@ fn split_row(ix: usize, left: Option<&DiffLine>, right: Option<&DiffLine>, cx: &
         .h(px(LINE_H))
         .flex()
         .font_family(MONO)
+        .text_color(rgb(t().editor_fg))
         .text_xs()
         .child(left)
-        .child(div().h_full().flex_1().min_w_0().border_l_1().border_color(rgb(BORDER)).flex().child(right))
+        .child(div().h_full().flex_1().min_w_0().border_l_1().border_color(rgb(t().border)).flex().child(right))
         .into_any_element()
 }
 
@@ -309,8 +408,8 @@ fn comment_card(ix: usize, comment: &Comment, mode: Mode, cx: &mut Context<Works
             div()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(BORDER))
-                .bg(rgb(0x252a31))
+                .border_color(rgb(t().border))
+                .bg(rgb(t().card))
                 .p_2()
                 .flex()
                 .flex_col()
@@ -321,7 +420,7 @@ fn comment_card(ix: usize, comment: &Comment, mode: Mode, cx: &mut Context<Works
                         .items_center()
                         .gap_2()
                         .text_xs()
-                        .text_color(rgb(MUTED))
+                        .text_color(rgb(t().muted))
                         .child(format!("{} line {}", side_name(comment.side), comment.line))
                         .child(ui::ago(now - comment.created))
                         .when(resolved, |row| row.child(div().px_1().rounded_sm().bg(rgb(0x23553a)).text_color(rgb(0xb7e4c7)).child("Resolved")))
@@ -334,6 +433,6 @@ fn comment_card(ix: usize, comment: &Comment, mode: Mode, cx: &mut Context<Works
                 )
                 .child(div().when(resolved, |text| text.opacity(0.6)).child(SharedString::from(comment.text.clone()))),
         )
-        .hover(|style| style.bg(rgb(HOVER)).opacity(1.))
+        .hover(|style| style.bg(rgb(t().hover)).opacity(1.))
         .into_any_element()
 }

@@ -346,9 +346,14 @@ async fn dragging_the_dividers_resizes_the_panes_within_their_limits(cx: &mut Te
     drag_to(&ws, cx, 320., Some(MouseButton::Left));
     assert_eq!(width(cx).0, 320.);
     draw(cx, &ws);
-    drag_to(&ws, cx, 5., Some(MouseButton::Left));
+    drag_to(&ws, cx, layout::SIDEBAR_HIDE_AT + 10., Some(MouseButton::Left));
     assert_eq!(width(cx).0, layout::SIDEBAR_MIN, "it stops at its minimum");
+    // Further left, it hides; dragging back out shows it again.
+    drag_to(&ws, cx, 5., Some(MouseButton::Left));
+    assert!(!ws.read_with(cx, |ws, _| ws.sidebar_shown()), "dragged shut");
+    draw(cx, &ws);
     drag_to(&ws, cx, total, Some(MouseButton::Left));
+    assert!(ws.read_with(cx, |ws, _| ws.sidebar_shown()));
     assert_eq!(width(cx).0, sidebar_limit, "and at what the window leaves room for");
     draw(cx, &ws);
 
@@ -562,7 +567,7 @@ async fn a_pull_requests_commits_are_listed_under_it_with_icons_and_the_setting_
 #[gpui::test]
 async fn a_saved_choice_to_not_group_is_there_on_the_next_launch(cx: &mut TestAppContext) {
     let fx = merged_pr("launch");
-    Store::at(fx.data()).save_settings(&gitgui_store::Settings { group_by_parent: false }).unwrap();
+    Store::at(fx.data()).save_settings(&gitgui_store::Settings { group_by_parent: false, ..Default::default() }).unwrap();
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     open_project(&ws, cx, &fx.repo());
     assert!(shown(&ws, cx).iter().all(|(_, depth)| *depth == 0));
@@ -1075,4 +1080,423 @@ async fn right_clicking_opens_a_menu_and_never_the_file_preview(cx: &mut TestApp
     click(cx, MouseButton::Left, row);
     cx.run_until_parked();
     assert!(pane_open(&ws, cx), "a left click still opens the file pane");
+}
+
+#[gpui::test]
+async fn the_filter_bar_narrows_the_graph_and_the_search_finds_commits(cx: &mut TestAppContext) {
+    use gitgui_core::Scope;
+
+    // main: base -> change. other (not checked out): one commit on base. feat (HEAD): one commit on change.
+    let fx = fixture("filters");
+    fx.git(&["checkout", "-q", "-b", "other", "HEAD~1"]);
+    fx.write("other.txt", "other\n");
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "other work"]);
+    fx.git(&["checkout", "-q", "-b", "feat", "main"]);
+    fx.write("src/feat.rs", "fn feat() {}\n");
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "feat work"]);
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    assert_eq!(summaries(&ws, cx), ["feat work", "other work", "change", "base"]);
+    draw(cx, &ws);
+
+    // The current branch only: the other branch's commit goes; ahead and behind still count it.
+    ws.update(cx, |ws, cx| ws.set_scope(Scope::Current, cx));
+    assert_eq!(summaries(&ws, cx), ["feat work", "change", "base"]);
+    let base = ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => view.base.clone(),
+        _ => None,
+    });
+    assert_eq!(base.map(|b| (b.name, b.ahead, b.behind)), Some(("main".into(), 1, 0)));
+    draw(cx, &ws);
+
+    // Reading the repository again keeps the filter.
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(summaries(&ws, cx), ["feat work", "change", "base"]);
+    ws.update(cx, |ws, cx| ws.set_scope(Scope::All, cx));
+
+    // A plain search dims what it misses; Enter goes to what it finds.
+    let misses = |ws: &Entity<Workspace>, cx: &VisualTestContext| -> Vec<bool> {
+        ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+            Phase::Ready(view) => view.entries.iter().map(|e| e.search_miss).collect(),
+            _ => Vec::new(),
+        })
+    };
+    ws.update(cx, |ws, cx| ws.set_search("work".into(), cx));
+    assert_eq!(misses(&ws, cx), [false, false, true, true]);
+    ws.update(cx, |ws, cx| ws.submit_search(cx));
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| ws.submit_search(cx));
+    cx.run_until_parked();
+    assert_eq!(ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().selected), Some(1), "the second match");
+    draw(cx, &ws);
+
+    // `path:` asks git once Enter is pressed.
+    ws.update(cx, |ws, cx| ws.set_search("path:src/feat.rs".into(), cx));
+    assert_eq!(misses(&ws, cx), [false; 4], "nothing dims before git answers");
+    ws.update(cx, |ws, cx| ws.submit_search(cx));
+    cx.run_until_parked();
+    assert_eq!(misses(&ws, cx), [false, true, true, true]);
+    draw(cx, &ws);
+}
+
+#[gpui::test]
+async fn a_diff_is_colored_from_the_whole_file_on_both_sides(cx: &mut TestAppContext) {
+    let fx = fixture("colors");
+    fx.write("src/app.ts", "const a = 1;\nexport function f() {\n  return \"old\";\n}\n");
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "add app"]);
+    fx.write("src/app.ts", "const a = 1;\nexport function f() {\n  // changed\n  return 2;\n}\n");
+    fx.git(&["commit", "-q", "-am", "change app"]);
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "change app");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+
+    let names = ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        file.diff.hunks.iter().flat_map(|h| &h.lines).map(|line| {
+            let spans = file.colors.of(line);
+            (line.text.clone(), spans.iter().map(|(_, n)| crate::syntax::NAMES[*n as usize]).collect::<Vec<_>>())
+        }).collect::<Vec<_>>()
+    });
+    let of = |text: &str| names.iter().find(|(t, _)| t == text).map(|(_, n)| n.clone()).unwrap_or_default();
+    assert!(of("  return \"old\";").contains(&"string"), "the removed line, from the old file: {names:?}");
+    assert_eq!(of("  // changed"), ["comment"], "the added line, from the new file");
+    assert!(of("export function f() {").contains(&"keyword"));
+    draw(cx, &ws);
+
+    // Every theme draws the diff.
+    let themes = ws.read_with(cx, |ws, _| ws.themes.iter().map(|t| t.name.clone()).collect::<Vec<_>>());
+    for name in themes.iter().take(3) {
+        ws.update(cx, |ws, cx| ws.set_theme(name, cx));
+        draw(cx, &ws);
+    }
+    ws.update(cx, |ws, cx| ws.set_theme(crate::theme::DEFAULT, cx));
+}
+
+#[gpui::test]
+async fn folders_fold_and_the_sidebar_hides_and_both_are_kept(cx: &mut TestAppContext) {
+    let fx = fixture("dir-fold");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+
+    // With nothing open, the sidebar cannot hide: it is where a project is picked.
+    ws.update(cx, |ws, cx| ws.toggle_sidebar(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.sidebar_shown()));
+    assert!(!Store::at(fx.data()).settings().unwrap().sidebar_hidden, "and nothing is saved");
+
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "change");
+    // src/a.rs, src/b/c.rs and README.md: src holds the other two.
+    assert_eq!(file_names(&ws, cx), ["src/b/c.rs", "src/a.rs", "README.md"]);
+    ws.update(cx, |ws, cx| ws.toggle_dir("src", cx));
+    assert_eq!(file_names(&ws, cx), ["README.md"]);
+    draw(cx, &ws);
+    // Another commit keeps the folder folded; unfolding brings the files back.
+    select(&ws, cx, "base");
+    ws.update(cx, |ws, cx| ws.toggle_dir("src", cx));
+    assert_eq!(file_names(&ws, cx), ["src/a.rs", "README.md"]);
+
+    ws.update(cx, |ws, cx| ws.toggle_sidebar(cx));
+    assert!(!ws.read_with(cx, |ws, _| ws.sidebar_shown()));
+    assert!(Store::at(fx.data()).settings().unwrap().sidebar_hidden, "the choice is kept");
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.toggle_sidebar(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.sidebar_shown()));
+}
+
+#[gpui::test]
+async fn a_changed_image_shows_before_and_after_with_its_sizes(cx: &mut TestAppContext) {
+    let fx = fixture("image");
+    let png = |w: u32, h: u32| {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(w, h, image::Rgba([2, 136, 209, 255])).write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    };
+    std::fs::write(fx.repo().join("logo.png"), png(4, 2)).unwrap();
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "add logo"]);
+    std::fs::write(fx.repo().join("logo.png"), png(8, 6)).unwrap();
+    fx.git(&["commit", "-q", "-am", "bigger logo"]);
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let sizes = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            let images = ws.repo.as_ref()?.file.as_ref()?.images.clone()?;
+            let dims = |p: Option<crate::preview::Preview>| p.map(|p| (p.width, p.height));
+            Some((dims(images.old), dims(images.new)))
+        })
+    };
+
+    select(&ws, cx, "bigger logo");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    assert_eq!(sizes(&ws, cx), Some((Some((4, 2)), Some((8, 6)))));
+    draw(cx, &ws);
+
+    select(&ws, cx, "add logo");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    assert_eq!(sizes(&ws, cx), Some((None, Some((4, 2)))), "an added image has no before");
+    draw(cx, &ws);
+}
+
+#[gpui::test]
+async fn the_chevron_on_a_merge_in_the_graph_folds_it_and_the_compact_graph_is_narrower(cx: &mut TestAppContext) {
+    let fx = merged_pr("chevron");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    assert_eq!(shown(&ws, cx).len(), 5);
+
+    // Clicking the chevron folds the merge's commits, and does not open the commit.
+    let chevron = center_of(cx, "fold-0".into());
+    click(cx, MouseButton::Left, chevron);
+    cx.run_until_parked();
+    assert_eq!(shown(&ws, cx).len(), 3);
+    assert!(!pane_open(&ws, cx), "folding is not selecting");
+    draw(cx, &ws);
+    click(cx, MouseButton::Left, chevron);
+    cx.run_until_parked();
+    assert_eq!(shown(&ws, cx).len(), 5);
+
+    let width = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+            Phase::Ready(view) => view.graph_width,
+            _ => 0.,
+        })
+    };
+    let roomy = width(&ws, cx);
+    ws.update(cx, |ws, cx| ws.toggle_compact_graph(cx));
+    assert!(width(&ws, cx) < roomy, "narrower lanes");
+    assert!(Store::at(fx.data()).settings().unwrap().compact_graph, "the choice is kept");
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.toggle_compact_graph(cx));
+    assert_eq!(width(&ws, cx), roomy);
+}
+
+#[gpui::test]
+async fn a_pull_request_merge_links_to_its_page_on_the_remote_site(cx: &mut TestAppContext) {
+    let fx = merged_pr("pr-link");
+    fx.git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+
+    let (pr, merge) = ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => (
+            view.entries[0].pr.clone().map(|(n, url)| (n, url.to_string())),
+            view.entries[0].commit.clone().unwrap(),
+        ),
+        _ => (None, String::new()),
+    });
+    assert_eq!(pr, Some((1, "https://github.com/owner/repo/pull/1".to_owned())));
+
+    let labels = ws.read_with(cx, |ws, _| {
+        ws.menu_items(&crate::menu::MenuTarget::Commit(merge.clone())).into_iter().map(|item| item.label.to_string()).collect::<Vec<_>>()
+    });
+    assert_eq!(labels[..2], ["Open Pull Request #1 in Browser".to_owned(), "Open Commit in Browser".to_owned()]);
+    // A plain commit has no pull request to open, only itself.
+    let plain = ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => view.entries.iter().find(|e| e.summary.as_ref() == "chore: m1").and_then(|e| e.commit.clone()).unwrap(),
+        _ => String::new(),
+    });
+    let labels = ws.read_with(cx, |ws, _| {
+        ws.menu_items(&crate::menu::MenuTarget::Commit(plain.clone())).into_iter().map(|item| item.label.to_string()).collect::<Vec<_>>()
+    });
+    assert_eq!(labels[0], "Open Commit in Browser");
+    select(&ws, cx, "Merge pull request #1 from owner/feat/x");
+    draw(cx, &ws);
+}
+
+#[gpui::test]
+async fn the_stashes_checkbox_hides_and_shows_stashes(cx: &mut TestAppContext) {
+    let fx = fixture("stash-filter");
+    fx.write("src/a.rs", "work in progress\n");
+    fx.git(&["stash", "push", "-q", "-m", "wip"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let has_stash = |ws: &Entity<Workspace>, cx: &VisualTestContext| summaries(ws, cx).iter().any(|s| s.contains("wip"));
+    assert!(has_stash(&ws, cx));
+    assert_eq!(ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => view.stashes,
+        _ => 0,
+    }), 1);
+
+    ws.update(cx, |ws, cx| ws.toggle_stashes(cx));
+    assert!(!has_stash(&ws, cx));
+    assert_eq!(summaries(&ws, cx), ["change", "base"]);
+    draw(cx, &ws);
+    // With the current branch only, the stash made on its commit still shows when stashes are on.
+    ws.update(cx, |ws, cx| ws.toggle_stashes(cx));
+    ws.update(cx, |ws, cx| ws.set_scope(gitgui_core::Scope::Current, cx));
+    assert!(has_stash(&ws, cx));
+}
+
+#[gpui::test]
+async fn local_changes_list_under_the_project_preview_stage_and_commit(cx: &mut TestAppContext) {
+    let fx = fixture("worktree");
+    fx.write("src/a.rs", "one\nTWO\nthree\nfour\nfive\nsix\nseven\nEIGHT\nnine\nten\n");
+    fx.write("notes.md", "# notes\n");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+
+    let work = |ws: &Entity<Workspace>, cx: &VisualTestContext| -> Vec<(String, bool)> {
+        ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().work.iter().map(|f| (f.change.path.clone(), f.staged)).collect())
+    };
+    assert_eq!(work(&ws, cx), [("notes.md".to_owned(), false), ("src/a.rs".to_owned(), false)]);
+
+    // A click on a change opens its diff in the pane, from the working tree.
+    ws.update(cx, |ws, cx| ws.open_work_file(1, cx));
+    cx.run_until_parked();
+    let added: Vec<String> = ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        file.diff.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == gitgui_core::LineKind::Added).map(|l| l.text.clone()).collect()
+    });
+    assert_eq!(added, ["ten"]);
+    assert!(ws.read_with(cx, |ws, _| ws.work_open()));
+    draw(cx, &ws);
+
+    // Staging one keeps it open, now from the index.
+    ws.update(cx, |ws, cx| ws.stage_paths(vec!["src/a.rs".into()], true, cx));
+    cx.run_until_parked();
+    assert_eq!(work(&ws, cx), [("src/a.rs".to_owned(), true), ("notes.md".to_owned(), false)]);
+    let open = ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().map(|f| f.index));
+    assert_eq!(open, Some(0), "the open file followed its move to Staged");
+    draw(cx, &ws);
+
+    // No message, no commit.
+    ws.update(cx, |ws, cx| ws.commit_work(cx));
+    cx.run_until_parked();
+    assert_eq!(summaries(&ws, cx).len(), 3, "uncommitted, change, base");
+
+    ws.update(cx, |ws, cx| ws.commit_input.update(cx, |input, cx| input.set_text("feat: ten", cx)));
+    ws.update(cx, |ws, cx| ws.commit_work(cx));
+    cx.run_until_parked();
+    assert_eq!(summaries(&ws, cx), ["Uncommitted Changes (1)", "feat: ten", "change", "base"], "only what was staged went in");
+    assert_eq!(work(&ws, cx), [("notes.md".to_owned(), false)]);
+    assert_eq!(ws.read_with(cx, |ws, cx| ws.commit_input.read(cx).text().to_owned()), "", "the message is cleared");
+    draw(cx, &ws);
+}
+
+#[gpui::test]
+async fn up_and_down_step_through_the_files_of_the_working_tree_and_of_a_commit(cx: &mut TestAppContext) {
+    let fx = fixture("step");
+    fx.write("README.md", "back\n");
+    fx.write("src/a.rs", "changed\n");
+    fx.git(&["add", "src/a.rs"]);
+    fx.write("z.txt", "new\n");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let open = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            let repo = ws.repo.as_ref().unwrap();
+            let file = repo.file.as_ref()?;
+            Some(if ws.work_open() { repo.work[file.index].change.path.clone() } else { file.index.to_string() })
+        })
+    };
+    let step = |ws: &Entity<Workspace>, cx: &mut VisualTestContext, delta: isize| {
+        ws.update(cx, |ws, cx| ws.step_file(delta, cx));
+        cx.run_until_parked();
+    };
+
+    // The working tree, in the sidebar's order: staged src/a.rs, then README.md and z.txt.
+    ws.update(cx, |ws, cx| ws.open_work(cx));
+    step(&ws, cx, 1);
+    assert_eq!(open(&ws, cx).as_deref(), Some("src/a.rs"), "Down opens the first");
+    step(&ws, cx, 1);
+    assert_eq!(open(&ws, cx).as_deref(), Some("README.md"));
+    step(&ws, cx, 1);
+    step(&ws, cx, 1);
+    assert_eq!(open(&ws, cx).as_deref(), Some("z.txt"), "and stops at the last");
+    step(&ws, cx, -1);
+    assert_eq!(open(&ws, cx).as_deref(), Some("README.md"));
+    draw(cx, &ws);
+
+    // A commit's files, in the file list's order.
+    select(&ws, cx, "change");
+    let rows = ws.read_with(cx, |ws, _| {
+        ws.repo.as_ref().unwrap().file_rows.iter().filter_map(|r| match r {
+            gitgui_core::TreeRow::File { index, .. } => Some(index.to_string()),
+            gitgui_core::TreeRow::Dir { .. } => None,
+        }).collect::<Vec<_>>()
+    });
+    step(&ws, cx, 1);
+    assert_eq!(open(&ws, cx).as_ref(), rows.first());
+    step(&ws, cx, 1);
+    assert_eq!(open(&ws, cx).as_ref(), rows.get(1));
+    step(&ws, cx, -1);
+    step(&ws, cx, -1);
+    assert_eq!(open(&ws, cx).as_ref(), rows.first(), "and stops at the first");
+}
+
+#[gpui::test]
+async fn the_arrow_keys_reach_the_files_after_typing_a_message_then_clicking_a_file(cx: &mut TestAppContext) {
+    let fx = fixture("arrows");
+    fx.write("README.md", "back\n");
+    fx.write("z.txt", "new\n");
+    cx.update(|cx| {
+        crate::text_input::bind_keys(cx);
+        cx.bind_keys([
+            gpui::KeyBinding::new("up", crate::workspace::PreviousFile, None),
+            gpui::KeyBinding::new("down", crate::workspace::NextFile, None),
+        ]);
+    });
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    let open = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            let repo = ws.repo.as_ref().unwrap();
+            repo.file.as_ref().map(|f| repo.work[f.index].change.path.clone())
+        })
+    };
+
+    // Type in the message box: the arrows are the box's.
+    cx.update(|window, cx| ws.read(cx).commit_input.read(cx).focus(window));
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(open(&ws, cx), None, "typing, the arrows do not open files");
+
+    // Click a file, then Down: the next file opens.
+    let first = center_of(cx, "change-0".into());
+    click(cx, MouseButton::Left, first);
+    cx.run_until_parked();
+    assert_eq!(open(&ws, cx).as_deref(), Some("README.md"));
+    draw(cx, &ws);
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(open(&ws, cx).as_deref(), Some("z.txt"));
+    cx.simulate_keystrokes("up");
+    cx.run_until_parked();
+    assert_eq!(open(&ws, cx).as_deref(), Some("README.md"));
+}
+
+#[gpui::test]
+async fn one_person_under_two_identities_gets_one_profile(cx: &mut TestAppContext) {
+    let fx = fixture("people");
+    // Ada (the fixture's own identity) commits work authored under her GitHub identity.
+    fx.write("c.txt", "c\n");
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "from github", "--author=Ada L <123+ada@users.noreply.github.com>"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+
+    let people = ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
+        Phase::Ready(view) => view.entries.iter().map(|e| (e.author.to_string(), e.person.clone())).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    });
+    let (github, local) = (&people[0], &people[1]);
+    assert_eq!((github.0.as_str(), local.0.as_str()), ("Ada L", "Ada"), "each commit keeps its own name");
+    assert_eq!(github.1, local.1, "but both are one person");
+    assert_eq!(local.1.name, "Ada", "named as she commits most");
+    assert_eq!(local.1.avatar_email, "123+ada@users.noreply.github.com", "pictured by her GitHub account");
 }

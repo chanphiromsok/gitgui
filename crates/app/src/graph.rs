@@ -8,28 +8,56 @@ use std::collections::{HashMap, HashSet};
 
 use gitgui_core::{
     Commit, CommitKind, Evidence, Half, Label, LabelKind, LaneLayout, Lineage, MergeClue, Placed, RefKind, Row, Stroke,
-    commit_kind, commit_rank, descendants, group_by_parent, labels, lineage_names,
+    People, Person, WebRemote, subject_pr,
+    commit_branches, commit_kind, commit_rank, conventional_prefix, descendants, group_by_parent, labels, lineage_names,
 };
 use gpui::{
-    BorderStyle, Bounds, Context, FontWeight, MouseButton, PathBuilder, Pixels, Rgba, SharedString, Window, canvas,
+    BorderStyle, Bounds, Context, FontWeight, MouseButton, PathBuilder, Pixels, Rgba, SharedString, StyledText, Window, canvas,
     div, point, prelude::*, px, quad, rgb, size,
 };
 
+use crate::avatars::Avatar;
+use crate::icons;
 use crate::menu::MenuTarget;
-use crate::ui::{self, BG, HEAD_ROW, HOVER, MONO, MUTED, SELECTED, TEXT, line_color};
+use crate::ui::{self, MONO, line_color};
 use crate::workspace::Workspace;
+use crate::theme::t;
 
 pub const ROW_H: f32 = 26.0;
-const LANE_W: f32 = 16.0;
-const DOT_R: f32 = 4.5;
+/// How tightly the graph is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Density {
+    /// Distance between lanes.
+    pub lane_w: f32,
+    pub dot_r: f32,
+    /// How wide a commit's node is: a circle with its author's initials.
+    pub node: f32,
+    /// Thickness of a line; the selected line is a step thicker.
+    pub line: f32,
+}
+
+impl Density {
+    pub const ROOMY: Density = Density { lane_w: 20., dot_r: 4.5, line: 2., node: 17. };
+    /// Narrow lanes and thin lines, so a busy history leaves room for the messages.
+    pub const COMPACT: Density = Density { lane_w: 14., dot_r: 3.2, line: 1.5, node: 13. };
+
+    pub fn of(compact: bool) -> Self {
+        if compact { Self::COMPACT } else { Self::ROOMY }
+    }
+
+    /// Where a lane's center is, from the graph's left edge.
+    fn x(&self, lane: usize) -> f32 {
+        lane.min(MAX_DRAWN_LANES) as f32 * self.lane_w + self.lane_w / 2.
+    }
+}
 pub const MAX_DRAWN_LANES: usize = 14;
-const GRAY_LINE: u32 = 0x808080;
 const DATE_COMPACT_W: f32 = 120.;
 /// How much of a branch line's color remains when another line is in front.
 const DIMMED: f32 = 0.22;
+/// How much remains of a commit, and a line, that is not part of the current branch's history.
+const OFF_BRANCH: f32 = 0.45;
 /// How far each level of a group is pushed in, and the color of the guide beside it.
 const INDENT: f32 = 18.;
-const GUIDE: u32 = 0x4a4f57;
 
 /// How the dot of a row is drawn.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,8 +88,15 @@ pub struct Entry {
     pub merge: bool,
     pub labels: Vec<Label>,
     pub summary: SharedString,
+    /// The pull request this commit merged or squashed, and its page.
+    pub pr: Option<(u32, SharedString)>,
+    /// How much of the summary is a conventional-commit prefix (`fix(ui):`), drawn bold; 0 for none.
+    pub prefix: usize,
     pub date: SharedString,
     pub author: SharedString,
+    /// The person behind the author, however many identities they commit under: one picture, one
+    /// set of initials and one color for all of them.
+    pub person: Person,
     pub short_id: SharedString,
     /// The full commit id; `None` for the working-tree row.
     pub commit: Option<String>,
@@ -75,6 +110,24 @@ pub struct Entry {
     pub group_size: usize,
     /// Those commits are hidden.
     pub collapsed: bool,
+    /// The commit is not in the current branch's history: it is drawn softer.
+    pub off_branch: bool,
+    /// Branch lines through this row that have nothing in the current branch's history.
+    pub off_lines: Vec<usize>,
+    /// A search is on and did not find this commit.
+    pub search_miss: bool,
+}
+
+/// Where the current branch stands against the branch it was cut from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Base {
+    pub name: String,
+    /// The commit it was branched from.
+    pub fork: String,
+    /// Commits on the current branch that the base does not have.
+    pub ahead: usize,
+    /// Commits on the base that the current branch does not have.
+    pub behind: usize,
 }
 
 /// How the commits are arranged.
@@ -87,6 +140,10 @@ pub struct Options<'a> {
     pub squashed: &'a HashMap<String, String>,
     /// Commits whose group is folded away.
     pub collapsed: &'a HashSet<String>,
+    /// The repository's web home, to link pull requests to.
+    pub web: Option<&'a WebRemote>,
+    /// Who is who among the authors.
+    pub people: Option<&'a People>,
 }
 
 pub struct Built {
@@ -94,6 +151,20 @@ pub struct Built {
     pub widest: usize,
     pub lineages: Vec<Lineage>,
     pub names: Vec<Option<String>>,
+    pub base: Option<Base>,
+}
+
+/// `start` and every commit it comes from, among `commits`.
+fn history<'a>(start: &'a str, by_id: &HashMap<&'a str, &'a Commit>) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut todo = vec![start];
+    while let Some(id) = todo.pop() {
+        let Some(commit) = by_id.get(id) else { continue };
+        if seen.insert(commit.id.as_str()) {
+            todo.extend(commit.parents.iter().map(String::as_str));
+        }
+    }
+    seen
 }
 
 /// Arranges `commits` (newest first) as table rows, preceded by an "Uncommitted Changes" row when
@@ -101,6 +172,8 @@ pub struct Built {
 pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
     let changed = options.changed;
     let head = commits.iter().find(|c| c.refs.iter().any(|r| r.kind == RefKind::Head));
+    let by_id: HashMap<&str, &Commit> = commits.iter().map(|c| (c.id.as_str(), c)).collect();
+    let head_history = head.map(|head| history(&head.id, &by_id));
 
     // The order to show them in, and which are folded away.
     let placed: Vec<Placed> = if options.group {
@@ -131,12 +204,13 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
     if changed > 0 {
         // The working tree hangs off the commit HEAD is on, like a commit not made yet.
         let parents: Vec<&str> = head.map(|c| c.id.as_str()).into_iter().collect();
-        rows.push(layout.push_ranked("uncommitted", &parents, head.map_or(0, commit_rank)));
+        let branches = head.map(commit_branches).unwrap_or_default();
+        rows.push(layout.push_branch("uncommitted", &parents, head.map_or(0, commit_rank), &branches));
     }
     for commit in &ordered {
         let parents: Vec<&str> =
             commit.parents.iter().map(String::as_str).filter(|p| !hidden.contains(p)).collect();
-        rows.push(layout.push_ranked(&commit.id, &parents, commit_rank(commit)));
+        rows.push(layout.push_branch(&commit.id, &parents, commit_rank(commit), &commit_branches(commit)));
     }
     let lineages = layout.lineages().to_vec();
     let names = lineage_names(&lineages, |row| match row.checked_sub(offset) {
@@ -155,8 +229,11 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             merge: false,
             labels: Vec::new(),
             summary: SharedString::from(format!("Uncommitted Changes ({changed})")),
+            pr: None,
+            prefix: 0,
             date: SharedString::default(),
             author: SharedString::from("*"),
+            person: Person { name: String::new(), email: String::new(), avatar_email: String::new() },
             short_id: SharedString::from("*"),
             commit: None,
             notes: Vec::new(),
@@ -164,6 +241,9 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             kind: CommitKind::Commit,
             group_size: 0,
             collapsed: false,
+            off_branch: false,
+            off_lines: Vec::new(),
+            search_miss: false,
         });
     }
     for ((commit, row), (placed, size)) in ordered.iter().zip(rows).zip(&shown) {
@@ -175,8 +255,16 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             merge: commit.is_merge(),
             labels: labels(&commit.refs),
             summary: SharedString::from(commit.summary.clone()),
+            pr: subject_pr(&commit.summary)
+                .and_then(|n| Some((n, SharedString::from(options.web?.pull_request(n))))),
+            prefix: conventional_prefix(&commit.summary).unwrap_or(0),
             date: SharedString::from(commit.date.clone()),
             author: SharedString::from(commit.author.clone()),
+            person: options.people.and_then(|p| p.of(&commit.email)).cloned().unwrap_or_else(|| Person {
+                name: commit.author.clone(),
+                email: commit.email.clone(),
+                avatar_email: commit.email.clone(),
+            }),
             short_id: SharedString::from(commit.short_id().to_owned()),
             commit: Some(commit.id.clone()),
             notes: Vec::new(),
@@ -184,10 +272,44 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             kind: commit_kind(commit),
             group_size: *size,
             collapsed: *size > 0 && options.collapsed.contains(&commit.id),
+            off_branch: head_history.as_ref().is_some_and(|seen| !seen.contains(commit.id.as_str())),
+            off_lines: Vec::new(),
+            search_miss: false,
         });
     }
+
+    // A line with none of its commits in the current branch's history steps back with them.
+    let mut on_lines = vec![false; lineages.len()];
+    for entry in entries.iter().filter(|entry| !entry.off_branch) {
+        on_lines[entry.row.lineage] = true;
+    }
+    for entry in &mut entries {
+        let mut off: Vec<usize> = std::iter::once(entry.row.lineage)
+            .chain(entry.row.strokes.iter().map(|stroke| stroke.lineage))
+            .filter(|&line| !on_lines[line])
+            .collect();
+        off.sort_unstable();
+        off.dedup();
+        entry.off_lines = off;
+    }
+
+    let base = head.zip(head_history.as_ref()).and_then(|(head, head_history)| {
+        let line = entries.iter().find(|entry| entry.commit.as_deref() == Some(head.id.as_str()))?.row.lineage;
+        let base_line = lineages[line].base?;
+        let commit_at = |row: usize| row.checked_sub(offset).and_then(|i| ordered.get(i).copied());
+        let fork = commit_at(lineages[line].fork_row?)?;
+        let base_tip = commit_at(lineages[base_line].tip_row)?;
+        let base_history = history(&base_tip.id, &by_id);
+        Some(Base {
+            name: names[base_line].clone()?,
+            fork: fork.id.clone(),
+            ahead: head_history.difference(&base_history).count(),
+            behind: base_history.difference(head_history).count(),
+        })
+    });
+
     let widest = entries.iter().map(|entry| entry.row.width).max().unwrap_or(1);
-    Built { entries, widest, lineages, names }
+    Built { entries, widest, lineages, names, base }
 }
 
 /// The names of the branch lines that end at this row because they were branched from its commit.
@@ -239,8 +361,8 @@ pub fn apply_clues(entries: &mut [Entry], clues: &[MergeClue]) {
     }
 }
 
-pub fn graph_width(widest_lanes: usize) -> f32 {
-    widest_lanes.min(MAX_DRAWN_LANES + 1) as f32 * LANE_W + 8.
+pub fn graph_width(widest_lanes: usize, density: Density) -> f32 {
+    widest_lanes.min(MAX_DRAWN_LANES + 1) as f32 * density.lane_w + 8.
 }
 
 /// `compact` drops the Author and Commit columns, to leave room beside the file pane.
@@ -253,43 +375,44 @@ pub fn columns(graph_width: f32, compact: bool) -> impl IntoElement {
         .flex()
         .items_center()
         .gap_2()
-        .bg(rgb(ui::PANEL))
+        .bg(rgb(t().panel))
         .border_b_1()
-        .border_color(rgb(ui::BORDER))
+        .border_color(rgb(t().border))
         .child(cell("Graph").w(px(graph_width)))
         .child(cell("Description").flex_1())
         .child(cell("Date").w(px(if compact { DATE_COMPACT_W } else { 130. })))
         .when(!compact, |row| row.child(cell("Author").w(px(130.))).child(cell("Commit").w(px(64.))))
 }
 
-fn faded(color: Rgba) -> Rgba {
-    Rgba { a: DIMMED, ..color }
+fn faded(color: Rgba, alpha: f32) -> Rgba {
+    Rgba { a: color.a.min(alpha), ..color }
 }
 
 /// A branch, tag, remote branch or stash on a commit. Right-click for its menu.
 fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
     let (bg, fg) = match label.kind {
-        LabelKind::Branch => (line_color(lineage), rgb(0x111111)),
-        LabelKind::RemoteBranch => (rgb(0x3a3d41), rgb(0xcccccc)),
+        LabelKind::Branch => (line_color(lineage), rgb(ui::text_on(t().lane(lineage)))),
+        LabelKind::RemoteBranch => (rgb(t().element), rgb(t().text)),
         LabelKind::Tag => (rgb(0x6b5b1e), rgb(0xfff3c4)),
         LabelKind::Stash => (rgb(0x23a455), rgb(0x0b1f12)),
     };
+    // A cloud says the branch is on a remote too (or only there), the way other clients mark it,
+    // instead of a separate `origin` tag beside it.
+    let on_remote = label.kind == LabelKind::RemoteBranch || !label.remotes.is_empty();
+    let fg_color = u32::from(fg) >> 8;
     let name = div()
         .px_1p5()
+        .flex()
+        .items_center()
+        .gap_1()
         .bg(bg)
         .text_color(fg)
         .when(label.head, |name| name.font_weight(FontWeight::BOLD))
+        .when(on_remote, |name| {
+            name.child(gpui::img(icons::remote(fg_color)).flex_none().size(px(11.)))
+                .when(label.remotes.len() > 1, |name| name.child(format!("{}", label.remotes.len())))
+        })
         .child(SharedString::from(label.name.clone()));
-    let remotes = label.remotes.iter().map(|remote| {
-        div()
-            .px_1p5()
-            .italic()
-            .text_color(rgb(0xcccccc))
-            .border_l_1()
-            .border_color(rgb(BG))
-            .bg(rgb(0x3a3d41))
-            .child(SharedString::from(remote.clone()))
-    });
 
     let target = MenuTarget::Label(label.clone());
     // A detached HEAD is not a branch; right-clicking it gives the commit's menu, so let the row have it.
@@ -305,7 +428,7 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
         .overflow_hidden()
         .text_xs()
         .cursor_pointer()
-        .when(label.head, |badge| badge.border_2().border_color(rgb(0xffffff)))
+        .when(label.head, |badge| badge.border_2().border_color(rgb(t().text_strong)))
         // The menu for this badge only; the row's own menu must not also open.
         .on_mouse_down(
             MouseButton::Right,
@@ -317,7 +440,21 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
             }),
         )
         .child(name)
-        .children(remotes)
+}
+
+/// The summary, its conventional-commit prefix (`docs:`, `fix(ui):`) in bold so the kind of change
+/// reads at a glance.
+fn summary_text(entry: &Entry) -> StyledText {
+    let text = StyledText::new(entry.summary.clone());
+    if entry.prefix == 0 || entry.merge {
+        return text;
+    }
+    let bold = gpui::HighlightStyle {
+        font_weight: Some(FontWeight::BOLD),
+        color: Some(rgb(t().text_strong).into()),
+        ..Default::default()
+    };
+    text.with_highlights([(0..entry.prefix, bold)])
 }
 
 fn chip(text: SharedString, color: u32, probable: bool) -> impl IntoElement {
@@ -334,19 +471,25 @@ fn chip(text: SharedString, color: u32, probable: bool) -> impl IntoElement {
 }
 
 // `use<>`: edition 2024 would otherwise tie the element to the borrowed entry.
+#[allow(clippy::too_many_arguments)]
 pub fn render_entry(
     ix: usize,
     entry: &Entry,
+    avatar: Avatar,
     graph_width: f32,
     selected: bool,
     highlight: Option<usize>,
     compact: bool,
+    density: Density,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
     let strokes = entry.row.strokes.clone();
     let lane = entry.row.lane;
     let lineage = entry.row.lineage;
     let fork_line = entry.row.joins.first().copied();
+    let off_lines = entry.off_lines.clone();
+    let off_branch = entry.off_branch || entry.search_miss;
+    let search_miss = entry.search_miss;
     let dot = entry.dot;
     let current = dot == Dot::Current;
     let uncommitted = dot == Dot::Uncommitted;
@@ -367,19 +510,30 @@ pub fn render_entry(
 
     let depth = entry.depth;
     let kind = entry.kind;
-    let toggle = (entry.group_size > 0).then(|| (entry.commit.clone(), entry.collapsed, entry.group_size));
+    // A commit with commits listed under it folds them with a chevron drawn on its dot.
+    let fold = (entry.group_size > 0).then_some(entry.collapsed);
+    // Any other commit is drawn as its author's initials; it steps back like its line does.
+    let node = (fold.is_none() && dot != Dot::Uncommitted).then(|| {
+        let alpha = match highlight {
+            Some(h) if h != lineage => DIMMED,
+            Some(_) => 1.,
+            None if off_branch => OFF_BRANCH,
+            None => 1.,
+        };
+        // The same picture, or initials and color, as the Author column shows for the person.
+        let face = ui::avatar(&entry.person.name, &entry.person.email, avatar.clone(), density.node - if current { 8. } else { 4. });
+        (face, t().lane(lineage), alpha)
+    });
+    let fold_commit = entry.commit.clone();
     let mut chips: Vec<gpui::AnyElement> = Vec::new();
-    if !entry.forks.is_empty() {
-        chips.push(chip(format!("branch point · {}", entry.forks.join(", ")).into(), 0x9aa5b1, false).into_any_element());
-    }
     for note in &entry.notes {
-        chips.push(chip(note.text.clone(), 0x4ec9b0, note.probable).into_any_element());
+        chips.push(chip(note.text.clone(), t().added, note.probable).into_any_element());
     }
     if entry.collapsed {
-        chips.push(chip(format!("{} commits folded", entry.group_size).into(), 0x9aa5b1, false).into_any_element());
+        chips.push(chip(format!("{} commits folded", entry.group_size).into(), t().muted, false).into_any_element());
     }
 
-    let text_color = if entry.merge { rgb(MUTED) } else { rgb(TEXT) };
+    let text_color = if entry.merge { rgb(t().muted) } else { rgb(t().text) };
     let commit = entry.commit.is_some();
     let target = entry.commit.clone().map(MenuTarget::Commit);
 
@@ -393,9 +547,9 @@ pub fn render_entry(
         .items_center()
         .gap_2()
         .cursor_pointer()
-        .when(current, |row| row.bg(rgb(HEAD_ROW)))
-        .when(selected, |row| row.bg(rgb(SELECTED)))
-        .hover(|style| style.bg(if selected { rgb(SELECTED) } else { rgb(HOVER) }))
+        .when(current, |row| row.bg(rgb(t().head_row)))
+        .when(selected, |row| row.bg(rgb(t().selected)))
+        .hover(|style| style.bg(if selected { rgb(t().selected) } else { rgb(t().hover) }))
         .on_click(cx.listener(move |this, _event, _window, cx| this.select_entry(ix, cx)))
         .when(commit, |row| {
             row.on_mouse_down(
@@ -409,12 +563,61 @@ pub fn render_entry(
             )
         })
         .child(
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, _| paint_lanes(bounds, &strokes, lane, lineage, fork_line, dot, highlight, window),
-            )
-            .w(px(graph_width))
-            .h(px(ROW_H)),
+            div()
+                .relative()
+                .flex_none()
+                .w(px(graph_width))
+                .h(px(ROW_H))
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let lines = Lines { lineage, fork_line, off_lines: &off_lines, off_branch, highlight };
+                            paint_lanes(bounds, &strokes, lane, &lines, dot, fold, density, window)
+                        },
+                    )
+                    .size_full(),
+                )
+                .when_some(node, |cell, (face, lane_color, alpha)| {
+                    // The commit's node: its author's face, ringed in its branch's color (and in white
+                    // for the commit HEAD is on).
+                    let d = density.node;
+                    cell.child(
+                        div()
+                            .absolute()
+                            .left(px(density.x(lane) - d / 2.))
+                            .top(px((ROW_H - d) / 2.))
+                            .size(px(d))
+                            .rounded_full()
+                            .bg(rgb(lane_color))
+                            .opacity(alpha)
+                            .when(current, |node| node.border_2().border_color(rgb(t().text_strong)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(face),
+                    )
+                })
+                .when(fold.is_some(), |cell| {
+                    let hit = 18.;
+                    cell.child(
+                        div()
+                            .id(("fold", ix))
+                            .debug_selector(move || format!("fold-{ix}"))
+                            .absolute()
+                            .left(px(density.x(lane) - hit / 2.))
+                            .top(px((ROW_H - hit) / 2.))
+                            .size(px(hit))
+                            .rounded_full()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(commit) = fold_commit.clone() {
+                                    this.toggle_group(&commit, cx);
+                                }
+                            })),
+                    )
+                }),
         )
         .child(
             div()
@@ -423,6 +626,8 @@ pub fn render_entry(
                 .min_w_0()
                 .h_full()
                 .pl(px(depth as f32 * INDENT))
+                .when(off_branch && !search_miss, |cell| cell.opacity(0.6))
+                .when(search_miss, |cell| cell.opacity(0.3))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -435,26 +640,8 @@ pub fn render_entry(
                         .bottom_0()
                         .left(px((level as f32 - 1.) * INDENT + 6.))
                         .w(px(1.))
-                        .bg(rgb(GUIDE))
+                        .bg(rgb(t().guide))
                 }))
-                .child(match toggle {
-                    Some((commit, collapsed, _)) => div()
-                        .id(("fold", ix))
-                        .flex_none()
-                        .w(px(14.))
-                        .text_color(rgb(MUTED))
-                        .cursor_pointer()
-                        .hover(|style| style.text_color(rgb(0xffffff)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            if let Some(commit) = commit.clone() {
-                                this.toggle_group(&commit, cx);
-                            }
-                        }))
-                        .child(if collapsed { "▸" } else { "▾" })
-                        .into_any_element(),
-                    None => div().flex_none().w(px(if depth > 0 { 0. } else { 14. })).into_any_element(),
-                })
                 .child(ui::kind_icon(kind))
                 .children(badges)
                 .child(
@@ -465,8 +652,23 @@ pub fn render_entry(
                         .text_ellipsis()
                         .text_color(text_color)
                         .when(uncommitted || current, |text| text.font_weight(FontWeight::BOLD))
-                        .child(entry.summary.clone()),
+                        .child(summary_text(entry)),
                 )
+                .children(entry.pr.clone().map(|(number, url)| {
+                    // The pull request's page, in the browser.
+                    div()
+                        .id(("pr", ix))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(rgb(t().link))
+                        .cursor_pointer()
+                        .hover(|style| style.underline())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.open_url(&url);
+                        })
+                        .child(format!("#{number} ↗"))
+                }))
                 .children(chips),
         )
         .child(
@@ -475,7 +677,7 @@ pub fn render_entry(
                 .flex_none()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_color(rgb(MUTED))
+                .text_color(rgb(t().muted))
                 .child(entry.date.clone()),
         )
         .when(!compact, |row| {
@@ -483,36 +685,61 @@ pub fn render_entry(
                 div()
                     .w(px(130.))
                     .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_color(rgb(MUTED))
-                    .child(entry.author.clone()),
+                    .text_color(rgb(t().muted))
+                    .when(entry.commit.is_some(), |cell| cell.child(ui::avatar(&entry.person.name, &entry.person.email, avatar, 16.)))
+                    .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(entry.author.clone())),
             )
-            .child(div().w(px(64.)).flex_none().font_family(MONO).text_color(rgb(MUTED)).child(entry.short_id.clone()))
+            .child(div().w(px(64.)).flex_none().font_family(MONO).text_color(rgb(t().muted)).child(entry.short_id.clone()))
         })
 }
 
+/// Which branch lines a row draws, and how strongly.
+struct Lines<'a> {
+    /// The line of the row's commit.
+    lineage: usize,
+    /// The first line branched from this commit.
+    fork_line: Option<usize>,
+    /// Lines that are not part of the current branch's history.
+    off_lines: &'a [usize],
+    /// The commit itself is not part of it.
+    off_branch: bool,
+    /// The selected commit's line.
+    highlight: Option<usize>,
+}
+
+/// `fold` is set for a commit that has commits listed under it: whether they are folded away.
 #[allow(clippy::too_many_arguments)]
 fn paint_lanes(
     bounds: Bounds<Pixels>,
     strokes: &[Stroke],
     lane: usize,
-    lineage: usize,
-    fork_line: Option<usize>,
+    lines: &Lines,
     dot: Dot,
-    highlight: Option<usize>,
+    fold: Option<bool>,
+    density: Density,
     window: &mut Window,
 ) {
-    let x = |lane: usize| bounds.origin.x + px(lane.min(MAX_DRAWN_LANES) as f32 * LANE_W + LANE_W / 2.);
+    let Lines { lineage, fork_line, off_lines, off_branch, highlight } = *lines;
+    let dot_r = density.dot_r;
+    let x = |lane: usize| bounds.origin.x + px(density.x(lane));
     let top = bounds.origin.y;
     let mid = top + bounds.size.height / 2.;
     let bottom = top + bounds.size.height;
     let gray = dot == Dot::Uncommitted;
-    // With a line selected, every other line steps back.
+    // With a line selected, every other line steps back; otherwise what the current branch does
+    // not have steps back a little.
     let tone = |line: usize| {
-        let color = if gray { rgb(GRAY_LINE) } else { line_color(line) };
-        if highlight.is_some_and(|h| h != line) { faded(color) } else { color }
+        let color = if gray { rgb(t().muted) } else { line_color(line) };
+        match highlight {
+            Some(h) if h != line => faded(color, DIMMED),
+            Some(_) => color,
+            None if off_lines.contains(&line) => faded(color, OFF_BRANCH),
+            None => color,
+        }
     };
 
     // Dimmed lines first, so the selected line is drawn over any crossing.
@@ -535,7 +762,7 @@ fn paint_lanes(
                 (from, to, from)
             }
         };
-        let mut line = PathBuilder::stroke(px(if highlight == Some(stroke.lineage) { 3. } else { 2. }));
+        let mut line = PathBuilder::stroke(px(density.line + if highlight == Some(stroke.lineage) { 1. } else { 0. }));
         line.move_to(from);
         if from.x == to.x {
             line.line_to(to);
@@ -548,7 +775,7 @@ fn paint_lanes(
     }
 
     let center = point(x(lane), mid);
-    let color = tone(lineage);
+    let color = if off_branch && highlight.is_none() { faded(tone(lineage), OFF_BRANCH) } else { tone(lineage) };
     let mut circle = |radius: f32, fill: Rgba, border: f32, border_color: Rgba| {
         window.paint_quad(quad(
             Bounds { origin: point(center.x - px(radius), center.y - px(radius)), size: size(px(radius * 2.), px(radius * 2.)) },
@@ -560,16 +787,80 @@ fn paint_lanes(
         ));
     };
     // A commit other branches were branched from gets a ring in the color of the first of them.
-    if let Some(line) = fork_line.filter(|_| dot != Dot::Current) {
-        circle(DOT_R + 3.5, rgb(BG), 1.5, tone(line));
+    if let Some(line) = fork_line.filter(|_| dot != Dot::Current && fold.is_none()) {
+        circle(density.node / 2. + 2.5, rgb(t().bg), 1.5, tone(line));
+    }
+    if let Some(folded) = fold {
+        // A ring with a chevron in it: down while the commits under it show, right while folded.
+        let r = dot_r + 3.;
+        if dot == Dot::Current {
+            circle(r + 2.5, rgb(t().bg), 2., rgb(t().text_strong));
+        }
+        circle(r, rgb(t().bg), 1.5, color);
+        let a = r * 0.45;
+        let points = if folded {
+            [(-a * 0.5, -a), (a * 0.6, 0.), (-a * 0.5, a)]
+        } else {
+            [(-a, -a * 0.5), (0., a * 0.6), (a, -a * 0.5)]
+        };
+        let mut chevron = PathBuilder::stroke(px(1.5));
+        chevron.move_to(point(center.x + px(points[0].0), center.y + px(points[0].1)));
+        for (dx, dy) in &points[1..] {
+            chevron.line_to(point(center.x + px(*dx), center.y + px(*dy)));
+        }
+        if let Ok(path) = chevron.build() {
+            window.paint_path(path, color);
+        }
+        return;
     }
     match dot {
-        Dot::Filled => circle(DOT_R, color, 0., rgb(BG)),
-        Dot::Current => {
-            // Ring first, so the filled dot sits inside it.
-            circle(DOT_R + 4., rgb(BG), 2., rgb(0xffffff));
-            circle(DOT_R, color, 0., rgb(BG));
+        // A commit's node, with its author's initials, is drawn over the lines by the row.
+        Dot::Filled | Dot::Current => {}
+        Dot::Uncommitted => circle(dot_r, rgb(t().bg), 2., color),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitgui_core::Ref;
+
+    fn commit(id: &str, parents: &[&str], refs: &[(&str, RefKind)]) -> Commit {
+        Commit {
+            id: id.into(),
+            parents: parents.iter().map(|p| (*p).into()).collect(),
+            author: "A".into(),
+            email: "a@b".into(),
+            time: 0,
+            date: String::new(),
+            summary: id.into(),
+            refs: refs.iter().map(|(name, kind)| Ref { name: (*name).into(), kind: *kind }).collect(),
+            stash: None,
+            committer: String::new(),
+            committer_email: String::new(),
         }
-        Dot::Uncommitted => circle(DOT_R, rgb(BG), 2., color),
+    }
+
+    #[test]
+    fn the_current_branch_knows_its_base_and_what_it_lacks_steps_back() {
+        // docs: d1 on top of r1. feat (HEAD): f1 on r1. release: r1 -> r0.
+        let commits = [
+            commit("d1", &["r1"], &[("docs", RefKind::LocalBranch)]),
+            commit("f1", &["r1"], &[("HEAD", RefKind::Head), ("feat", RefKind::LocalBranch)]),
+            commit("r1", &["r0"], &[("release/1.0.0", RefKind::LocalBranch)]),
+            commit("r0", &[], &[]),
+        ];
+        let built = build_entries(
+            &commits,
+            &Options { changed: 0, group: false, squashed: &HashMap::new(), collapsed: &HashSet::new(), web: None, people: None },
+        );
+        let off: Vec<bool> = built.entries.iter().map(|e| e.off_branch).collect();
+        assert_eq!(off, [true, false, false, false]);
+        assert_eq!(built.entries[0].off_lines, [built.entries[0].row.lineage]);
+        assert!(built.entries[1].off_lines.iter().all(|&line| line != built.entries[1].row.lineage));
+        assert_eq!(
+            built.base,
+            Some(Base { name: "release/1.0.0".into(), fork: "r1".into(), ahead: 1, behind: 0 })
+        );
     }
 }

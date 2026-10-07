@@ -5,27 +5,50 @@ use gpui::{
     BorderStyle, Bounds, ElementId, PathBuilder, Pixels, Point, Rgba, SharedString, Stateful, Window, canvas, div, point,
     prelude::*, px, quad, rgb, size,
 };
+use crate::theme::t;
 
-pub const BG: u32 = 0x1e1e1e;
-pub const PANEL: u32 = 0x252526;
-pub const BORDER: u32 = 0x333333;
-pub const TEXT: u32 = 0xd4d4d4;
-pub const MUTED: u32 = 0x858585;
-pub const ACCENT: u32 = 0x4fc1ff;
-pub const LINK: u32 = 0x3794ff;
-pub const SELECTED: u32 = 0x264f78;
-pub const HOVER: u32 = 0x2a2d2e;
-pub const HEAD_ROW: u32 = 0x1b2a38;
-pub const ADDED: u32 = 0x4ec9b0;
-pub const REMOVED: u32 = 0xf48771;
-pub const MODIFIED: u32 = 0xe5c07b;
-pub const WARNING: u32 = 0xe5c07b;
 
-const LANE_COLORS: [u32; 8] = [0x4fc1ff, 0xc586c0, 0xdcdcaa, 0x4ec9b0, 0xce9178, 0x569cd6, 0xb5cea8, 0xd16969];
-
-/// The color of a branch line. Lines are numbered in the order they start, so neighbors differ.
+/// The color of a branch line, from the theme's accents. Lines are numbered in the order they
+/// start, so neighbors differ.
 pub fn line_color(lineage: usize) -> Rgba {
-    rgb(LANE_COLORS[lineage % LANE_COLORS.len()])
+    rgb(t().lane(lineage))
+}
+
+/// A file or folder icon, 14 pixels square; empty space when there is none.
+pub fn file_icon(image: Option<std::sync::Arc<gpui::RenderImage>>) -> gpui::AnyElement {
+    match image {
+        Some(image) => gpui::img(image).flex_none().size(px(14.)).into_any_element(),
+        None => div().flex_none().size(px(14.)).into_any_element(),
+    }
+}
+
+/// An author's picture in a circle `size` pixels across, or their initials on their own color.
+pub fn avatar(name: &str, email: &str, avatar: crate::avatars::Avatar, size: f32) -> gpui::AnyElement {
+    use crate::avatars::{Avatar, hue, initials};
+    match avatar {
+        Avatar::Picture(image) => gpui::img(image).flex_none().size(px(size)).rounded_full().into_any_element(),
+        Avatar::Pending | Avatar::None => {
+            let color = t().lane(hue(email));
+            div()
+                .flex_none()
+                .size(px(size))
+                .rounded_full()
+                .bg(rgb(color))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(text_on(color)))
+                .text_size(px(size * 0.45))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(initials(name))
+                .into_any_element()
+        }
+    }
+}
+
+/// Dark or light text, whichever reads on `background`.
+pub fn text_on(background: u32) -> u32 {
+    crate::theme::text_on(background)
 }
 
 pub const PR_COLOR: u32 = 0xa371f7;
@@ -53,7 +76,7 @@ fn paint_icon(kind: CommitKind, bounds: Bounds<Pixels>, window: &mut Window) {
         window.paint_quad(quad(
             Bounds { origin: point(center.x - px(radius), center.y - px(radius)), size: size(px(radius * 2.), px(radius * 2.)) },
             px(radius),
-            rgb(BG),
+            rgb(t().bg),
             1.4,
             color,
             BorderStyle::default(),
@@ -98,10 +121,10 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> State
         .flex()
         .items_center()
         .rounded_sm()
-        .bg(rgb(0x3a3d41))
+        .bg(rgb(t().element))
         .text_xs()
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(0x4a4d51)))
+        .hover(|style| style.bg(rgb(t().element_hover)))
         .child(label.into())
 }
 
