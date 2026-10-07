@@ -612,7 +612,10 @@ fn read_commit(path: &Path, id: &str, wanted: impl Fn() -> bool) -> Option<Resul
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self::with_store(Store::open_default(), cx)
+        let this = Self::with_store(Store::open_default(), cx);
+        // The graph's look is process-wide, like the color theme; only the app itself sets it from the saved choice.
+        crate::graph_style::set_active(&this.settings.graph_style);
+        this
     }
 
     /// Like `new`, with the store given: tests pass one that points at a scratch folder.
@@ -1806,6 +1809,18 @@ impl Workspace {
             self.save_settings();
             cx.notify();
         }
+    }
+
+    /// The graph's look, by id (see `graph_style::STYLES`). Kept for the next launch.
+    pub fn set_graph_style(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(style) = crate::graph_style::STYLES.iter().find(|s| s.id == id) else { return };
+        crate::graph_style::set_active(style.id);
+        if self.settings.graph_style != style.id {
+            self.settings.graph_style = style.id.to_owned();
+            self.save_settings();
+        }
+        cx.refresh_windows();
+        cx.notify();
     }
 
     /// How large the graph is drawn, in percent. Kept for the next launch.

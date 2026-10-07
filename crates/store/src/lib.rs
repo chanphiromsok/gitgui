@@ -112,6 +112,8 @@ pub struct Settings {
     pub review_layout: ReviewLayout,
     /// How large the graph is drawn (commit circles, lanes, row height), in percent. 100 is the default.
     pub graph_scale: u32,
+    /// The graph's look (its colors, how lines bend, how commits are marked), by id; `theme` follows the color theme.
+    pub graph_style: String,
 }
 
 /// The smallest and largest graph scale, in percent; a saved value outside is brought inside.
@@ -137,6 +139,7 @@ impl Default for Settings {
             file_layout: FileLayout::Tree,
             diff_mode: DiffMode::Split,
             graph_scale: 100,
+            graph_style: "theme".to_owned(),
             graph_faces: GraphFaces::Tips,
             review_layout: ReviewLayout::Below,
             last_project: None,
@@ -622,6 +625,15 @@ mod tests {
         assert_eq!(store.settings().unwrap().last_project, None);
         store.save_settings(&Settings { last_project: Some(PathBuf::from("/work/app")), ..Settings::default() }).unwrap();
         assert_eq!(scratch.store().settings().unwrap().last_project, Some(PathBuf::from("/work/app")));
+    }
+
+    #[test]
+    fn the_graph_style_defaults_to_the_theme_and_is_remembered() {
+        let scratch = Scratch::new("graph-style");
+        let store = scratch.store();
+        assert_eq!(store.settings().unwrap().graph_style, "theme");
+        store.save_settings(&Settings { graph_style: "aurora".into(), ..Settings::default() }).unwrap();
+        assert_eq!(scratch.store().settings().unwrap().graph_style, "aurora");
     }
 
     #[test]

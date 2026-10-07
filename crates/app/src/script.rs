@@ -12,7 +12,7 @@
 //! file 0                  open the commit's nth changed file
 //! mode split|unified      layout tree|flat      expand      back      more
 //! search <text>   fill the search box (author:… date:… words)      menu authors|dates X Y   open that chip's menu
-//! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light
+//! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light      style <id>   graph style, e.g. style neon
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
 //! settings [graph|files|appearance|projects]
@@ -51,8 +51,16 @@ pub fn run(window: WindowHandle<Workspace>, file: String, cx: &mut App) {
             match word {
                 "wait" => pause(rest.parse().unwrap_or(500)).await,
                 "shot" => {
-                    // A frame to draw what the last step did.
-                    pause(700).await;
+                    // Bring the window forward and ask for a frame: a covered one is not drawn, and the picture would
+                    // show what it last drew.
+                    window
+                        .update(cx, |_, window, cx| {
+                            cx.activate(true);
+                            window.activate_window();
+                            window.refresh();
+                        })
+                        .ok();
+                    pause(1000).await;
                     let path = dir.join(format!("{rest}.png"));
                     match window.update(cx, |_, window, _| snapshot::save(window, &path)) {
                         Ok(Ok(())) => eprintln!("gitgui: saved {}", path.display()),
@@ -98,6 +106,7 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             cx,
         ),
         "theme" => workspace.set_theme(rest, cx),
+        "style" => workspace.set_graph_style(rest, cx),
         "search" => workspace.set_search(rest.to_owned(), cx),
         "menu" => {
             // menu authors|dates X Y: the menu a click there on that chip would open.
@@ -123,6 +132,7 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             workspace.open_settings(cx);
             let page = match rest {
                 "files" => SettingsPage::Files,
+                "style" => SettingsPage::GraphStyle,
                 "appearance" => SettingsPage::Appearance,
                 "projects" => SettingsPage::Projects,
                 _ => SettingsPage::Graph,

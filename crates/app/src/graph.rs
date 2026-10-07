@@ -22,6 +22,7 @@ use crate::layout::{Columns, DateStyle, short_date};
 use gitgui_store::GraphFaces;
 use crate::menu::MenuTarget;
 use crate::ui::{self, MONO, line_color};
+use crate::graph_style;
 use crate::workspace::Workspace;
 use crate::theme::t;
 
@@ -425,38 +426,31 @@ fn faded(color: Rgba, alpha: f32) -> Rgba {
 
 /// A branch, tag, remote branch or stash on a commit. Right-click for its menu.
 fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
-    // Quiet by default (a tint of the line's color, outlined in it); solid only for the branch HEAD is on, which is
-    // the one state here that should shout.
-    let lane = t().lane(lineage);
-    let tinted = |color: u32| (rgb(crate::theme::mix(t().bg, color, 0.2)), rgb(t().text_strong));
-    let (bg, fg) = match label.kind {
-        LabelKind::Branch if label.head => (line_color(lineage), rgb(ui::text_on(lane))),
-        LabelKind::Branch => tinted(lane),
-        LabelKind::RemoteBranch => (rgb(t().element), rgb(t().text)),
-        LabelKind::Tag => tinted(0xd4a72c),
-        LabelKind::Stash => tinted(0x23a455),
+    use crate::graph_style::{Radius, Role};
+    // How it looks is the graph style's say (tinted, solid, outlined, a pill, a dot...); the branch HEAD is on is
+    // always the loudest.
+    let role = match label.kind {
+        LabelKind::Branch => Role::Branch,
+        LabelKind::RemoteBranch => Role::Remote,
+        LabelKind::Tag => Role::Tag,
+        LabelKind::Stash => Role::Stash,
     };
-    let outline = match label.kind {
-        LabelKind::Branch if !label.head => Some(lane),
-        LabelKind::Tag => Some(0xd4a72c),
-        LabelKind::Stash => Some(0x23a455),
-        _ => None,
-    };
+    let look = graph_style::badge_look(&t(), graph_style::active().badge, role, label.head, graph_style::lane(lineage));
+    let ink = rgb(look.ink);
     // A cloud says the branch is on a remote too (or only there), the way other clients mark it,
     // instead of a separate `origin` tag beside it.
     let on_remote = label.kind == LabelKind::RemoteBranch || !label.remotes.is_empty();
-    let fg_color = u32::from(fg) >> 8;
     let name = div()
         .px_1p5()
         .flex()
         .items_center()
         .gap_1()
         .max_w(px(BADGE_MAX_W))
-        .bg(bg)
-        .text_color(fg)
-        .when(label.head, |name| name.font_weight(FontWeight::BOLD))
+        .text_color(ink)
+        .when(look.bold, |name| name.font_weight(FontWeight::BOLD))
+        .when_some(look.dot, |name, color| name.child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(color))))
         .when(on_remote, |name| {
-            name.child(gpui::img(icons::remote(fg_color)).flex_none().size(px(11.)))
+            name.child(gpui::img(icons::remote(look.ink)).flex_none().size(px(11.)))
                 .when(label.remotes.len() > 1, |name| name.child(format!("{}", label.remotes.len())))
         })
         .child(
@@ -473,13 +467,18 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
         .flex()
         .flex_none()
         .items_center()
-        .rounded_md()
         .overflow_hidden()
         .text_xs()
         .cursor_pointer()
-        .when(label.head, |badge| badge.border_2().border_color(rgb(t().text_strong)))
-        .when_some(outline.filter(|_| !label.head), |badge, color| {
-            badge.border_1().border_color(Rgba { a: 0.6, ..rgb(color) })
+        // The fill belongs here, on the element that has the rounded corners: a child is clipped to a rectangle.
+        .when_some(look.fill, |badge, fill| badge.bg(rgb(fill)))
+        .when(look.radius == Radius::Square, |badge| badge.rounded_none())
+        .when(look.radius == Radius::Small, |badge| badge.rounded_sm())
+        .when(look.radius == Radius::Medium, |badge| badge.rounded_md())
+        .when(look.radius == Radius::Full, |badge| badge.rounded_full())
+        .when_some(look.border, |badge, (width, color)| {
+            let badge = if width >= 2. { badge.border_2() } else { badge.border_1() };
+            badge.border_color(rgb(color))
         })
         // The menu for this badge only; the row's own menu must not also open.
         .on_mouse_down(
@@ -523,7 +522,12 @@ fn note_label(note: &Note) -> impl IntoElement + use<> {
         .text_xs()
         .when(note.probable, |label| label.italic())
         .when(note.merged, |label| {
-            label.px_1p5().rounded_sm().bg(Rgba { a: 0.14, ..green }).text_color(Rgba { a: 0.95, ..green })
+            let label = label.px_1p5().bg(Rgba { a: 0.14, ..green }).text_color(Rgba { a: 0.95, ..green });
+            match graph_style::active().badge {
+                graph_style::Badge::Pill | graph_style::Badge::Capsule => label.rounded_full(),
+                graph_style::Badge::Block => label.rounded_none(),
+                _ => label.rounded_sm(),
+            }
         })
         .when(!note.merged, |label| label.text_color(rgb(t().muted)))
         .child(note.text.clone())
@@ -620,7 +624,7 @@ pub fn render_entry(
         };
         // The same picture, or initials and color, as the Author column shows for the person.
         let face = ui::avatar(&entry.person.name, &entry.person.email, avatar.clone(), density.node - if current { 8. } else { 4. });
-        (face, t().lane(lineage), alpha)
+        (face, crate::graph_style::lane(lineage), alpha)
     });
     let fold_commit = entry.commit.clone();
     let mut chips: Vec<gpui::AnyElement> = Vec::new();
@@ -834,6 +838,8 @@ fn paint_lanes(
     window: &mut Window,
 ) {
     let Lines { lineage, fork_line, off_lines, off_branch, highlight } = *lines;
+    let style = graph_style::active();
+    let corner = graph_style::corner(density.row_h, density.lane_w);
     let dot_r = density.dot_r;
     let x = |lane: usize| bounds.origin.x + px(density.x(lane));
     let top = bounds.origin.y;
@@ -856,30 +862,13 @@ fn paint_lanes(
     let mut order: Vec<&Stroke> = strokes.iter().collect();
     order.sort_by_key(|s| highlight == Some(s.lineage));
     for stroke in order {
-        let (from, to, ctrl) = match stroke.half {
-            // Comes down the lane, then bends into the dot.
-            Half::Top => {
-                let (from, to) = (point(x(stroke.from), top), point(x(stroke.to), mid));
-                (from, to, point(from.x, mid))
-            }
-            // Leaves the dot sideways, then bends down into its lane.
-            Half::Bottom => {
-                let (from, to) = (point(x(stroke.from), mid), point(x(stroke.to), bottom));
-                (from, to, point(to.x, mid))
-            }
-            Half::Through => {
-                let (from, to) = (point(x(stroke.from), top), point(x(stroke.to), bottom));
-                (from, to, from)
-            }
+        let (from, to) = match stroke.half {
+            Half::Top => (point(x(stroke.from), top), point(x(stroke.to), mid)),
+            Half::Bottom => (point(x(stroke.from), mid), point(x(stroke.to), bottom)),
+            Half::Through => (point(x(stroke.from), top), point(x(stroke.to), bottom)),
         };
-        let mut line = PathBuilder::stroke(px(density.line + if highlight == Some(stroke.lineage) { 1. } else { 0. }));
-        line.move_to(from);
-        if from.x == to.x {
-            line.line_to(to);
-        } else {
-            line.curve_to(to, ctrl);
-        }
-        if let Ok(path) = line.build() {
+        let width = density.line * style.weight + if highlight == Some(stroke.lineage) { 1. } else { 0. };
+        if let Some(path) = graph_style::stroke(style.shape, stroke.half, from, to, mid, corner, width) {
             window.paint_path(path, tone(stroke.lineage));
         }
     }
@@ -926,7 +915,22 @@ fn paint_lanes(
     match dot {
         // A commit's node, with its author's picture, is drawn over the lines by the row; a commit that
         // does not show one is a plain dot.
-        Dot::Filled | Dot::Current if plain => circle(dot_r, color, 0., color),
+        Dot::Filled | Dot::Current if plain => match style.node {
+            graph_style::Node::Dot => circle(dot_r, color, 0., color),
+            // Hollow: the background shows through, in a line as thick as the lines.
+            graph_style::Node::Ring => circle(dot_r + 0.6, rgb(t().bg), (density.line * style.weight + 0.4).max(1.5), color),
+            graph_style::Node::Square => {
+                let half = dot_r * 0.95;
+                window.paint_quad(quad(
+                    Bounds { origin: point(center.x - px(half), center.y - px(half)), size: size(px(half * 2.), px(half * 2.)) },
+                    px(half * 0.3),
+                    color,
+                    0.,
+                    color,
+                    BorderStyle::default(),
+                ));
+            }
+        },
         Dot::Filled | Dot::Current => {}
         Dot::Uncommitted => circle(dot_r, rgb(t().bg), 2., color),
     }

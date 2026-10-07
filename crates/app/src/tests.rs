@@ -1581,6 +1581,35 @@ async fn the_settings_panel_fits_a_short_window(cx: &mut TestAppContext) {
     assert!(done.top() >= px(0.));
 }
 
+/// Clicking a style card in the settings changes how the graph is colored, at once, and is kept for the next launch.
+#[gpui::test]
+async fn choosing_a_graph_style_in_the_settings_recolors_the_graph_and_is_kept(cx: &mut TestAppContext) {
+    let _only = crate::graph_style::STYLE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = merged_pr("graph-style");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| {
+        ws.open_settings(cx);
+        ws.set_settings_page(crate::settings_view::SettingsPage::GraphStyle, cx);
+    });
+    draw(cx, &ws);
+    crate::graph_style::set_active("theme");
+    let before = crate::graph_style::lane(0);
+
+    let card = center_of(cx, "graph-style-neon".to_owned());
+    click(cx, MouseButton::Left, card);
+    draw(cx, &ws);
+    assert_eq!(crate::graph_style::active().id, "neon");
+    assert_ne!(crate::graph_style::lane(0), before, "the lines have the new colors");
+    assert_eq!(Store::at(fx.data()).settings().unwrap().graph_style, "neon", "and it is saved");
+
+    // Back to the theme's own, so the other tests see the colors they expect.
+    let card = center_of(cx, "graph-style-theme".to_owned());
+    click(cx, MouseButton::Left, card);
+    assert_eq!(crate::graph_style::lane(0), before);
+    assert_eq!(Store::at(fx.data()).settings().unwrap().graph_style, "theme");
+}
+
 // ---- background work stays bounded --------------------------------------------------------------
 
 fn count(ws: &Entity<Workspace>, cx: &VisualTestContext, which: fn(&crate::workspace::Counts) -> &std::sync::atomic::AtomicUsize) -> usize {

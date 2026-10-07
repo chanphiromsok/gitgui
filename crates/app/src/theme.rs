@@ -157,7 +157,7 @@ pub fn mix(from: u32, to: u32, amount: f32) -> u32 {
 }
 
 /// Relative luminance, as WCAG defines it: 0 for black, 1 for white.
-fn luminance(color: u32) -> f32 {
+pub fn luminance(color: u32) -> f32 {
     let channel = |shift: u32| {
         let c = ((color >> shift) & 0xff) as f32 / 255.;
         if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
@@ -283,7 +283,7 @@ pub fn parse_family(json: &str, origin: Origin) -> Vec<Theme> {
         .collect()
 }
 
-fn built_in() -> Vec<Theme> {
+pub fn built_in() -> Vec<Theme> {
     BUNDLED.iter().flat_map(|json| parse_family(json, Origin::BuiltIn)).collect()
 }
 

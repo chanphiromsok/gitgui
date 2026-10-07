@@ -5,7 +5,7 @@
 //! for themes. Everything is saved the moment it changes, so there is nothing to apply, only Done.
 
 use gpui::{
-    AnyElement, Context, FontWeight, Pixels, SharedString, Stateful, Window, div, prelude::*, px, rgb,
+    AnyElement, Context, FontWeight, Pixels, SharedString, Stateful, Window, canvas, div, prelude::*, px, rgb,
 };
 use gitgui_core::Layout;
 use gitgui_store::{DiffMode, FileLayout, GraphFaces, ReviewLayout};
@@ -25,17 +25,19 @@ const MAX_H: f32 = 600.;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsPage {
     Graph,
+    GraphStyle,
     Files,
     Appearance,
     Projects,
 }
 
 impl SettingsPage {
-    pub const ALL: [SettingsPage; 4] = [Self::Graph, Self::Files, Self::Appearance, Self::Projects];
+    pub const ALL: [SettingsPage; 5] = [Self::Graph, Self::GraphStyle, Self::Files, Self::Appearance, Self::Projects];
 
     fn title(self) -> &'static str {
         match self {
             Self::Graph => "Graph",
+            Self::GraphStyle => "Graph style",
             Self::Files => "Files & diffs",
             Self::Appearance => "Appearance",
             Self::Projects => "Projects",
@@ -45,6 +47,7 @@ impl SettingsPage {
     fn blurb(self) -> &'static str {
         match self {
             Self::Graph => "How the commit history is drawn and what is shown beside it.",
+            Self::GraphStyle => "The colors, line shapes, commit marks and labels of the graph.",
             Self::Files => "How a commit's changed files and their diffs are laid out.",
             Self::Appearance => "Colors and file icons.",
             Self::Projects => "Where new clones go, and where gitgui keeps its own files.",
@@ -165,7 +168,8 @@ impl Workspace {
             }));
 
         let content = div()
-            .id("settings-scroll")
+            // One scroll position per page, so a long page does not leave the next one scrolled.
+            .id(("settings-scroll", page as usize))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -272,6 +276,7 @@ impl Workspace {
                     ),
                 ]
             }
+            SettingsPage::GraphStyle => vec![self.graph_style_cards(card_w, cx)],
             SettingsPage::Files => vec![card(
                 None,
                 vec![
@@ -350,6 +355,66 @@ impl Workspace {
     }
 
     /// Every theme found, as a card with a small preview of its colors; click one to use it.
+    /// The graph's looks, each drawn as a small history in its own colors, line shape and commit marks.
+    fn graph_style_cards(&self, card_w: f32, cx: &mut Context<Self>) -> AnyElement {
+        use crate::graph_style::{self, STYLES};
+        let chosen = self.settings.graph_style.as_str();
+        let background = t().bg;
+        // Three to a row, filling the width two theme cards take.
+        let width = (((card_w * 2. + 8.) - 16.) / 3.).floor();
+        let cards = STYLES.iter().enumerate().map(|(ix, style)| {
+            let on = style.id == chosen || (ix == 0 && !STYLES.iter().any(|s| s.id == chosen));
+            let colors = graph_style::fitted_palette(style, background);
+            let id = style.id;
+            div()
+                .id(("graph-style", ix))
+                .debug_selector(move || format!("graph-style-{id}"))
+                .w(px(width))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_2()
+                .rounded_lg()
+                .border_2()
+                .border_color(rgb(if on { t().accent } else { t().border }))
+                .bg(rgb(t().card))
+                .cursor_pointer()
+                .hover(|card| card.bg(rgb(t().hover)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_graph_style(id, cx)))
+                .child(
+                    div().h(px(84.)).rounded_md().overflow_hidden().bg(rgb(background)).border_1().border_color(rgb(t().border)).child(
+                        canvas(|_, _, _| (), move |bounds, _, window, _| graph_style::paint_preview(style, &colors, bounds, window))
+                            .size_full(),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .overflow_hidden()
+                                .line_clamp(1)
+                                .text_ellipsis()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(t().text_strong))
+                                .child(style.name),
+                        )
+                        .when(on, |line| line.child(div().flex_none().text_color(rgb(t().accent)).font_weight(FontWeight::BOLD).child("✓"))),
+                )
+                .child(div().text_xs().text_color(rgb(t().muted)).line_clamp(1).text_ellipsis().child(style.note))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().flex().flex_wrap().gap_2().children(cards))
+            .into_any_element()
+    }
+
     fn theme_cards(&self, card_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let current = t().name.clone();
         let where_from = |origin: &Origin| match origin {

@@ -11,7 +11,7 @@ use crate::theme::t;
 /// The color of a branch line, from the theme's accents. Lines are numbered in the order they
 /// start, so neighbors differ.
 pub fn line_color(lineage: usize) -> Rgba {
-    rgb(t().lane(lineage))
+    rgb(crate::graph_style::lane(lineage))
 }
 
 /// A file or folder icon, 14 pixels square; empty space when there is none.
