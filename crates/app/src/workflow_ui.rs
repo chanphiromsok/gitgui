@@ -281,7 +281,7 @@ impl Workspace {
                 .child(field("Name", preview.into_any_element()))
                 .when(exists, |panel| panel.child(div().pl(px(100.)).text_xs().text_color(rgb(t().warning)).child("A branch with this name already exists.")))
                 .child(field("Start from", div().flex().flex_wrap().gap_1().children(bases).into_any_element()))
-                .child(div().pl(px(100.)).child(toggle("branch-switch", "Switch to it", wizard.switch).on_click(cx.listener(|this, _, _, cx| this.toggle_branch_switch(cx)))))
+                .child(div().pl(px(100.)).flex().child(toggle("branch-switch", "Switch to it", wizard.switch).on_click(cx.listener(|this, _, _, cx| this.toggle_branch_switch(cx)))))
                 .child(
                     div()
                         .flex()
@@ -366,7 +366,7 @@ impl Workspace {
             }
         }
         let types = div().flex().flex_wrap().gap_1().children(kinds.into_iter().map(|kind| {
-            let on = current.types.iter().any(|k| *k == kind);
+            let on = current.types.contains(&kind);
             let mut types = current.types.clone();
             if on {
                 types.retain(|k| *k != kind);

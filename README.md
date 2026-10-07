@@ -1,159 +1,71 @@
+<div align="center">
+
 # gitgui
 
-A fast Git GUI in Rust, on GPUI, for reading history on repositories that work through pull requests.
+**A fast, native Git client that understands pull requests.**
 
-![gitgui showing a release branch with its pull requests, their commits indented underneath, and squash-merged branches marked as merged](docs/screenshot.webp)
+![Rust](https://img.shields.io/badge/Rust-GPUI-b7410e?style=flat-square)
+![macOS and Windows](https://img.shields.io/badge/macOS%20%C2%B7%20Windows-lightgrey?style=flat-square)
+![MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
+![No account](https://img.shields.io/badge/no%20account%20%C2%B7%20no%20telemetry-2ea44f?style=flat-square)
 
-**What it fixes**
+<br>
 
-- **"Is this branch merged?"** Squash and rebase merges leave no link in git history, so most tools show the branch as unmerged forever. gitgui finds them (same changes, same PR number, same messages) and marks the branch *✓ squash-merged into release/1.0.0 (#45)*. The squash commit says *squash of branch …*.
-- **A pull request's commits are scattered through the log.** They are listed indented under the PR, with a guide line, and fold away.
-- **Where did this branch start?** Each branch is one coloured line down to its fork point, with the current branch ringed.
-- **Slow on big histories.** It scrolls 10,000-line diffs and thousands of commits smoothly, and refreshes do not re-scan.
+<img src="docs/img/hero.webp" alt="gitgui: a release branch with its pull requests grouped, a squash-merged branch marked as merged, and branches in their own colours" width="900">
 
-Also: a **Pull (rebase)** button, the last project reopens at start, a Graph size setting, author pictures (Gravatar, and GitHub through `gh` for plain-email authors), Tree/Flat file list, Unified/Split diff (both remembered), line comments, and right-click checkout, merge, rebase, push and more, always asking before anything destructive. Feature inventory and architecture: `docs/feature-spec.md`.
+</div>
 
-## Build and run
+<br>
 
-You need [Rust](https://rustup.rs) (stable, 1.90 or newer) and `git` on your PATH. The app runs your own `git`, so your config, hooks and credentials apply.
+## Why you'll like it
+
+- **It knows what's merged.** Squash and rebase merges leave no trace in git, so other tools show the branch as open forever. gitgui finds them and marks the branch **✓ squash-merged**.
+- **Pull requests, tidy.** A pull request's commits sit together under it and fold away.
+- **It remembers your team's workflow.** Branch names, where work starts, how things merge: read from the repo, then **New branch…** builds `feature/74-driver-reporting` for you.
+- **Blame where you're looking.** Rest the pointer on a line in a diff: who changed it, and when.
+- **Yours to restyle.** 14 graph styles, each with its own lines, commit marks and labels.
+- **Fast.** Native Rust, no Electron: thousands of commits and 10,000-line diffs scroll smoothly.
+
+<br>
+
+## See it
+
+<img src="docs/img/review.webp" alt="A split diff with syntax colours and a blame note beside the line the pointer is on" width="900">
+
+*Split diff, with who-changed-this one hover away. Comment on any line.*
+
+<br>
+
+<img src="docs/img/wizard.webp" alt="The New branch window, building feature/101-driver-reporting-v2 from develop" width="900">
+
+*Start a branch the way your team does: type, ticket, title. The name and the base branch follow the repo.*
+
+<br>
+
+<img src="docs/img/styles.webp" alt="The same history in six graph styles: Neon, Soft, Circuit, Graphite, Tokyo Night and Gruvbox" width="900">
+
+*Six of the 14 styles. Colours are fitted to your theme, so every line stays readable.*
+
+<details>
+<summary>Light theme</summary>
+<br>
+<img src="docs/img/light.webp" alt="gitgui in the One Light theme" width="900">
+</details>
+
+<br>
+
+## Get it
+
+**Download** for macOS (Apple silicon and Intel) or Windows from [Releases](https://github.com/chanphiromsok/gitgui/releases). It needs `git` on your PATH.
+
+**Or build it** (Rust, stable):
 
 ```sh
-cargo run --release -p gitgui-app -- /path/to/repo   # open the window (the path is optional)
-cargo test --workspace                               # all tests
+cargo run --release -p gitgui-app -- /path/to/repo
 ```
 
-Always use `--release` to run it. A debug build of the UI is far too slow to scroll.
+<br>
 
-Saved projects, settings and comments live in `~/Library/Application Support/gitgui` (macOS), `%APPDATA%\gitgui` (Windows) or `~/.local/share/gitgui` (Linux). Set `GITGUI_DATA_DIR` to use another folder.
+## More
 
-## Release build: macOS
-
-Needs Xcode or the Command Line Tools (`xcode-select --install`). The Metal shader compiler is **not** needed: the app compiles its shaders when it starts (`runtime_shaders`).
-
-```sh
-scripts/bundle-macos.sh                  # this Mac's architecture
-scripts/bundle-macos.sh --arch arm64     # Apple Silicon (can be built on an Intel Mac too)
-scripts/bundle-macos.sh --arch x86_64    # Intel (can be built on an Apple Silicon Mac)
-scripts/bundle-macos.sh --arch universal # both in one app
-```
-
-This writes `dist/gitgui.app` and `dist/gitgui-<version>-macos-<arch>.dmg`. Drag the app to Applications.
-
-**The icon** is `crates/app/assets/app-icon/icon.svg`. After changing it, make `AppIcon.icns` again:
-
-```sh
-cargo run -p gitgui-app --example app_icon -- /tmp/AppIcon.iconset && iconutil -c icns /tmp/AppIcon.iconset -o crates/app/assets/app-icon/AppIcon.icns
-```
-
-**Signing.** The script signs ad hoc, which is enough to run on the Mac that built it. On another Mac, Gatekeeper blocks it: right-click the app and choose Open once, or run `xattr -dr com.apple.quarantine gitgui.app`.
-To distribute properly you need an Apple Developer ID: sign with `codesign --force --deep --options runtime --sign "Developer ID Application: NAME (TEAMID)" dist/gitgui.app`, then notarize with `xcrun notarytool submit dist/gitgui-<version>-macos-<arch>.dmg --keychain-profile PROFILE --wait` and `xcrun stapler staple dist/gitgui-<version>-macos-<arch>.dmg`.
-
-## Publishing a release on GitHub
-
-`.github/workflows/release.yml` builds the macOS Apple Silicon and Intel `.dmg` files and the Windows `.zip`, then drafts a GitHub release with them and a `SHA256SUMS` file. It never publishes by itself: open the draft, read it, press **Publish**.
-
-```sh
-# 1. Set `version` in the root Cargo.toml, commit, push.
-# 2. Tag it; the workflow starts on the tag:
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-Or run it by hand without a tag: GitHub → Actions → release → Run workflow, and type the tag (`v0.1.0`). The tag is created when you publish the draft. The install notes in the release body come from `.github/release-notes.md`.
-
-## Release build: Windows
-
-The release workflow builds it on a Windows runner (cross-compiling GPUI from another OS is not supported). **It has never been run on a real Windows machine**, and the first workflow run may need fixes; check that run before relying on it. Shortcuts use Ctrl there, the code font is Consolas, and no console window opens.
-
-1. Install [Rust](https://rustup.rs) with the default `x86_64-pc-windows-msvc` toolchain.
-2. Install **Visual Studio Build Tools** with the *Desktop development with C++* workload and a Windows 10/11 SDK.
-3. Install [Git for Windows](https://git-scm.com/download/win) and make sure `git` works in a terminal.
-4. In PowerShell, from the project folder:
-
-```powershell
-cargo build --release -p gitgui-app
-```
-
-The program is `target\release\gitgui-app.exe`. It is a single file: copy it anywhere. For an installer, wrap it with [WiX](https://wixtoolset.org) or [Inno Setup](https://jrsoftware.org/isinfo.php); sign it with `signtool` to avoid SmartScreen warnings.
-
-Known Windows gaps:
-- The menu bar is macOS-only; Minimize, Hide and the other macOS window shortcuts do nothing there.
-- The program has no icon of its own, and is not signed (SmartScreen warns).
-- Git is found on PATH only.
-
-## Release build: Linux
-
-Install the system libraries GPUI needs (on Debian/Ubuntu: `libxkbcommon-x11-dev libwayland-dev libxcb1-dev libfontconfig-dev libssl-dev pkg-config`), then `cargo build --release -p gitgui-app`. Not tested either, and it uses Ctrl for shortcuts and DejaVu Sans Mono for code.
-
-## Layout
-
-| Crate | What it is | Dependencies |
-|---|---|---|
-| `crates/core` | Repo model, `Backend` trait, `GitCli` backend, lane layout, diff parser, file tree | none (std only) |
-| `crates/store` | Saved projects and line comments, as JSON in the app-data folder | serde |
-| `crates/cli` | `gitgui log [PATH] [-n N]` prints the commit graph as text | core |
-| `crates/app` | The GPUI window | core, store, gpui 0.2.2 |
-
-`crates/app` is not in `default-members`, so a plain `cargo test` stays fast. Use `cargo test --workspace` for everything
-and `cargo run -p gitgui-app -- [PATH]` for the window.
-
-## What the window does
-
-Left to right: **projects** | **graph** with the **file pane** below it (or beside it). The dividers drag to resize.
-
-- **Projects:** *Clone…* (Cmd-Shift-O) clones from an https, ssh (`git@host:owner/repo.git`) or git address into a folder you pick, then opens it; it uses the credentials your git already has and never asks for a password. *Open Folder…* (Cmd-O) adds a repository (a folder inside one adds the repo). Kept between launches; hover a row and click × to remove.
-- **Local changes** list under the open project, staged and not: click one to see its diff, hover for **+** / **−** to stage or unstage (or a whole group). The box below commits what is staged (or everything, when nothing is), Enter to commit.
-- **Graph:** Sourcetree-style table.
-  - Each branch is one line with one color from its tip down to the commit it was branched from. Lines are not bent into their parent early, so the fork point is visible.
-  - A fork commit gets a ring; its details name the branches cut from it. Selecting a commit brings its branch line forward and dims the rest.
-  - Each commit's node shows its author's initials (Rom → R, Kim heang → KH) on its branch's color.
-  - Icons tell a pull request, a merge and a plain commit apart. A local branch and its remote share one badge; the current branch is ringed and bold.
-  - Stashes are one `stash@{n}` commit; an *Uncommitted Changes* row sits on top.
-- **Settings** (Cmd-,) is a window with five pages: *Graph* (grouping, pictures, compact, size), *Graph style*, *Files & diffs*, *Appearance* (theme cards, file icons) and *Projects* (clone folder, data folder). Everything saves as you change it.
-- **Graph style** (Settings): 14 looks for the graph, each a set of choices and not only a recolor: its own palette (fitted to your color theme so every line keeps at least 3:1 contrast with the background), how a line changes lane (curve, straight diagonal, or right angle with a rounded corner), line weight, how a commit is marked (dot, hollow ring, square), and how branch, tag and stash labels look (tinted, solid, outline, pill, capsule, dot, block). Theme (your color theme's own), Aurora, Neon, Soft, Circuit, Graphite, Colour-blind safe (Okabe–Ito), Gruvbox, Dracula, Catppuccin, Solarized, Tokyo Night, Sunset and Ocean. Each card draws a small history in its style. The tests check every style against every built-in theme.
-- **Grouping** (Settings… / Cmd-,, on by default): a pull request's commits are listed one level in under it, with a guide line, and fold away with the chevron on the merge's dot in the graph. *Compact graph* (Settings) narrows the lanes and thins the lines.
-  Squash-merged branches go under their squash commit.
-- **Already merged?** A background scan marks branches that are merged even when git cannot tell (squash and rebase merges): *squash-merged into release/1.0.0 · #37*, and *squash of branch feat/x* on the commit that carries it.
-  Evidence, strongest first: identical changes in one trunk commit; the same pull request number; a trunk commit repeating the branch's commit messages. The last two are shown in italics as guesses.
-- **Pull requests** link to their page: *#42 ↗* beside a merge or squash commit, in its details, and *Open Pull Request / Open Commit in Browser* on right-click (GitHub, GitLab and Bitbucket remotes).
-- **Filter by author and date:** the **Author ▾** and **Date ▾** chips in the filter bar pick an author (everyone who committed, most active first; a person's other emails count too) or a day range (today, yesterday, last 7 or 30 days, this month). They write plain words into the search box, which you can also type: `author:ada` (part of a name or an email; `author:"Ada Lovelace"` with spaces), `date:2026-10-05`, `date:2026-10-01..2026-10-07` (either end may be left open), `date:2026-10` (a month), `date:today`, `date:7d`, `since:`/`until:`. The graph then shows only those commits and keeps its lines joined across the ones left out, the way `git log` does; other words in the box still mark rows as before.
-- **Right-click** a branch badge or a commit: checkout, rename, delete, merge into current, rebase current onto, push, new branch / tag here, cherry-pick, copy name / SHA / message.
-  Anything that rewrites history, deletes, or reaches a remote asks first. Nothing is forced: no force-push, no `reset --hard`, and an unmerged branch is deleted only after a second, explicit yes.
-  A merge, rebase or cherry-pick that meets conflicts stops and the banner offers **Abort**, which puts everything back.
-- **File pane** (click a commit): overview, and the changed files as a **tree or flat list** with a filter. A file opens as a **unified or split** diff; **Show more lines** (on the toolbar or beside any hunk) widens the unchanged lines around every change: 25, 100, 400, then the whole file; **Collapse** goes back to 3. Long lines scroll sideways (shift + wheel, or a trackpad swipe), and a **minimap** strip on the right shows where the changes are: click or drag it to jump. Your choice of **Tree / Flat** and **Unified / Split** is saved as soon as you make it (also in Settings…) and is used the next time the app starts. The file pane sits **below the graph**, across the whole width (Settings → Files & diffs → Review layout switches to beside it); a divider between them drags. A diff opens **split** unless you choose unified. A new or deleted file has one side only, so it is shown as one column labelled *(New file)* or *(Deleted)*. Every panel can be hidden and still reached: **Graph** and **Files** in the pane header, the sidebar button or Cmd-B. A thin strip stays where a hidden panel was; point at it and the panel slides in over the code until the pointer leaves. The file list has a divider you drag to resize. **Expand** (Cmd-E, or double-click a file) gives the code the whole window: the sidebar and graph step aside until Esc. While a file is open the pane takes most of the width by default. The expand button (**↕**) sits in the line-number gutter of each hunk header. Scrolling is locked to one direction at a time, and the wheel works over the minimap too.
-- **Filter bar** above the graph: show the *current branch*, *local* branches or *all*; *hide merged* branches; show or hide *stashes* (a stash shows where the commit it was made on does); search (Cmd-F) by message, author, branch or id, `path:` for commits touching a file, `code:` for commits adding or removing text. Enter goes to the next match.
-- **Syntax highlighting** in diffs (tree-sitter, 21 languages including PHP). Each line is colored from the whole file it came from, so hunks that start mid-string still color right.
-- **Blame on hover**: rest the pointer on a line of a diff and a small note at the end of that line says who last changed it, when, and the commit's message (`phirom · 13 h ago · gitgui: Git GUI in Rust on GPUI`). Click it to go to that commit in the graph. A removed line is blamed as the commit's parent had it, a line the selected commit changed says *This change*, and a working-tree line says *Not committed yet*. It is read the first time you point at a line (`git blame`, ignoring whitespace-only changes), in the background, so a diff you only read costs nothing.
-- **Themes** (Settings): Zed's theme format. gitgui Dark, One Dark and One Light are built in; themes installed in Zed show up, or drop a Zed theme file in `<data folder>/themes/`.
-- **File icons:** the Material Icon Theme is built in; icon themes installed in Zed can be picked instead. A deleted file is marked *(Deleted)*; folders in the file tree fold.
-- **Authors** show their picture beside their name (GitHub's for GitHub no-reply emails, else Gravatar's), or their initials. Pictures are kept for a week in `<data folder>/avatars`; Settings turns fetching off. One person under several identities (a laptop's git config, GitHub's web merges) gets one picture, initials and color: identities are joined when they are the same GitHub account, or when one committed the other's work and no one else's. A `.mailmap` is honored too.
-- **Images** (PNG, JPEG, GIF, WebP, BMP, TIFF, SVG) show before and after, with their size in pixels and bytes.
-- **Sidebar:** the button at the top left of the graph, Cmd-B, or drag its divider all the way left hides it.
-- **Comments:** hover a diff line and click **+**. Saved locally per repository by commit, file, side and line, so they never go stale.
-- **Shortcuts:** Cmd-O open, Cmd-, settings, Cmd-R refresh, Cmd-F search commits, Cmd-B show or hide the sidebar, Up / Down step through the open commit's (or local changes') files, Cmd-E full view, Esc back (closes a menu, dialog or settings first), Cmd-W close window, Cmd-M minimize, Cmd-Q quit.
-
-`gitgui merges PATH` prints the merge scan for a repository from the terminal (read-only).
-
-## Seeing the window without anyone at the screen
-
-`GITGUI_SCRIPT=steps.txt GITGUI_SHOTS=folder cargo run -p gitgui-app` drives the app through the steps in the file (`size`, `open`, `select`, `file`, `mode`, `expand`, `settings`, `graph`, `files`, `peek`, `shot name`, `quit`; see `crates/app/src/script.rs`) and saves a PNG of the real window at each `shot`. macOS only. It is how the layout is checked on a small window. `GITGUI_PERF=1` adds lane count and read/layout timings to the graph header.
-
-## Tests
-
-`cargo test --workspace`: 217 tests. Core and store run against real temporary git repositories, including real squash merges, conflicts, a local "remote" for push, and a 300-case random test that grouping never puts a commit above its parent.
-The app tests run the real window headlessly (GPUI's test platform) through every flow and draw a frame after each step, so a view that panics on real data fails.
-Frame-time checks keep a 10,000-row diff and a 4,400-row graph under 8 ms per frame in release builds.
-They do not check how anything looks.
-
-## Third-party assets
-
-`crates/app/assets/material-icons/` is the [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme) by Philipp Kief and contributors, MIT licensed (its `LICENSE` is beside it).
-
-## Known gaps
-
-- Comments are one line each and local only. Syncing with GitHub/GitLab review comments is not built.
-- No word-level highlight inside changed lines.
-- Divider positions and folded groups are not remembered between launches.
-- The merge scan looks at each trunk's newest 500 commits and gives up after 25 s (it says how many branches it skipped; the next refresh carries on from there). It remembers its answers, so a refresh only re-checks branches and trunks that moved.
-- Menu items from Sourcetree not built: *Create Archive*, *Unselect in Branches Dropdown* (there is no branch dropdown yet).
-- `crates/app/src/text_input.rs` is adapted from gpui's `input` example (Apache-2.0, Zed Industries).
-- 
+[Guide](docs/guide.md): everything it does · [Feature spec](docs/feature-spec.md): how it is built · MIT

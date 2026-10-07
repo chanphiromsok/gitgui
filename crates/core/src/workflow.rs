@@ -222,10 +222,17 @@ pub fn detect(branches: &[&str], merged_into: &[&str], contained: usize, squashe
     for into in merged_into {
         *targets.entry(into).or_default() += 1;
     }
-    let base = targets
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
-        .map(|(name, _)| name.to_owned())
+    // An integration branch (`develop`) is where work starts when there is one: the scan reports `main` for the same
+    // branches, since everything reaches `main` in the end, but nobody starts a feature there.
+    let integration = trunks.iter().find(|name| matches!(**name, "develop" | "dev" | "development"));
+    let base = integration
+        .map(|name| (*name).to_owned())
+        .or_else(|| {
+            targets
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+                .map(|(name, _)| name.to_owned())
+        })
         .or_else(|| trunks.first().map(|name| (*name).to_owned()));
 
     let merge_style = match (contained, squashed) {
@@ -382,6 +389,16 @@ mod tests {
         assert_eq!(found.merge_style, MergeStyle::Merge);
         let said = found.describe();
         assert!(said.contains("feature/74-add-login") && said.contains("merged into develop") && said.contains("merge commit"), "{said}");
+    }
+
+    #[test]
+    fn work_starts_on_develop_when_there_is_one_even_if_the_scan_says_main() {
+        let branches = ["main", "develop", "feature/1-a", "feature/2-b"];
+        let found = detect(&branches, &["main", "main", "main"], 3, 0, &["develop", "main"]);
+        assert_eq!(found.base.as_deref(), Some("develop"));
+        // With no such branch, where branches went is the answer.
+        let found = detect(&["main", "feature/1-a", "feature/2-b"], &["main", "main"], 2, 0, &["main"]);
+        assert_eq!(found.base.as_deref(), Some("main"));
     }
 
     #[test]

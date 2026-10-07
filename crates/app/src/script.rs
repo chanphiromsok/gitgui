@@ -115,8 +115,8 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             let mut words = rest.splitn(3, ' ');
             if let (Some(kind), Some(ticket), Some(title)) = (words.next(), words.next(), words.next()) {
                 workspace.set_branch_kind(kind, cx);
-                workspace.branch_ticket.update(cx, |input, cx| input.set_text(if ticket == "-" { "" } else { ticket }, cx));
-                workspace.branch_title.update(cx, |input, cx| input.set_text(title, cx));
+                workspace.branch_ticket.update(cx, |input, cx| input.replace_text(if ticket == "-" { "" } else { ticket }, cx));
+                workspace.branch_title.update(cx, |input, cx| input.replace_text(title, cx));
             }
         }
         "search" => workspace.set_search(rest.to_owned(), cx),

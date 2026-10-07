@@ -517,16 +517,16 @@ pub struct BlameNote {
     pub commit: Option<String>,
 }
 
-/// The note, drawn over the end of its line.
-fn blame_chip(ix: usize, side: u8, note: &BlameNote, edge: f32, cx: &mut Context<Workspace>) -> AnyElement {
+/// The note, drawn right after the line's text, where the eye already is (it is cut off with the row when the
+/// line is too long to leave room).
+fn blame_chip(ix: usize, side: u8, note: &BlameNote, cx: &mut Context<Workspace>) -> AnyElement {
     let commit = note.commit.clone();
     div()
         .id(("blame", ix * 3 + side as usize))
         .debug_selector(|| "blame-note".to_owned())
-        .absolute()
-        .top(px(1.))
-        .right(px(edge))
-        .h(px(LINE_H - 2.))
+        .flex_none()
+        .ml_4()
+        .h(px(LINE_H - 4.))
         .px_2()
         .flex()
         .items_center()
@@ -672,7 +672,9 @@ impl Workspace {
                     return note("This change".to_owned(), None);
                 }
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-                let text = format!("{} · {} · {}", info.author, ui::ago(now - info.time), clip(&info.summary, 56));
+                // A half of a split row is narrow: only who and when fit beside the line (click for the rest).
+                let who = format!("{} · {}", info.author, ui::ago(now - info.time));
+                let text = if side == 0 { format!("{who} · {}", clip(&info.summary, 56)) } else { who };
                 note(text, Some(info.commit.clone()))
             }
         }
@@ -778,7 +780,7 @@ fn unified_line(
         .child(plus(("plus", ix), anchor_of(line).filter(|_| comments), "diff-line", cx))
         .text_color(rgb(t().editor_fg))
         .child(div().flex_none().ml(px(-sx)).child(diff_text(&gutter, sign, sign_color, &line.text, spans)))
-        .when_some(note, |row, note| row.child(blame_chip(ix, 0, note, MINIMAP_W + 6., cx)))
+        .when_some(note, |row, note| row.child(blame_chip(ix, 0, note, cx)))
         .into_any_element()
 }
 
@@ -802,8 +804,6 @@ fn split_row(
         let (sign, sign_color) = marker(line.kind);
         let shown = if left_side { line.old_no } else { line.new_no };
         let side = if left_side { 1u8 } else { 2 };
-        // The strip down the right edge covers the right half's end; the left half has its own edge.
-        let edge = if left_side { 6. } else { MINIMAP_W + 6. };
         cell.id(("half", ix * 3 + side as usize))
             .group(group)
             .relative()
@@ -813,7 +813,7 @@ fn split_row(
             .when_some(line_bg(line.kind), |cell, bg| cell.bg(rgb(bg)))
             .child(plus((if left_side { "plus-l" } else { "plus-r" }, ix), anchor_of(line).filter(|_| comments), group, cx))
             .child(div().flex_none().ml(px(-sx)).child(diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side))))
-            .when_some(note.filter(|note| note.side == side), |cell, note| cell.child(blame_chip(ix, side, note, edge, cx)))
+            .when_some(note.filter(|note| note.side == side), |cell, note| cell.child(blame_chip(ix, side, note, cx)))
             .into_any_element()
     };
 
