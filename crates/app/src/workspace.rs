@@ -385,6 +385,8 @@ pub struct Workspace {
     pub dialog_input: Entity<TextInput>,
     pub settings: Settings,
     pub settings_open: bool,
+    /// The page of the settings window that is showing.
+    pub settings_page: crate::settings_view::SettingsPage,
     /// Every color theme found, built in first.
     pub themes: Vec<Arc<Theme>>,
     /// Icon themes from Zed's extensions; the built-in icons are not in the list.
@@ -617,6 +619,7 @@ impl Workspace {
             dialog_input,
             settings,
             settings_open: false,
+            settings_page: crate::settings_view::SettingsPage::Graph,
             menu: None,
             dialog: None,
             busy: None,

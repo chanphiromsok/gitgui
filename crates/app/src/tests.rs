@@ -2074,3 +2074,48 @@ async fn cloning_by_address_makes_the_folder_adds_the_project_and_opens_it(cx: &
     cx.run_until_parked();
     assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.warn && n.text.contains("already exists"))));
 }
+
+#[gpui::test]
+async fn the_settings_window_has_pages_and_its_controls_change_and_save_settings(cx: &mut TestAppContext) {
+    use crate::settings_view::SettingsPage;
+    use gitgui_store::GraphFaces;
+    let fx = merged_pr("settings-pages");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| ws.open_settings(cx));
+    draw(cx, &ws);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.settings_page), SettingsPage::Graph, "opens on the graph page");
+
+    // A switch: click it and the setting flips and is saved.
+    let grouped = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.settings.group_by_parent);
+    assert!(grouped(cx));
+    let at = center_of(cx, "setting-group".to_owned());
+    click(cx, MouseButton::Left, at);
+    assert!(!grouped(cx));
+    assert!(!Store::at(fx.data()).settings().unwrap().group_by_parent, "saved at once");
+    draw(cx, &ws);
+    let at = center_of(cx, "setting-group".to_owned());
+    click(cx, MouseButton::Left, at);
+    assert!(grouped(cx));
+
+    // Each page draws, and its controls reach the same settings as the buttons in the panes.
+    for (ix, page) in SettingsPage::ALL.into_iter().enumerate() {
+        draw(cx, &ws);
+        let at = center_of(cx, format!("settings-page-{ix}"));
+        click(cx, MouseButton::Left, at);
+        assert_eq!(ws.read_with(cx, |ws, _| ws.settings_page), page);
+        draw(cx, &ws);
+    }
+    // The appearance page lists the themes; choosing one applies it.
+    ws.update(cx, |ws, cx| ws.set_settings_page(SettingsPage::Appearance, cx));
+    draw(cx, &ws);
+    let other = ws.read_with(cx, |ws, _| ws.themes.iter().map(|t| t.name.clone()).find(|n| *n != crate::theme::t().name));
+    if let Some(other) = other {
+        ws.update(cx, |ws, cx| ws.set_theme(&other, cx));
+        assert_eq!(Store::at(fx.data()).settings().unwrap().theme.as_deref(), Some(other.as_str()));
+    }
+    ws.update(cx, |ws, cx| ws.set_graph_faces(GraphFaces::All, cx));
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.back(cx));
+    assert!(!ws.read_with(cx, |ws, _| ws.settings_open), "Esc closes it");
+}

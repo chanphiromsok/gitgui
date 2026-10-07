@@ -17,6 +17,7 @@ mod minimap;
 mod pane;
 mod preview;
 mod rows;
+mod settings_view;
 mod syntax;
 #[cfg(test)]
 mod tests;

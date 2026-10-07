@@ -108,6 +108,7 @@ Left to right: **projects** | **graph** | **file pane**. Both dividers drag to r
   - Each commit's node shows its author's initials (Rom → R, Kim heang → KH) on its branch's color.
   - Icons tell a pull request, a merge and a plain commit apart. A local branch and its remote share one badge; the current branch is ringed and bold.
   - Stashes are one `stash@{n}` commit; an *Uncommitted Changes* row sits on top.
+- **Settings** (Cmd-,) is a window with four pages: *Graph* (grouping, pictures, compact, size), *Files & diffs*, *Appearance* (theme cards, file icons) and *Projects* (clone folder, data folder). Everything saves as you change it.
 - **Grouping** (Settings… / Cmd-,, on by default): a pull request's commits are listed one level in under it, with a guide line, and fold away with the chevron on the merge's dot in the graph. *Compact graph* (Settings) narrows the lanes and thins the lines.
   Squash-merged branches go under their squash commit.
 - **Already merged?** A background scan marks branches that are merged even when git cannot tell (squash and rebase merges): *squash-merged into release/1.0.0 · #37*, and *squash of branch feat/x* on the commit that carries it.
