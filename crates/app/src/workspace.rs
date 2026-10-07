@@ -1270,24 +1270,36 @@ impl Workspace {
             return Avatar::None;
         }
         let (avatar, ask) = self.avatars.borrow_mut().get(email);
-        if ask {
-            let (email, dir) = (email.to_owned(), self.avatars.borrow().dir.clone());
-            let task = cx.background_executor().spawn({
-                let email = email.clone();
-                // Tests never reach the network.
-                async move { avatars::load(&email, dir.as_deref(), if cfg!(test) { |_: &str| None } else { avatars::fetch }) }
-            });
-            cx.spawn(async move |this, cx| {
-                let avatar = task.await;
-                this.update(cx, |this, cx| {
-                    this.avatars.borrow_mut().set(&email, avatar);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+        if ask && self.avatars.borrow_mut().start(email) {
+            self.fetch_avatar(email.to_owned(), cx);
         }
         avatar
+    }
+
+    /// Asks for one author's picture in the background; when it is in, the next waiting one is asked.
+    fn fetch_avatar(&self, email: String, cx: &mut Context<Self>) {
+        let dir = self.avatars.borrow().dir.clone();
+        let task = cx.background_executor().spawn({
+            let email = email.clone();
+            // Tests never reach the network.
+            async move { avatars::load(&email, dir.as_deref(), if cfg!(test) { |_: &str| None } else { avatars::fetch }) }
+        });
+        cx.spawn(async move |this, cx| {
+            let avatar = task.await;
+            this.update(cx, |this, cx| {
+                let next = {
+                    let mut avatars = this.avatars.borrow_mut();
+                    avatars.set(&email, avatar);
+                    avatars.finish()
+                };
+                if let Some(next) = next {
+                    this.fetch_avatar(next, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Turns fetching authors' pictures on or off, and keeps the choice.

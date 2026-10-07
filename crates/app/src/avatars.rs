@@ -6,7 +6,7 @@
 //! in the data folder, so each is asked for once a week at most. Fetching can be turned off in
 //! Settings; the initials need nothing from the network.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -18,6 +18,10 @@ use sha2::{Digest, Sha256};
 const FRESH_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Pictures bigger than this are not kept.
 const MAX_BYTES: u64 = 1 << 20;
+/// How many pictures are asked for at once. Each ask holds a background thread until the network
+/// answers (up to 8 s); scrolling through a history with many authors would otherwise start one per
+/// author at the same moment, each with its own connection.
+pub const MOST_AT_ONCE: usize = 4;
 
 /// What is known about one email's picture.
 #[derive(Clone)]
@@ -110,7 +114,9 @@ pub fn load(email: &str, dir: Option<&Path>, fetch: impl Fn(&str) -> Option<Vec<
 
 /// Asks the network for a picture; `None` for anything but a small image.
 pub fn fetch(url: &str) -> Option<Vec<u8>> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().into();
+    // One agent for every ask, so connections (and TLS setup) are reused.
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().into());
     let mut response = agent.get(url).call().ok()?;
     response.body_mut().with_config().limit(MAX_BYTES).read_to_vec().ok()
 }
@@ -121,11 +127,33 @@ pub struct Avatars {
     known: HashMap<String, Avatar>,
     /// Where pictures are kept between runs.
     pub dir: Option<PathBuf>,
+    /// Pictures being asked for now, and emails waiting their turn.
+    fetching: usize,
+    waiting: VecDeque<String>,
 }
 
 impl Avatars {
     pub fn new(dir: Option<PathBuf>) -> Self {
-        Self { known: HashMap::new(), dir }
+        Self { dir, ..Self::default() }
+    }
+
+    /// Whether `email`, just marked as asked for, may be asked now; if not it waits its turn.
+    pub fn start(&mut self, email: &str) -> bool {
+        if self.fetching < MOST_AT_ONCE {
+            self.fetching += 1;
+            true
+        } else {
+            self.waiting.push_back(email.to_owned());
+            false
+        }
+    }
+
+    /// One ask is done: the next email to ask for, if one is waiting (it takes the free turn).
+    pub fn finish(&mut self) -> Option<String> {
+        self.fetching = self.fetching.saturating_sub(1);
+        let next = self.waiting.pop_front()?;
+        self.fetching += 1;
+        Some(next)
     }
 
     /// What is known for `email`, and whether it still has to be asked for (it is then marked as
@@ -148,6 +176,7 @@ impl Avatars {
     /// Forgets everything asked this run, so turning pictures back on asks again.
     pub fn clear(&mut self) {
         self.known.clear();
+        self.waiting.clear();
     }
 }
 
@@ -208,6 +237,19 @@ mod tests {
         assert_eq!(asked.get(), 2, "having no picture is remembered too");
         assert!(matches!(load("html@y.z", Some(&dir), |_: &str| Some(b"<html>".to_vec())), Avatar::None), "not an image");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_few_pictures_are_asked_for_at_once_and_the_rest_wait_their_turn() {
+        let mut avatars = Avatars::default();
+        let started: Vec<bool> = (0..MOST_AT_ONCE + 2).map(|n| avatars.start(&format!("{n}@x"))).collect();
+        assert_eq!(started.iter().filter(|s| **s).count(), MOST_AT_ONCE);
+        assert_eq!(avatars.finish().as_deref(), Some(format!("{MOST_AT_ONCE}@x").as_str()), "the first waiting goes next");
+        assert_eq!(avatars.finish().as_deref(), Some(format!("{}@x", MOST_AT_ONCE + 1).as_str()));
+        for _ in 0..MOST_AT_ONCE {
+            assert_eq!(avatars.finish(), None);
+        }
+        assert!(avatars.start("again@x"), "a free turn is taken at once");
     }
 
     #[test]
