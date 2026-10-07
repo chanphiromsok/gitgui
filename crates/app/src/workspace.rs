@@ -431,7 +431,7 @@ pub enum Panel {
 }
 
 /// How wide the changed-files column starts, and the least and most it may be dragged to.
-pub const FILES_WIDTH: f32 = 230.;
+pub const FILES_WIDTH: f32 = 280.;
 pub const FILES_MIN: f32 = 150.;
 pub const FILES_MAX: f32 = 520.;
 /// With the pane below the graph: its share of the height to start with, and what each keeps at least.

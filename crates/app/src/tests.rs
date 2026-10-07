@@ -2204,7 +2204,11 @@ async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_win
     ws.update(cx, |ws, cx| ws.toggle_expanded(cx));
     draw(cx, &ws);
     let wide = cx.debug_bounds("diff-list").unwrap();
-    assert!(wide.origin.x < px(260.), "only the file list is left of the code: starts at {:?}", wide.origin.x);
+    assert!(
+        wide.origin.x < px(crate::workspace::FILES_WIDTH + 30.),
+        "only the file list is left of the code: starts at {:?}",
+        wide.origin.x
+    );
     assert!(wide.size.width > narrow_pane * 1.3, "more room for the code in full view: {narrow_pane:?} → {:?}", wide.size.width);
     ws.update(cx, |ws, cx| ws.back(cx));
     draw(cx, &ws);

@@ -425,11 +425,22 @@ fn faded(color: Rgba, alpha: f32) -> Rgba {
 
 /// A branch, tag, remote branch or stash on a commit. Right-click for its menu.
 fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
+    // Quiet by default (a tint of the line's color, outlined in it); solid only for the branch HEAD is on, which is
+    // the one state here that should shout.
+    let lane = t().lane(lineage);
+    let tinted = |color: u32| (rgb(crate::theme::mix(t().bg, color, 0.2)), rgb(t().text_strong));
     let (bg, fg) = match label.kind {
-        LabelKind::Branch => (line_color(lineage), rgb(ui::text_on(t().lane(lineage)))),
+        LabelKind::Branch if label.head => (line_color(lineage), rgb(ui::text_on(lane))),
+        LabelKind::Branch => tinted(lane),
         LabelKind::RemoteBranch => (rgb(t().element), rgb(t().text)),
-        LabelKind::Tag => (rgb(0x6b5b1e), rgb(0xfff3c4)),
-        LabelKind::Stash => (rgb(0x23a455), rgb(0x0b1f12)),
+        LabelKind::Tag => tinted(0xd4a72c),
+        LabelKind::Stash => tinted(0x23a455),
+    };
+    let outline = match label.kind {
+        LabelKind::Branch if !label.head => Some(lane),
+        LabelKind::Tag => Some(0xd4a72c),
+        LabelKind::Stash => Some(0x23a455),
+        _ => None,
     };
     // A cloud says the branch is on a remote too (or only there), the way other clients mark it,
     // instead of a separate `origin` tag beside it.
@@ -467,6 +478,9 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
         .text_xs()
         .cursor_pointer()
         .when(label.head, |badge| badge.border_2().border_color(rgb(t().text_strong)))
+        .when_some(outline.filter(|_| !label.head), |badge, color| {
+            badge.border_1().border_color(Rgba { a: 0.6, ..rgb(color) })
+        })
         // The menu for this badge only; the row's own menu must not also open.
         .on_mouse_down(
             MouseButton::Right,
@@ -500,7 +514,12 @@ fn summary_text(entry: &Entry, gray: bool) -> StyledText {
 fn note_label(note: &Note) -> impl IntoElement + use<> {
     let green = rgb(t().added);
     div()
-        .flex_none()
+        // Shrinks, with an ellipsis, before the message does: the message is what the row is for.
+        .flex_shrink()
+        .min_w(px(88.))
+        .max_w(px(280.))
+        .line_clamp(1)
+        .text_ellipsis()
         .text_xs()
         .when(note.probable, |label| label.italic())
         .when(note.merged, |label| {
@@ -581,7 +600,6 @@ pub fn render_entry(
                 .flex_none()
                 .items_center()
                 .gap_1()
-                .when(label.head, |item| item.child(ui::ring(line_color(lineage))))
                 .child(badge(label, lineage, cx))
         })
         .collect();
@@ -726,7 +744,8 @@ pub fn render_entry(
                         .w(px(1.))
                         .bg(rgb(t().guide))
                 }))
-                .child(ui::kind_icon(kind))
+                // Every row is a commit and the graph says so; only a merge or a pull request earns a mark here.
+                .child(if kind == CommitKind::Commit { div().flex_none().w(px(14.)).into_any_element() } else { ui::kind_icon(kind).into_any_element() })
                 .children(badges)
                 .child(
                     div()

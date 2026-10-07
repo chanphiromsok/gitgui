@@ -21,22 +21,19 @@ pub fn status_color(status: FileStatus) -> Rgba {
     })
 }
 
-/// `(+12 | -1)`, or `(binary)` for a file with no line counts.
+/// `+12 −1`, or `binary` for a file with no line counts. Two colored numbers and nothing else: the room is
+/// the file name's.
 pub fn stats(change: &FileChange) -> AnyElement {
     match (change.additions, change.deletions) {
         (Some(adds), Some(dels)) => div()
             .flex()
             .flex_none()
-            .gap_1()
+            .gap_1p5()
             .text_xs()
-            .text_color(rgb(t().muted))
-            .child("(")
             .child(div().text_color(rgb(t().added)).child(format!("+{adds}")))
-            .child("|")
-            .child(div().text_color(rgb(t().removed)).child(format!("-{dels}")))
-            .child(")")
+            .child(div().text_color(rgb(t().removed)).child(format!("−{dels}")))
             .into_any_element(),
-        _ => div().flex_none().text_xs().text_color(rgb(t().muted)).child("(binary)").into_any_element(),
+        _ => div().flex_none().text_xs().text_color(rgb(t().muted)).child("binary").into_any_element(),
     }
 }
 
@@ -266,14 +263,13 @@ pub fn file_row(
                 .child(
                     // Gives way (with an ellipsis) before the counts do, so a long name never pushes them out of view.
                     div()
-                        .min_w(px(40.))
+                        .min_w(px(72.))
                         .line_clamp(1)
                         .text_ellipsis()
                         .text_color(status_color(change.status))
                         .when(deleted, |name| name.line_through())
                         .child(SharedString::from(name.clone())),
                 )
-                .when(deleted, |row| row.child(deleted_tag()))
                 .when(!dir.is_empty(), |row| {
                     row.child(
                         div()
