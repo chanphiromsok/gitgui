@@ -2,9 +2,12 @@
 //! that is always the same for the same person.
 //!
 //! A GitHub no-reply email (`123+user@users.noreply.github.com`) gives the GitHub avatar; any other
-//! email asks Gravatar, by a SHA-256 of the address. Pictures are fetched in the background and kept
-//! in the data folder, so each is asked for once a week at most. Fetching can be turned off in
-//! Settings; the initials need nothing from the network.
+//! email asks Gravatar, by a SHA-256 of the address. When Gravatar has none and the repository is on
+//! GitHub, GitHub itself is asked who made one of that author's commits (through the `gh` command, so
+//! your own login covers private repositories): that finds the picture of an author who commits with
+//! a plain email address. Pictures are fetched in the background and kept in the data folder, so each
+//! is asked for once a week at most; a failed ask (offline, `gh` not signed in) is not remembered.
+//! Fetching can be turned off in Settings; the initials need nothing from the network.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -31,6 +34,24 @@ pub enum Avatar {
     /// No picture: draw the initials.
     None,
     Picture(Arc<Image>),
+}
+
+/// How asking the network for a picture ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fetched {
+    Image(Vec<u8>),
+    /// The site answered that it has no such picture (404). Worth remembering for a while.
+    Missing,
+    /// No answer, or an odd one: offline, timed out, rate limited. Not remembered, so it is tried again.
+    Failed,
+}
+
+/// One commit an author made in a GitHub repository, to ask GitHub who made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hint {
+    /// `owner/name`.
+    pub repo: String,
+    pub sha: String,
 }
 
 /// `Ada Lovelace` → `AL`, `octocat` → `O`, `jean-luc picard` → `JP`.
@@ -84,11 +105,20 @@ fn fresh(path: &Path) -> bool {
 }
 
 /// The picture for `email`: from the cache folder if it is fresh there, else from the network (and
-/// then kept). Runs on a background thread. `fetch` is what asks the network, so tests can stand in.
-pub fn load(email: &str, dir: Option<&Path>, fetch: impl Fn(&str) -> Option<Vec<u8>>) -> Avatar {
+/// then kept). Runs on a background thread. `fetch` and `lookup` are what ask the network, so tests can
+/// stand in. `lookup` returns the picture's address for a commit's author, `Ok(None)` when GitHub says
+/// the commit's email is not linked to an account, and `Err` when it could not be asked.
+pub fn load(
+    email: &str,
+    dir: Option<&Path>,
+    hint: Option<&Hint>,
+    fetch: impl Fn(&str) -> Fetched,
+    lookup: impl Fn(&Hint) -> Result<Option<String>, ()>,
+) -> Avatar {
     let key = key(email);
     let picture = dir.map(|d| d.join(format!("{key}.img")));
-    let none = dir.map(|d| d.join(format!("{key}.none")));
+    // `.miss` says nothing was found; its text says whether GitHub was asked (`github`) or could not be.
+    let miss = dir.map(|d| d.join(format!("{key}.miss")));
     let from = |bytes: Vec<u8>| match format_of(&bytes) {
         Some(format) => Avatar::Picture(Arc::new(Image::from_bytes(format, bytes))),
         None => Avatar::None,
@@ -98,27 +128,124 @@ pub fn load(email: &str, dir: Option<&Path>, fetch: impl Fn(&str) -> Option<Vec<
     {
         return from(bytes);
     }
-    if none.as_ref().is_some_and(|p| fresh(p)) {
-        return Avatar::None;
+    if let Some(path) = miss.as_ref().filter(|p| fresh(p)) {
+        let asked_github = std::fs::read_to_string(path).is_ok_and(|text| text == "github");
+        // Nothing found before, and GitHub could not be asked then but can be now: ask it.
+        if asked_github || hint.is_none() {
+            return Avatar::None;
+        }
     }
-    let fetched = fetch(&url_for(email)).filter(|bytes| format_of(bytes).is_some());
+    let keep = |bytes: &[u8]| {
+        if let Some(dir) = dir {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(dir.join(format!("{key}.img")), bytes);
+        }
+    };
+    let image = |fetched: Fetched| match fetched {
+        Fetched::Image(bytes) if format_of(&bytes).is_some() => Some(Some(bytes)),
+        Fetched::Failed => None,
+        _ => Some(None),
+    };
+
+    // Gravatar, or GitHub's own address for a no-reply email.
+    match image(fetch(&url_for(email))) {
+        None => return Avatar::None,
+        Some(Some(bytes)) => {
+            keep(&bytes);
+            return from(bytes);
+        }
+        Some(None) => {}
+    }
+    // A plain email: ask GitHub who made one of this author's commits.
+    let mut asked_github = false;
+    if let Some(hint) = hint.filter(|_| !email.trim().to_ascii_lowercase().ends_with("@users.noreply.github.com")) {
+        match lookup(hint) {
+            Err(()) => return Avatar::None,
+            Ok(None) => asked_github = true,
+            Ok(Some(url)) => match image(fetch(&url)) {
+                None => return Avatar::None,
+                Some(Some(bytes)) => {
+                    keep(&bytes);
+                    return from(bytes);
+                }
+                Some(None) => asked_github = true,
+            },
+        }
+    }
     if let Some(dir) = dir {
         let _ = std::fs::create_dir_all(dir);
-        let _ = match &fetched {
-            Some(bytes) => std::fs::write(dir.join(format!("{key}.img")), bytes),
-            None => std::fs::write(dir.join(format!("{key}.none")), b""),
-        };
+        let _ = std::fs::write(dir.join(format!("{key}.miss")), if asked_github { "github" } else { "" });
     }
-    fetched.map_or(Avatar::None, from)
+    Avatar::None
 }
 
-/// Asks the network for a picture; `None` for anything but a small image.
-pub fn fetch(url: &str) -> Option<Vec<u8>> {
+/// Asks the network for a picture: an image, "there is none" (404), or no answer.
+pub fn fetch(url: &str) -> Fetched {
     // One agent for every ask, so connections (and TLS setup) are reused.
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     let agent = AGENT.get_or_init(|| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(8))).build().into());
-    let mut response = agent.get(url).call().ok()?;
-    response.body_mut().with_config().limit(MAX_BYTES).read_to_vec().ok()
+    match agent.get(url).call() {
+        Ok(mut response) => match response.body_mut().with_config().limit(MAX_BYTES).read_to_vec() {
+            Ok(bytes) => Fetched::Image(bytes),
+            Err(_) => Fetched::Failed,
+        },
+        Err(ureq::Error::StatusCode(404 | 410)) => Fetched::Missing,
+        Err(_) => Fetched::Failed,
+    }
+}
+
+/// Asks GitHub, through the `gh` command (so with your own login, which private repositories need),
+/// for the picture of whoever made the commit. `Ok(None)` when the commit's email is linked to no account.
+pub fn gh_lookup(hint: &Hint) -> Result<Option<String>, ()> {
+    use std::process::{Command, Stdio};
+    let name_ok = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let valid = hint.repo.split_once('/').is_some_and(|(owner, name)| name_ok(owner) && name_ok(name))
+        && (7..=64).contains(&hint.sha.len())
+        && hint.sha.chars().all(|c| c.is_ascii_hexdigit());
+    if !valid {
+        return Err(());
+    }
+    // A program started from the Dock does not get the shell's PATH, so look where Homebrew puts it too.
+    let mut child = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
+        .iter()
+        .find_map(|gh| {
+            Command::new(gh)
+                .args(["api", &format!("repos/{}/commits/{}", hint.repo, hint.sha), "--jq", ".author.avatar_url // empty"])
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("NO_COLOR", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        })
+        .ok_or(())?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(10) => std::thread::sleep(Duration::from_millis(40)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(());
+            }
+        }
+    };
+    if !status.success() {
+        return Err(());
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().ok_or(())?, &mut text).map_err(|_| ())?;
+    let url = text.trim();
+    if url.is_empty() {
+        return Ok(None);
+    }
+    // Only GitHub's own picture host; ask for a small one.
+    if !url.starts_with("https://avatars.githubusercontent.com/") {
+        return Ok(None);
+    }
+    Ok(Some(if url.contains('?') { format!("{url}&s=64") } else { format!("{url}?s=64") }))
 }
 
 /// Every email's picture this run, by lowercased email.
@@ -215,28 +342,97 @@ mod tests {
         );
     }
 
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gitgui-avatars-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const NO_LOOKUP: fn(&Hint) -> Result<Option<String>, ()> = |_| Err(());
+
     #[test]
     fn a_picture_is_fetched_once_then_read_from_the_folder_and_none_is_remembered() {
-        let dir = std::env::temp_dir().join(format!("gitgui-avatars-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = temp("once");
         let asked = std::cell::Cell::new(0);
         let fetch = |_: &str| {
             asked.set(asked.get() + 1);
-            Some(PNG.to_vec())
+            Fetched::Image(PNG.to_vec())
         };
-        assert!(matches!(load("a@b.c", Some(&dir), fetch), Avatar::Picture(_)));
-        assert!(matches!(load("A@B.C", Some(&dir), fetch), Avatar::Picture(_)));
+        assert!(matches!(load("a@b.c", Some(&dir), None, fetch, NO_LOOKUP), Avatar::Picture(_)));
+        assert!(matches!(load("A@B.C", Some(&dir), None, fetch, NO_LOOKUP), Avatar::Picture(_)));
         assert_eq!(asked.get(), 1, "the second time comes from the folder");
 
         let nothing = |_: &str| {
             asked.set(asked.get() + 1);
-            None
+            Fetched::Missing
         };
-        assert!(matches!(load("x@y.z", Some(&dir), nothing), Avatar::None));
-        assert!(matches!(load("x@y.z", Some(&dir), nothing), Avatar::None));
+        assert!(matches!(load("x@y.z", Some(&dir), None, nothing, NO_LOOKUP), Avatar::None));
+        assert!(matches!(load("x@y.z", Some(&dir), None, nothing, NO_LOOKUP), Avatar::None));
         assert_eq!(asked.get(), 2, "having no picture is remembered too");
-        assert!(matches!(load("html@y.z", Some(&dir), |_: &str| Some(b"<html>".to_vec())), Avatar::None), "not an image");
+        assert!(
+            matches!(load("html@y.z", Some(&dir), None, |_: &str| Fetched::Image(b"<html>".to_vec()), NO_LOOKUP), Avatar::None),
+            "not an image"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_ask_is_not_remembered_as_having_no_picture() {
+        let dir = temp("failed");
+        let asked = std::cell::Cell::new(0);
+        let offline = |_: &str| {
+            asked.set(asked.get() + 1);
+            Fetched::Failed
+        };
+        assert!(matches!(load("a@b.c", Some(&dir), None, offline, NO_LOOKUP), Avatar::None));
+        assert!(matches!(load("a@b.c", Some(&dir), None, offline, NO_LOOKUP), Avatar::None));
+        assert_eq!(asked.get(), 2, "asked again, because the first answer was not an answer");
+        let back = |_: &str| Fetched::Image(PNG.to_vec());
+        assert!(matches!(load("a@b.c", Some(&dir), None, back, NO_LOOKUP), Avatar::Picture(_)), "found once the network is back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_author_gravatar_does_not_know_is_found_through_github() {
+        let dir = temp("github");
+        let hint = Hint { repo: "acme/app".into(), sha: "abc1234".into() };
+        let gravatar_has_none_github_has_one = |url: &str| {
+            if url.starts_with("https://gravatar.com/") { Fetched::Missing } else { Fetched::Image(PNG.to_vec()) }
+        };
+        let found = |_: &Hint| Ok(Some("https://avatars.githubusercontent.com/u/9?v=4&s=64".to_owned()));
+        assert!(matches!(load("kim@gmail.com", Some(&dir), Some(&hint), gravatar_has_none_github_has_one, found), Avatar::Picture(_)));
+        // Kept: the next time nothing is asked at all.
+        let never = |_: &str| -> Fetched { panic!("asked the network for a kept picture") };
+        assert!(matches!(load("kim@gmail.com", Some(&dir), Some(&hint), never, NO_LOOKUP), Avatar::Picture(_)));
+
+        // `gh` could not be asked (not installed, not signed in): nothing is remembered, so it is tried again.
+        let missing = |_: &str| Fetched::Missing;
+        assert!(matches!(load("lee@gmail.com", Some(&dir), Some(&hint), missing, NO_LOOKUP), Avatar::None));
+        let linked_now = |_: &Hint| Ok(Some("https://avatars.githubusercontent.com/u/7".to_owned()));
+        let github_only = |url: &str| if url.contains("avatars.githubusercontent.com") { Fetched::Image(PNG.to_vec()) } else { Fetched::Missing };
+        assert!(matches!(load("lee@gmail.com", Some(&dir), Some(&hint), github_only, linked_now), Avatar::Picture(_)));
+
+        // GitHub says the email is linked to no account: remembered, not asked again.
+        let unlinked = std::cell::Cell::new(0);
+        let none = |_: &Hint| {
+            unlinked.set(unlinked.get() + 1);
+            Ok(None)
+        };
+        assert!(matches!(load("ghost@gmail.com", Some(&dir), Some(&hint), missing, none), Avatar::None));
+        assert!(matches!(load("ghost@gmail.com", Some(&dir), Some(&hint), missing, none), Avatar::None));
+        assert_eq!(unlinked.get(), 1);
+
+        // Nothing found while there was no commit to ask about: asked again once there is one.
+        assert!(matches!(load("new@gmail.com", Some(&dir), None, missing, NO_LOOKUP), Avatar::None));
+        assert!(matches!(load("new@gmail.com", Some(&dir), Some(&hint), github_only, linked_now), Avatar::Picture(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_github_lookup_refuses_odd_repo_names_and_ids_before_running_anything() {
+        for (repo, sha) in [("a/b c", "abc1234"), ("../x", "abc1234"), ("a/b", "--help"), ("a/b", "xyz"), ("noslash", "abc1234")] {
+            assert!(gh_lookup(&Hint { repo: repo.into(), sha: sha.into() }).is_err(), "{repo} {sha}");
+        }
     }
 
     #[test]

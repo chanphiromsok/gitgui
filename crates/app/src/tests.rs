@@ -1766,3 +1766,60 @@ async fn the_graph_size_setting_scales_the_rows_and_is_remembered(cx: &mut TestA
     ws.update(cx, |ws, cx| ws.set_graph_scale(5000, cx));
     assert_eq!(ws.read_with(cx, |ws, _| ws.settings.graph_scale), 200);
 }
+
+#[gpui::test]
+async fn the_pull_rebase_button_asks_then_pulls_and_keeps_history_straight(cx: &mut TestAppContext) {
+    let fx = bare_fixture("pull-button");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    let remote = fx.0.join("remote.git");
+    fx.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    fx.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fx.git(&["push", "-q", "-u", "origin", "main"]);
+    // A colleague's commit lands on the remote; ours is not pushed yet.
+    let other = fx.0.join("other");
+    let run = |dir: &Path, args: &[&str]| {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Bo")
+            .env("GIT_AUTHOR_EMAIL", "bo@example.com")
+            .env("GIT_COMMITTER_NAME", "Bo")
+            .env("GIT_COMMITTER_EMAIL", "bo@example.com")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    run(&fx.0, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::write(other.join("theirs.txt"), "t\n").unwrap();
+    run(&other, &["add", "."]);
+    run(&other, &["commit", "-q", "-m", "theirs"]);
+    run(&other, &["push", "-q", "origin", "main"]);
+    commit_file(&fx, "mine.txt", "m\n", "mine");
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+
+    // Clicking the button only asks.
+    let at = center_of(cx, "pull-rebase".to_owned());
+    click(cx, MouseButton::Left, at);
+    let (title, confirm) = ws.read_with(cx, |ws, _| {
+        let d = ws.dialog.as_ref().expect("a question is asked first");
+        (d.title.to_string(), d.confirm.to_string())
+    });
+    assert!(title.contains("Pull main with rebase"), "{title}");
+    assert_eq!(confirm, "Pull");
+    assert!(!fx.repo().join("theirs.txt").exists(), "nothing has been pulled yet");
+
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    assert!(fx.repo().join("theirs.txt").exists(), "their commit is here");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| !n.warn && n.text.contains("Pulled main"))));
+    let merges = Command::new("git").arg("-C").arg(fx.repo()).args(["rev-list", "--merges", "--count", "HEAD"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&merges.stdout).trim(), "0", "no merge commit");
+}

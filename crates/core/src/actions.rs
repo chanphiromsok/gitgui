@@ -152,6 +152,14 @@ impl GitCli {
         self.finish(Operation::Rebase, &["rebase", onto])
     }
 
+    /// `git pull --rebase`: fetches the current branch's upstream and replays the commits that are only
+    /// here on top of it, so history stays a straight line instead of gaining a merge commit.
+    /// Git refuses, and says so, with uncommitted changes, a detached HEAD or no upstream. On conflicts
+    /// it stops like a rebase and [`GitCli::abort`] puts everything back.
+    pub fn pull_rebase(&self) -> Result<Outcome, Error> {
+        self.finish(Operation::Rebase, &["pull", "--rebase", "--no-stat"])
+    }
+
     /// Applies one commit on top of the current branch. A merge commit is refused: which side to
     /// follow is a choice this does not make for you.
     pub fn cherry_pick(&self, id: &str) -> Result<Outcome, Error> {

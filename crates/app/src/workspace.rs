@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gitgui_core::{
-    Backend, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Layout, Lineage, LogOptions, People, WorkFile,
+    Backend, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
     MergeClue, Operation, Query, ScanCache, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count,
     visible_rows, people, web_remote,
 };
@@ -368,6 +368,8 @@ pub struct Workspace {
     pub icon_themes: Vec<Arc<IconTheme>>,
     /// Authors' pictures, fetched as rows that show them are drawn.
     avatars: std::cell::RefCell<Avatars>,
+    /// For each author's email, a commit of theirs on GitHub to ask who made it, when Gravatar has no picture.
+    avatar_hints: std::cell::RefCell<HashMap<String, avatars::Hint>>,
     pub menu: Option<MenuState>,
     pub dialog: Option<Dialog>,
     /// What is being done right now, while a git operation runs.
@@ -441,6 +443,24 @@ struct RepoData {
 
 /// Reads the repository; the commits are left unparsed (`None`) when the log is the one `unchanged`
 /// fingerprints.
+/// For each author's email, remembers one of their commits on GitHub, so a picture Gravatar does not
+/// have can be asked of GitHub (see `avatars`). Only github.com repositories count.
+fn note_avatar_hints(
+    hints: &std::cell::RefCell<HashMap<String, avatars::Hint>>,
+    commits: &[Commit],
+    web: Option<&WebRemote>,
+) {
+    let Some(repo) = web.filter(|web| web.host == Host::GitHub).and_then(|web| web.base.strip_prefix("https://github.com/")) else {
+        return;
+    };
+    let mut hints = hints.borrow_mut();
+    for commit in commits.iter().filter(|c| c.stash.is_none()) {
+        hints
+            .entry(commit.email.trim().to_ascii_lowercase())
+            .or_insert_with(|| avatars::Hint { repo: repo.to_owned(), sha: commit.id.clone() });
+    }
+}
+
 fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_core::Error> {
     let git = GitCli::new(path);
     let started = Instant::now();
@@ -562,6 +582,7 @@ impl Workspace {
             themes,
             icon_themes,
             avatars,
+            avatar_hints: Default::default(),
             store,
             projects,
             notice: notice.map(Notice::warn),
@@ -819,6 +840,7 @@ impl Workspace {
                             commits: commits.clone(),
                             people: everyone.clone(),
                         });
+                        note_avatar_hints(&this.avatar_hints, &commits, data.web.as_ref());
                         let (branches, targets) = scan_inputs(&commits);
                         let mut view = RepoView {
                             commits,
@@ -1293,10 +1315,13 @@ impl Workspace {
     /// Asks for one author's picture in the background; when it is in, the next waiting one is asked.
     fn fetch_avatar(&self, email: String, cx: &mut Context<Self>) {
         let dir = self.avatars.borrow().dir.clone();
+        let hint = self.avatar_hints.borrow().get(&email.trim().to_ascii_lowercase()).cloned();
         let task = cx.background_executor().spawn({
             let email = email.clone();
             // Tests never reach the network.
-            async move { avatars::load(&email, dir.as_deref(), if cfg!(test) { |_: &str| None } else { avatars::fetch }) }
+            let fetch: fn(&str) -> avatars::Fetched = if cfg!(test) { |_| avatars::Fetched::Failed } else { avatars::fetch };
+            let lookup: fn(&avatars::Hint) -> Result<Option<String>, ()> = if cfg!(test) { |_| Err(()) } else { avatars::gh_lookup };
+            async move { avatars::load(&email, dir.as_deref(), hint.as_ref(), fetch, lookup) }
         });
         cx.spawn(async move |this, cx| {
             let avatar = task.await;
@@ -1945,6 +1970,11 @@ impl Workspace {
                     } else {
                         view.timing.clone()
                     }),
+            )
+            .child(
+                button("pull-rebase", "Pull (rebase)")
+                    .debug_selector(|| "pull-rebase".to_owned())
+                    .on_click(cx.listener(|this, _, window, cx| this.choose(crate::menu::Action::PullRebase, window, cx))),
             )
             .child(button("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 

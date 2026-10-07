@@ -44,6 +44,8 @@ pub enum Action {
     /// Rebase the current branch onto this one.
     Rebase(String),
     Push(String),
+    /// `git pull --rebase` on the current branch.
+    PullRebase,
     /// Make a branch at this commit.
     CreateBranch(String),
     /// Make a tag at this commit.
@@ -313,6 +315,18 @@ impl Workspace {
                 false,
                 None,
             ),
+            Action::PullRebase => (
+                format!("Pull {current} with rebase?"),
+                format!(
+                    "Fetches the upstream of `{current}` and replays the commits that are only on your side on top of it \
+                     (`git pull --rebase`), so history stays a straight line with no merge commit. Your unpushed commits are \
+                     rewritten, which is safe because they are not shared yet. Nothing is forced. If there are conflicts it \
+                     stops and you can abort to put everything back. Git refuses if you have uncommitted changes."
+                ),
+                "Pull",
+                false,
+                None,
+            ),
             Action::CherryPick(id) => {
                 let summary = self.summary_of(id).unwrap_or_default();
                 (
@@ -394,6 +408,10 @@ impl Workspace {
             }
             Action::Push(branch) => {
                 self.run(format!("Pushing {branch}…"), format!("Pushed {branch}."), None, move |git| git.push_branch(&branch).map(Outcome::Done), cx);
+            }
+            Action::PullRebase => {
+                let on = self.current_branch_name().unwrap_or_default();
+                self.run("Pulling…".to_owned(), format!("Pulled {on} (rebase)."), None, |git| git.pull_rebase(), cx);
             }
             Action::CherryPick(id) => {
                 let shown = short(&id);

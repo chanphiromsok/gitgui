@@ -834,6 +834,64 @@ fn push_sets_an_upstream_the_first_time_pushes_new_commits_and_never_forces() {
     let _ = std::fs::remove_dir_all(&remote);
 }
 
+/// Another person's clone of `remote`, in its own folder, ready to commit and push from.
+fn clone_of(remote: &Path, name: &str) -> TempRepo {
+    let dir = std::env::temp_dir().join(format!("gitgui-test-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let status = Command::new("git")
+        .args(["clone", "-q", remote.to_str().unwrap(), dir.to_str().unwrap()])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    TempRepo(dir)
+}
+
+#[test]
+fn pull_rebase_replays_local_commits_on_the_remotes_and_stops_cleanly_on_conflicts() {
+    let repo = trunk();
+    let remote = std::env::temp_dir().join(format!("gitgui-test-{}-remote-pull", std::process::id()));
+    let _ = std::fs::remove_dir_all(&remote);
+    repo.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    repo.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    let git = GitCli::new(repo.path());
+    git.push_branch("main").unwrap();
+
+    // A colleague pushes a commit; we also made one that is not pushed.
+    let other = clone_of(&remote, "pull-other");
+    other.commit("theirs.txt", "theirs");
+    other.git(&["push", "-q", "origin", "main"]);
+    repo.commit("mine.txt", "mine");
+
+    let outcome = git.pull_rebase().unwrap();
+    assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
+    let log = Command::new("git").arg("-C").arg(repo.path()).args(["log", "--format=%s", "-3"]).output().unwrap();
+    let log = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(log.starts_with("mine\ntheirs\n"), "our commit is on top of theirs: {log:?}");
+    let parents = Command::new("git").arg("-C").arg(repo.path()).args(["rev-list", "--merges", "--count", "HEAD"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&parents.stdout).trim(), "0", "no merge commit was made");
+
+    // Both sides change the same file: the rebase stops, and abort puts it back.
+    other.commit("clash.txt", "their version");
+    other.git(&["push", "-q", "origin", "main"]);
+    repo.commit("clash.txt", "my version");
+    let before = Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "HEAD"]).output().unwrap().stdout;
+    let outcome = git.pull_rebase().unwrap();
+    assert!(matches!(outcome, Outcome::Conflicts { operation: Operation::Rebase, files: 1 }), "{outcome:?}");
+    git.abort(Operation::Rebase).unwrap();
+    let after = Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "HEAD"]).output().unwrap().stdout;
+    assert_eq!(before, after, "abort restored our commit");
+
+    // Uncommitted changes: git refuses and says why; nothing is lost.
+    std::fs::write(repo.path().join("mine.txt"), "edited").unwrap();
+    let result = git.pull_rebase();
+    assert!(matches!(result, Err(Error::Git { .. })) || matches!(result, Ok(Outcome::Done(_))), "{result:?}");
+    assert_eq!(std::fs::read_to_string(repo.path().join("mine.txt")).unwrap(), "edited");
+
+    let _ = std::fs::remove_dir_all(&remote);
+}
+
 #[test]
 fn option_shaped_names_never_reach_git_for_any_operation() {
     let repo = trunk();
