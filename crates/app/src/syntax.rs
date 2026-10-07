@@ -171,6 +171,14 @@ fn languages() -> Vec<Language> {
             "",
         ),
         lang("java", tree_sitter_java::LANGUAGE, tree_sitter_java::HIGHLIGHTS_QUERY, "", ""),
+        // LANGUAGE_PHP, not _ONLY: a .php file starts out as HTML text until its first `<?php`.
+        lang(
+            "php",
+            tree_sitter_php::LANGUAGE_PHP,
+            tree_sitter_php::HIGHLIGHTS_QUERY,
+            tree_sitter_php::INJECTIONS_QUERY,
+            "",
+        ),
         lang("ruby", tree_sitter_ruby::LANGUAGE, tree_sitter_ruby::HIGHLIGHTS_QUERY, "", tree_sitter_ruby::LOCALS_QUERY),
         lang(
             "swift",
@@ -243,6 +251,7 @@ pub fn language_of(path: &str) -> Option<&'static str> {
         "c" | "h" => "c",
         "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" | "mm" | "m" => "cpp",
         "java" => "java",
+        "php" | "phtml" | "php3" | "php4" | "php5" | "phps" => "php",
         "rb" | "rake" | "gemspec" => "ruby",
         "swift" => "swift",
         "kt" | "kts" => "kotlin",
@@ -376,6 +385,24 @@ mod tests {
         assert_eq!(language_of("crates/app/Cargo.toml"), Some("toml"));
         assert_eq!(language_of("Makefile"), Some("bash"));
         assert_eq!(language_of("locales/en/messages.po"), None);
+        assert_eq!(language_of("app/Http/Controllers/UserController.php"), Some("php"));
+        assert_eq!(language_of("resources/views/home.PHTML"), Some("php"));
+    }
+
+    #[test]
+    fn a_php_file_is_colored() {
+        let source = "<?php\n\nnamespace App;\n\n// greet\nfunction greet(string $name): string {\n    return \"Hello, $name\" . 42;\n}\n";
+        let lines = highlight("greet.php", source).expect("php highlights");
+        let text: Vec<&str> = source.split('\n').collect();
+        assert_eq!(names(lines.line(5), text[4]), [("// greet".into(), "comment")]);
+        let sixth = names(lines.line(6), text[5]);
+        assert!(sixth.contains(&("function".into(), "keyword")), "{sixth:?}");
+        assert!(sixth.iter().any(|(t, n)| t == "greet" && n.starts_with("function")), "{sixth:?}");
+        let seventh = names(lines.line(7), text[6]);
+        assert!(seventh.contains(&("return".into(), "keyword")), "{seventh:?}");
+        assert!(seventh.contains(&("Hello, ".into(), "string")), "a string is split around its variable: {seventh:?}");
+        assert!(seventh.contains(&("name".into(), "variable")), "{seventh:?}");
+        assert!(seventh.contains(&("42".into(), "number")), "{seventh:?}");
     }
 
     #[test]
