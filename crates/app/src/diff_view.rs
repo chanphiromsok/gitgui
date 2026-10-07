@@ -43,9 +43,12 @@ impl Workspace {
         let Some(view) = self.commit_view() else { return div().into_any_element() };
         let Some(change) = view.files.get(file.index) else { return div().into_any_element() };
 
-        let title = match &change.old_path {
-            Some(old) => format!("{old} → {}", change.path),
-            None => change.path.clone(),
+        // The file's name leads; its folder (and, for a rename, where it came from) follows, dimmer, and is
+        // what gives way when there is no room.
+        let (folder, name) = change.path.rsplit_once('/').map_or(("", change.path.as_str()), |(folder, name)| (folder, name));
+        let place = match &change.old_path {
+            Some(old) => format!("{folder}  ← {old}"),
+            None => folder.to_owned(),
         };
         let mode = file.mode(repo.mode);
         let count = file.comments.len();
@@ -68,15 +71,25 @@ impl Workspace {
             .child(button("overview", "Overview").on_click(cx.listener(|this, _, _, cx| this.close_file(cx))))
             .child(ui::file_icon(icons::file(change.path.rsplit('/').next().unwrap_or(&change.path))))
             .child(
-                // A long path gives way to the buttons beside it, ending in an ellipsis.
                 div()
-                    .min_w_0()
+                    .flex_none()
+                    .max_w(px(360.))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(status_color(change.status))
-                    .child(SharedString::from(title)),
+                    .child(SharedString::from(name.to_owned())),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(rgb(t().muted))
+                    .child(SharedString::from(place)),
             )
             .when(change.status == FileStatus::Added, |bar| bar.child(added_tag()))
             .when(change.status == FileStatus::Deleted, |bar| bar.child(deleted_tag()))

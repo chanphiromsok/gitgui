@@ -8,7 +8,7 @@ use gpui::{
     AnyElement, Context, FontWeight, Pixels, SharedString, Stateful, Window, div, prelude::*, px, rgb,
 };
 use gitgui_core::Layout;
-use gitgui_store::{DiffMode, FileLayout, GraphFaces};
+use gitgui_store::{DiffMode, FileLayout, GraphFaces, ReviewLayout};
 
 use crate::icons;
 use crate::menu::modal;
@@ -20,7 +20,6 @@ use crate::workspace::Workspace;
 const NAV_W: f32 = 184.;
 const MAX_W: f32 = 820.;
 const MAX_H: f32 = 600.;
-const CARD_W: f32 = 252.;
 
 /// The pages of the settings window, in the order they are listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +157,8 @@ impl Workspace {
         let width = (view - px(48.)).min(px(MAX_W)).max(px(480.));
         let height = (height * 0.9).min(px(MAX_H));
         let page = self.settings_page;
+        // Two cards to a row, filling it: the page's width less the list of pages and the page's own padding.
+        let card_w = ((f32::from(width) - NAV_W - 48. - 8.) / 2.).floor();
 
         let nav = div()
             .flex_none()
@@ -204,7 +205,7 @@ impl Workspace {
                     .child(div().text_lg().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(page.title()))
                     .child(div().text_color(rgb(t().muted)).child(page.blurb())),
             )
-            .children(self.settings_page_body(page, cx));
+            .children(self.settings_page_body(page, card_w, cx));
 
         let footer = div()
             .flex_none()
@@ -237,7 +238,7 @@ impl Workspace {
         ))
     }
 
-    fn settings_page_body(&self, page: SettingsPage, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn settings_page_body(&self, page: SettingsPage, card_w: f32, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let s = &self.settings;
         match page {
             SettingsPage::Graph => {
@@ -298,6 +299,16 @@ impl Workspace {
                 None,
                 vec![
                     row(
+                        "Review layout",
+                        "Where a commit's files and diff go. Below the graph they get the whole width, which suits a split diff.",
+                        segmented(vec![
+                            segment("setting-review-below", "Below the graph", s.review_layout == ReviewLayout::Below)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_review_layout(ReviewLayout::Below, cx))),
+                            segment("setting-review-beside", "Beside the graph", s.review_layout == ReviewLayout::Beside)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_review_layout(ReviewLayout::Beside, cx))),
+                        ]),
+                    ),
+                    row(
                         "File list",
                         "How a commit's changed files are listed. Also the Tree / Flat buttons above the list.",
                         segmented(vec![
@@ -319,7 +330,7 @@ impl Workspace {
                     ),
                 ],
             )],
-            SettingsPage::Appearance => vec![self.theme_cards(cx), self.icon_cards(cx)],
+            SettingsPage::Appearance => vec![self.theme_cards(card_w, cx), self.icon_cards(card_w, cx)],
             SettingsPage::Projects => {
                 let folder = self.clone_folder();
                 let data = self.store_dir().map(|dir| dir.display().to_string()).unwrap_or_else(|| "none".to_owned());
@@ -362,7 +373,7 @@ impl Workspace {
     }
 
     /// Every theme found, as a card with a small preview of its colors; click one to use it.
-    fn theme_cards(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn theme_cards(&self, card_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let current = t().name.clone();
         let where_from = |origin: &Origin| match origin {
             Origin::BuiltIn => "built in",
@@ -374,7 +385,7 @@ impl Workspace {
             let name = theme.name.clone();
             div()
                 .id(("theme", ix))
-                .w(px(CARD_W))
+                .w(px(card_w))
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -441,7 +452,7 @@ impl Workspace {
     }
 
     /// The built-in icons, then each icon theme installed in Zed.
-    fn icon_cards(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn icon_cards(&self, card_w: f32, cx: &mut Context<Self>) -> AnyElement {
         let current = self.settings.icon_theme.clone();
         let names: Vec<Option<String>> =
             std::iter::once(None).chain(self.icon_themes.iter().map(|t| Some(t.name.clone()))).collect();
@@ -450,7 +461,7 @@ impl Workspace {
             let label = name.clone().unwrap_or_else(|| icons::BUILT_IN.to_owned());
             div()
                 .id(("icon-theme", ix))
-                .w(px(CARD_W))
+                .w(px(card_w))
                 .flex()
                 .items_center()
                 .gap_2()

@@ -15,7 +15,7 @@ use gitgui_core::{
     MergeClue, Operation, Query, ScanCache, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count,
     visible_rows, people, web_remote,
 };
-use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, NewComment, Project, Settings, Store};
+use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, FontWeight, ListAlignment, ListState, MouseButton, MouseMoveEvent,
     PathPromptOptions, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
@@ -381,6 +381,8 @@ pub enum Splitter {
     Pane,
     /// Between the changed-files column and the diff.
     Files,
+    /// Between the graph and the file pane below it.
+    PaneHeight,
 }
 
 /// A panel that can be hidden and still reached: pointing at its edge slides it back over the content.
@@ -395,6 +397,12 @@ pub enum Panel {
 pub const FILES_WIDTH: f32 = 230.;
 pub const FILES_MIN: f32 = 150.;
 pub const FILES_MAX: f32 = 520.;
+/// With the pane below the graph: its share of the height to start with, and what each keeps at least.
+pub const PANE_HEIGHT_SHARE: f32 = 0.6;
+pub const PANE_HEIGHT_MIN: f32 = 180.;
+pub const GRAPH_HEIGHT_MIN: f32 = 160.;
+/// About what the banner at the bottom takes while it shows.
+const NOTICE_HEIGHT: f32 = 36.;
 
 gpui::actions!(workspace, [PreviousFile, NextFile]);
 
@@ -423,6 +431,8 @@ pub struct Workspace {
     /// The changed-files column's width, and where it was last drawn (for dragging its divider).
     pub files_width: f32,
     pub files_left: std::rc::Rc<std::cell::Cell<f32>>,
+    /// With the pane below the graph: the height it was dragged to.
+    pub pane_height: Option<f32>,
     /// The page of the settings window that is showing.
     pub settings_page: crate::settings_view::SettingsPage,
     /// Every color theme found, built in first.
@@ -661,6 +671,7 @@ impl Workspace {
             graph_hidden: false,
             files_width: FILES_WIDTH,
             files_left: Default::default(),
+            pane_height: None,
             settings_page: crate::settings_view::SettingsPage::Graph,
             menu: None,
             dialog: None,
@@ -735,6 +746,13 @@ impl Workspace {
             }
             Splitter::Files => {
                 self.files_width = (x - self.files_left.get()).clamp(FILES_MIN, FILES_MAX);
+            }
+            Splitter::PaneHeight => {
+                // The pane runs from the pointer down to the bottom of the area (above the banner, if showing).
+                let height = self.main_height(window);
+                let bottom = height;
+                let most = (height - GRAPH_HEIGHT_MIN).max(PANE_HEIGHT_MIN);
+                self.pane_height = Some((bottom - f32::from(event.position.y)).clamp(PANE_HEIGHT_MIN, most));
             }
         }
         cx.notify();
@@ -1367,6 +1385,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The height of the area the graph and the file pane share: the window's, less the banner when one shows.
+    pub(crate) fn main_height(&self, window: &Window) -> f32 {
+        let banner = if self.notice.is_some() || self.busy.is_some() { NOTICE_HEIGHT } else { 0. };
+        f32::from(window.viewport_size().height) - banner
+    }
+
     /// A thin strip standing where a hidden panel was; pointing at it slides the panel in over the content.
     /// It takes a few pixels of its own, so it never covers anything. `drag` makes it also start that divider's
     /// drag (the sidebar's rail is where the sidebar's divider is, to drag it back out).
@@ -1717,6 +1741,15 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Where the file pane sits: below the graph, or beside it. Kept for the next launch.
+    pub fn set_review_layout(&mut self, layout: ReviewLayout, cx: &mut Context<Self>) {
+        if self.settings.review_layout != layout {
+            self.settings.review_layout = layout;
+            self.save_settings();
+            cx.notify();
+        }
+    }
+
     /// Which commits in the graph show their author's picture. Kept for the next launch.
     pub fn set_graph_faces(&mut self, faces: GraphFaces, cx: &mut Context<Self>) {
         if self.settings.graph_faces != faces {
@@ -1977,6 +2010,24 @@ impl Workspace {
     /// A thin draggable line between two panes.
     pub fn splitter(&self, id: &'static str, which: Splitter, cx: &mut Context<Self>) -> AnyElement {
         let active = self.resizing == Some(which);
+        // Between the graph and a pane below it the line is horizontal.
+        if which == Splitter::PaneHeight {
+            return div()
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .w_full()
+                .h(px(5.))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .cursor(CursorStyle::ResizeUpDown)
+                .hover(|style| style.bg(rgb(t().selected)))
+                .when(active, |divider| divider.bg(rgb(t().selected)))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.begin_resize(which, cx)))
+                .child(div().h(px(if active { 2. } else { 1. })).w_full().bg(rgb(if active { t().accent } else { t().border })))
+                .into_any_element();
+        }
         div()
             .id(id)
             .w(px(5.))
@@ -2187,9 +2238,28 @@ impl Workspace {
                 let width = layout::pane_width(self.pane_width.or(Some((total - sidebar_width) * share)), total, sidebar_width);
                 // What is left for the graph beside the sidebar and the file pane (and its divider).
                 let area = total - sidebar_width - if pane_open { width + 6. } else { 0. };
+                // The pane under the graph, across the whole width, or beside it.
+                let below = pane_open && !graph_gone && self.settings.review_layout == ReviewLayout::Below;
+                if below {
+                    let main_h = self.main_height(window);
+                    let most = (main_h - GRAPH_HEIGHT_MIN).max(PANE_HEIGHT_MIN);
+                    let height = self.pane_height.unwrap_or(main_h * PANE_HEIGHT_SHARE).clamp(PANE_HEIGHT_MIN, most);
+                    let graph = self.render_middle(total - sidebar_width, cx);
+                    let divider = self.splitter("pane-height-divider", Splitter::PaneHeight, cx);
+                    let pane = self.render_pane(window, total - sidebar_width, Some(height), cx);
+                    return div()
+                        .size_full()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .child(div().flex_1().min_h_0().flex().child(graph))
+                        .child(divider)
+                        .child(pane)
+                        .into_any_element();
+                }
                 let middle = (!graph_gone).then(|| self.render_middle(area, cx));
                 let divider = (pane_open && !graph_gone).then(|| self.splitter("pane-divider", Splitter::Pane, cx));
-                let pane = pane_open.then(|| self.render_pane(window, width, cx));
+                let pane = pane_open.then(|| self.render_pane(window, width, None, cx));
                 // Hidden by hand, the graph can be reached by pointing at the left edge of the file pane (in full
                 // view the sidebar's edge is the one in the corner).
                 let by_hand = pane_open && !expanded && self.graph_hidden;
@@ -2218,7 +2288,7 @@ impl Workspace {
                 .items_center()
                 .gap_2()
                 .child(ui::ring(rgb(t().accent)))
-                .child(div().text_color(rgb(t().muted)).child("Current branch"))
+                .when(area >= 640., |row| row.child(div().text_color(rgb(t().muted)).child("Current branch")))
                 .child(div().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(name.clone()))
                 .children(view.base.clone().map(|base| self.render_base(base, cx))),
             None => div().text_color(rgb(t().warning)).child("HEAD is detached"),

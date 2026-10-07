@@ -11,6 +11,7 @@
 //! select <text>           the first commit whose summary has the text (or a row number)
 //! file 0                  open the commit's nth changed file
 //! mode split|unified      layout tree|flat      expand      back      more
+//! review below|beside    where the file pane goes
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
 //! settings [graph|files|appearance|projects]
@@ -57,8 +58,8 @@ pub fn run(window: WindowHandle<Workspace>, file: String, cx: &mut App) {
                     }
                 }
                 "quit" => {
-                    cx.update(|cx| cx.quit()).ok();
-                    return;
+                    // `cx.quit()` leaves a window behind when it is asked from here; leave for good.
+                    std::process::exit(0);
                 }
                 _ => {
                     window.update(cx, |workspace, window, cx| step(workspace, window, word, rest, cx)).ok();
@@ -89,6 +90,10 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         "expand" => workspace.toggle_expanded(cx),
         "back" => workspace.back(cx),
         "more" => workspace.more_context(cx),
+        "review" => workspace.set_review_layout(
+            if rest == "beside" { gitgui_store::ReviewLayout::Beside } else { gitgui_store::ReviewLayout::Below },
+            cx,
+        ),
         "sidebar" => workspace.toggle_sidebar(cx),
         "graph" => workspace.toggle_graph_hidden(cx),
         "files" => workspace.toggle_files_visible(cx),

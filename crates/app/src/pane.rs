@@ -14,7 +14,7 @@ use crate::theme::t;
 
 impl Workspace {
     /// `width` is used beside the graph; in full view the pane fills the area instead.
-    pub fn render_pane(&mut self, window: &mut Window, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_pane(&mut self, window: &mut Window, width: f32, below: Option<f32>, cx: &mut Context<Self>) -> AnyElement {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Some(commit) = repo.commit.as_ref() else { return div().into_any_element() };
         let expanded = repo.expanded;
@@ -120,7 +120,10 @@ impl Workspace {
             .bg(rgb(t().bg))
             .child(header)
             .child(div().flex_1().min_h_0().child(body));
-        if fill {
+        if let Some(height) = below {
+            // Under the graph, across the whole width, at the height it was given.
+            pane.w_full().h(px(height)).flex_none().into_any_element()
+        } else if fill {
             pane.flex_1().min_w_0().border_l_1().border_color(rgb(t().border)).into_any_element()
         } else {
             pane.flex_none().w(px(width)).into_any_element()

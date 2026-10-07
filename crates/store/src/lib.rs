@@ -51,9 +51,21 @@ pub enum FileLayout {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DiffMode {
-    #[default]
     Unified,
+    /// Old and new side by side: how most people review code, and the default.
+    #[default]
     Split,
+}
+
+/// Where the file pane (commit, files and diff) sits relative to the graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewLayout {
+    /// Under the graph, across the whole width: room for a diff, a split one especially.
+    #[default]
+    Below,
+    /// To the right of the graph.
+    Beside,
 }
 
 /// Which commits in the graph are drawn with their author's picture.
@@ -96,6 +108,8 @@ pub struct Settings {
     pub last_project: Option<PathBuf>,
     /// Which commits in the graph show their author's picture.
     pub graph_faces: GraphFaces,
+    /// The file pane below the graph, or beside it.
+    pub review_layout: ReviewLayout,
     /// How large the graph is drawn (commit circles, lanes, row height), in percent. 100 is the default.
     pub graph_scale: u32,
 }
@@ -121,9 +135,10 @@ impl Default for Settings {
             compact_graph: false,
             fetch_avatars: true,
             file_layout: FileLayout::Tree,
-            diff_mode: DiffMode::Unified,
+            diff_mode: DiffMode::Split,
             graph_scale: 100,
             graph_faces: GraphFaces::Tips,
+            review_layout: ReviewLayout::Below,
             last_project: None,
             clone_dir: None,
         }
@@ -561,17 +576,17 @@ mod tests {
     }
 
     #[test]
-    fn the_file_list_and_diff_layout_are_remembered_and_default_to_tree_and_unified() {
+    fn the_file_list_and_diff_layout_are_remembered_and_default_to_tree_and_split() {
         let scratch = Scratch::new("layout-settings");
         let store = scratch.store();
         let fresh = store.settings().unwrap();
-        assert_eq!((fresh.file_layout, fresh.diff_mode), (FileLayout::Tree, DiffMode::Unified));
+        assert_eq!((fresh.file_layout, fresh.diff_mode), (FileLayout::Tree, DiffMode::Split));
 
-        store.save_settings(&Settings { file_layout: FileLayout::Flat, diff_mode: DiffMode::Split, ..Settings::default() }).unwrap();
+        store.save_settings(&Settings { file_layout: FileLayout::Flat, diff_mode: DiffMode::Unified, ..Settings::default() }).unwrap();
         let again = scratch.store().settings().unwrap();
-        assert_eq!((again.file_layout, again.diff_mode), (FileLayout::Flat, DiffMode::Split));
+        assert_eq!((again.file_layout, again.diff_mode), (FileLayout::Flat, DiffMode::Unified));
         let text = fs::read_to_string(scratch.0.join("data/settings.json")).unwrap();
-        assert!(text.contains("\"flat\"") && text.contains("\"split\""), "readable in the file: {text}");
+        assert!(text.contains("\"flat\"") && text.contains("\"unified\""), "readable in the file: {text}");
     }
 
     #[test]
@@ -581,7 +596,7 @@ mod tests {
         fs::write(scratch.0.join("data/settings.json"), r#"{"group_by_parent": false}"#).unwrap();
         let loaded = scratch.store().settings().unwrap();
         assert!(!loaded.group_by_parent);
-        assert_eq!((loaded.file_layout, loaded.diff_mode), (FileLayout::Tree, DiffMode::Unified));
+        assert_eq!((loaded.file_layout, loaded.diff_mode), (FileLayout::Tree, DiffMode::Split));
         // A value from a newer version that this one does not know is an error, not a silent reset.
         fs::write(scratch.0.join("data/settings.json"), r#"{"diff_mode": "sideways"}"#).unwrap();
         assert!(matches!(scratch.store().settings(), Err(Error::Corrupt { .. })));
@@ -618,5 +633,16 @@ mod tests {
         assert_eq!(scratch.store().settings().unwrap().graph_faces, GraphFaces::Selected);
         let text = fs::read_to_string(scratch.0.join("data/settings.json")).unwrap();
         assert!(text.contains("\"selected\""), "readable in the file: {text}");
+    }
+
+    #[test]
+    fn the_review_layout_defaults_to_below_and_is_remembered() {
+        let scratch = Scratch::new("review-layout");
+        let store = scratch.store();
+        assert_eq!(store.settings().unwrap().review_layout, ReviewLayout::Below);
+        store.save_settings(&Settings { review_layout: ReviewLayout::Beside, ..Settings::default() }).unwrap();
+        assert_eq!(scratch.store().settings().unwrap().review_layout, ReviewLayout::Beside);
+        let text = fs::read_to_string(scratch.0.join("data/settings.json")).unwrap();
+        assert!(text.contains("\"beside\""), "readable in the file: {text}");
     }
 }

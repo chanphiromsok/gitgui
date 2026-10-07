@@ -415,6 +415,7 @@ async fn a_very_large_diff_costs_no_more_per_frame_than_a_small_one(cx: &mut Tes
     fx.git(&["commit", "-q", "-m", "big change"]);
 
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx)); // one row per line: the most rows
     open_project(&ws, cx, &fx.repo());
     select(&ws, cx, "big change");
     let ix = ws.read_with(cx, |ws, _| ws.commit_view().unwrap().files.iter().position(|f| f.path == "big.txt").unwrap());
@@ -1028,6 +1029,8 @@ fn center_of(cx: &mut VisualTestContext, name: String) -> Point<gpui::Pixels> {
 }
 
 fn click(cx: &mut VisualTestContext, button: MouseButton, at: Point<gpui::Pixels>) {
+    // A real pointer arrives before it presses.
+    cx.simulate_event(MouseMoveEvent { position: at, pressed_button: None, modifiers: Modifiers::default() });
     cx.simulate_event(MouseDownEvent { button, position: at, modifiers: Modifiers::default(), click_count: 1, first_mouse: false });
     cx.simulate_event(MouseUpEvent { button, position: at, modifiers: Modifiers::default(), click_count: 1 });
 }
@@ -1506,7 +1509,7 @@ async fn flat_and_split_are_remembered_for_the_next_start(cx: &mut TestAppContex
     use gitgui_store::{DiffMode, FileLayout};
     let fx = merged_pr("remember-layout");
 
-    // First run: the defaults are tree and unified. Switch to flat and split.
+    // First run: the defaults are tree and split. Switch to flat and unified.
     {
         let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
         open_project(&ws, cx, &fx.repo());
@@ -1514,28 +1517,28 @@ async fn flat_and_split_are_remembered_for_the_next_start(cx: &mut TestAppContex
             let repo = ws.repo.as_ref().unwrap();
             (repo.layout, repo.mode)
         });
-        assert_eq!((layout, mode), (Layout::Tree, Mode::Unified));
+        assert_eq!((layout, mode), (Layout::Tree, Mode::Split));
 
         ws.update(cx, |ws, cx| ws.set_layout(Layout::Flat, cx));
-        ws.update(cx, |ws, cx| ws.set_mode(Mode::Split, cx));
+        ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx));
         let saved = Store::at(fx.data()).settings().unwrap();
-        assert_eq!((saved.file_layout, saved.diff_mode), (FileLayout::Flat, DiffMode::Split), "written as soon as it is chosen");
+        assert_eq!((saved.file_layout, saved.diff_mode), (FileLayout::Flat, DiffMode::Unified), "written as soon as it is chosen");
 
         // The Settings panel shows the same two choices.
         ws.update(cx, |ws, cx| ws.open_settings(cx));
         draw(cx, &ws);
     }
 
-    // Next start: a brand new workspace on the same data folder opens in flat and split.
+    // Next start: a brand new workspace on the same data folder opens in flat and unified.
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     open_project(&ws, cx, &fx.repo());
     let (layout, mode) = ws.read_with(cx, |ws, _| {
         let repo = ws.repo.as_ref().unwrap();
         (repo.layout, repo.mode)
     });
-    assert_eq!((layout, mode), (Layout::Flat, Mode::Split), "restored without touching anything");
+    assert_eq!((layout, mode), (Layout::Flat, Mode::Unified), "restored without touching anything");
 
-    // And it really shows: the file list is flat and the diff is side by side.
+    // And it really shows: the file list is flat and the diff is one column.
     select(&ws, cx, "chore: m1");
     let flat = ws.read_with(cx, |ws, _| {
         ws.repo.as_ref().unwrap().file_rows.iter().all(|row| matches!(row, gitgui_core::TreeRow::File { .. }))
@@ -1548,14 +1551,14 @@ async fn flat_and_split_are_remembered_for_the_next_start(cx: &mut TestAppContex
     let has_pairs = ws.read_with(cx, |ws, _| {
         ws.repo.as_ref().unwrap().file.as_ref().unwrap().rows.iter().any(|r| matches!(r, DisplayRow::Pair { .. }))
     });
-    assert!(has_pairs, "the first file opens split, with no click on Split");
+    assert!(!has_pairs, "the first file opens unified, with no click on Unified");
     draw(cx, &ws);
 
     // Changing them in the Settings panel works the same way, and the project switch keeps them.
     ws.update(cx, |ws, cx| ws.set_layout(Layout::Tree, cx));
-    ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx));
+    ws.update(cx, |ws, cx| ws.set_mode(Mode::Split, cx));
     let back = Store::at(fx.data()).settings().unwrap();
-    assert_eq!((back.file_layout, back.diff_mode), (FileLayout::Tree, DiffMode::Unified));
+    assert_eq!((back.file_layout, back.diff_mode), (FileLayout::Tree, DiffMode::Split));
 }
 
 /// With every theme and icon theme listed the panel is taller than a short window; it must scroll, not
@@ -1845,6 +1848,7 @@ async fn show_more_lines_widens_the_context_around_each_change_and_collapse_goes
     let context = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().context);
     assert_eq!((context(cx), lines(cx)), (3, 8), "3 lines around one changed line: 3 + removed + added + 3");
 
+    draw(cx, &ws); // the pane's height is known from the first frame on
     // The toolbar button asks for more.
     let at = center_of(cx, "more-context".to_owned());
     click(cx, MouseButton::Left, at);
@@ -1880,6 +1884,7 @@ async fn long_lines_scroll_sideways_and_the_minimap_jumps_to_a_block(cx: &mut Te
     commit_file(&fx, "wide.txt", &text("after one", "after two"), "change twice");
 
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx)); // a removed and an added row each, for the ticks below
     open_project(&ws, cx, &fx.repo());
     select(&ws, cx, "change twice");
     ws.update(cx, |ws, cx| ws.open_file(0, cx));
@@ -2181,6 +2186,7 @@ async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_win
     commit_file(&fx, "r.txt", &text("before"), "base");
     commit_file(&fx, "r.txt", &text("after"), "change");
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    ws.update(cx, |ws, cx| ws.set_review_layout(gitgui_store::ReviewLayout::Beside, cx));
     open_project(&ws, cx, &fx.repo());
     select(&ws, cx, "change");
     ws.update(cx, |ws, cx| ws.open_file(0, cx));
@@ -2210,6 +2216,8 @@ async fn hidden_panels_leave_a_strip_that_brings_them_back_and_the_file_list_res
     use crate::workspace::{FILES_MAX, FILES_MIN, Panel};
     let fx = merged_pr("panels");
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    // The pane beside the graph, where hiding the graph gives its room to the code.
+    ws.update(cx, |ws, cx| ws.set_review_layout(gitgui_store::ReviewLayout::Beside, cx));
     open_project(&ws, cx, &fx.repo());
     select(&ws, cx, "feat: x2");
     ws.update(cx, |ws, cx| ws.open_file(0, cx));
@@ -2262,4 +2270,37 @@ async fn hidden_panels_leave_a_strip_that_brings_them_back_and_the_file_list_res
     ws.update(cx, |ws, cx| ws.peek_panel(Panel::Sidebar, cx));
     draw(cx, &ws);
     assert!(cx.debug_bounds("sidebar-peek").is_some());
+}
+
+#[gpui::test]
+async fn the_pane_below_the_graph_has_a_divider_that_resizes_it_within_limits(cx: &mut TestAppContext) {
+    use crate::workspace::{GRAPH_HEIGHT_MIN, PANE_HEIGHT_MIN};
+    let fx = merged_pr("pane-height");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    assert_eq!(ws.read_with(cx, |ws, _| ws.settings.review_layout), gitgui_store::ReviewLayout::Below, "the default");
+    select(&ws, cx, "feat: x2");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("pane-height-divider").is_some(), "a horizontal divider between the graph and the pane");
+
+    let total = cx.update(|window, _| f32::from(window.viewport_size().height));
+    let move_to = |cx: &mut VisualTestContext, y: f32| {
+        let event = MouseMoveEvent { position: point(px(900.), px(y)), pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() };
+        cx.update(|window, app| ws.update(app, |ws, cx| ws.drag_divider(&event, window, cx)));
+    };
+    ws.update(cx, |ws, cx| ws.begin_resize(Splitter::PaneHeight, cx));
+    move_to(cx, total - 300.);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.pane_height), Some(300.), "the pane runs from the pointer to the bottom");
+    move_to(cx, total - 5.);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.pane_height), Some(PANE_HEIGHT_MIN), "not smaller than it can be read");
+    move_to(cx, 5.);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.pane_height), Some(total - GRAPH_HEIGHT_MIN), "and the graph keeps some rows");
+    ws.update(cx, |ws, cx| ws.end_resize(cx));
+    draw(cx, &ws);
+
+    // Beside the graph there is no such divider.
+    ws.update(cx, |ws, cx| ws.set_review_layout(gitgui_store::ReviewLayout::Beside, cx));
+    assert_eq!(Store::at(fx.data()).settings().unwrap().review_layout, gitgui_store::ReviewLayout::Beside, "kept");
 }
