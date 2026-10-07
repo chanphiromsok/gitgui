@@ -952,6 +952,27 @@ fn a_cancelled_scan_stops_without_asking_git_and_says_what_it_left_unchecked() {
 }
 
 #[test]
+fn reading_the_log_again_parses_nothing_when_git_prints_the_same() {
+    let (repo, _) = squashed_and_open();
+    let git = GitCli::new(repo.path());
+    let options = LogOptions { max_count: Some(20_000), skip: 0 };
+    let (first, commits) = git.log_if_changed(&options, None).unwrap();
+    assert_eq!(commits.as_deref(), Some(git.log(&options).unwrap().as_slice()));
+    assert_eq!(git.log_if_changed(&options, Some(first)).unwrap(), (first, None), "nothing moved: nothing parsed");
+
+    // Anything that changes what the graph shows changes the fingerprint: a commit, a branch, a stash.
+    repo.git(&["branch", "another"]);
+    let (second, commits) = git.log_if_changed(&options, Some(first)).unwrap();
+    assert_ne!(second, first);
+    assert!(commits.unwrap().iter().any(|c| c.refs.iter().any(|r| r.name == "another")));
+    write(&repo, "app.txt", "stashed\n");
+    repo.git(&["stash", "-q"]);
+    let (third, commits) = git.log_if_changed(&options, Some(second)).unwrap();
+    assert_ne!(third, second);
+    assert!(commits.unwrap().iter().any(|c| c.stash.is_some()));
+}
+
+#[test]
 fn a_squash_of_a_very_large_change_is_still_recognized() {
     // The diffs are streamed from one git process into the next; they never sit in memory here.
     let repo = trunk();

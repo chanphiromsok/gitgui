@@ -312,6 +312,42 @@ impl GitCli {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
+    /// The stashes, and what `git log` prints for the graph.
+    fn log_output(&self, options: &LogOptions) -> Result<(Vec<String>, Vec<u8>), Error> {
+        // Asking for the stashes first also fails fast when the folder is not a repository.
+        let stashes = self.stash_ids()?;
+
+        let max = options.max_count.map(|max| format!("--max-count={max}"));
+        let skip = (options.skip > 0).then(|| format!("--skip={}", options.skip));
+        let mut args: Vec<&str> = vec!["log", "--date-order", "--decorate=full", DATE_FORMAT, LOG_FORMAT];
+        args.extend(max.as_deref());
+        args.extend(skip.as_deref());
+        // Explicit tips, not `--all`: that would also walk `refs/stash`, notes, and any `refs/pull/*`.
+        args.extend(["--branches", "--remotes", "--tags"]);
+        if self.has_head() {
+            args.push("HEAD");
+        }
+        args.extend(stashes.iter().map(String::as_str));
+        let stdout = self.run(&args)?;
+        Ok((stashes, stdout))
+    }
+
+    /// [`Backend::log`], with a fingerprint of what git printed. When it is `unchanged` (the fingerprint
+    /// of an earlier read), the commits are not parsed again and `None` comes back in their place:
+    /// the commits read then are still exactly right. Parsing tens of thousands of commits makes
+    /// hundreds of thousands of small allocations, so a refresh that finds nothing new skips that.
+    pub fn log_if_changed(&self, options: &LogOptions, unchanged: Option<u64>) -> Result<(u64, Option<Vec<Commit>>), Error> {
+        use std::hash::{Hash, Hasher};
+        let (stashes, stdout) = self.log_output(options)?;
+        let mut hasher = std::hash::DefaultHasher::new();
+        (&stashes, &stdout).hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        if unchanged == Some(fingerprint) {
+            return Ok((fingerprint, None));
+        }
+        Ok((fingerprint, Some(commits_of(&stashes, &stdout)?)))
+    }
+
     pub(crate) fn has_head(&self) -> bool {
         self.command(&["rev-parse", "--verify", "--quiet", "HEAD"])
             .output()
@@ -576,25 +612,8 @@ const DETAIL_FORMAT: &str = "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%a
 
 impl Backend for GitCli {
     fn log(&self, options: &LogOptions) -> Result<Vec<Commit>, Error> {
-        // Asking for the stashes first also fails fast when the folder is not a repository.
-        let stashes = self.stash_ids()?;
-
-        let max = options.max_count.map(|max| format!("--max-count={max}"));
-        let skip = (options.skip > 0).then(|| format!("--skip={}", options.skip));
-        let mut args: Vec<&str> = vec!["log", "--date-order", "--decorate=full", DATE_FORMAT, LOG_FORMAT];
-        args.extend(max.as_deref());
-        args.extend(skip.as_deref());
-        // Explicit tips, not `--all`: that would also walk `refs/stash`, notes, and any `refs/pull/*`.
-        args.extend(["--branches", "--remotes", "--tags"]);
-        if self.has_head() {
-            args.push("HEAD");
-        }
-        args.extend(stashes.iter().map(String::as_str));
-
-        let stdout = self.run(&args)?;
-        let mut commits = parse_log(&String::from_utf8_lossy(&stdout))?;
-        fold_stashes(&mut commits, &stashes);
-        Ok(commits)
+        let (stashes, stdout) = self.log_output(options)?;
+        commits_of(&stashes, &stdout)
     }
 
     fn current_branch(&self) -> Result<Option<String>, Error> {
@@ -732,6 +751,13 @@ fn fold_stashes(commits: &mut Vec<Commit>, stashes: &[String]) {
         commit.refs.push(Ref { name: format!("stash@{{{n}}}"), kind: RefKind::Stash });
     }
     commits.retain(|commit| !internal.contains(&commit.id));
+}
+
+/// The commits in `git log` output, each stash folded into one commit.
+fn commits_of(stashes: &[String], stdout: &[u8]) -> Result<Vec<Commit>, Error> {
+    let mut commits = parse_log(&String::from_utf8_lossy(stdout))?;
+    fold_stashes(&mut commits, stashes);
+    Ok(commits)
 }
 
 pub(crate) fn parse_log(output: &str) -> Result<Vec<Commit>, Error> {
