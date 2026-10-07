@@ -600,7 +600,7 @@ impl Workspace {
         let icon_themes = icons::all();
         icons::set(settings.icon_theme.as_ref().and_then(|name| icon_themes.iter().find(|t| &t.name == name).cloned()));
         let avatars = std::cell::RefCell::new(Avatars::new(store.as_ref().map(|s| s.dir().join("avatars"))));
-        Self {
+        let mut this = Self {
             focus: cx.focus_handle(),
             themes,
             icon_themes,
@@ -634,6 +634,17 @@ impl Workspace {
             last_log: None,
             shown_pictures: Vec::new(),
             counts: Arc::default(),
+        };
+        this.reopen_last_project(cx);
+        this
+    }
+
+    /// Opens the project that was open when the app was last closed, if it is still in the list and
+    /// its folder is still there.
+    fn reopen_last_project(&mut self, cx: &mut Context<Self>) {
+        let Some(last) = self.settings.last_project.clone() else { return };
+        if last.is_dir() && self.projects.iter().any(|p| p.path == last) {
+            self.select_project(last, cx);
         }
     }
 
@@ -757,6 +768,10 @@ impl Workspace {
         }
         self.projects.retain(|p| p.path != path);
         self.scan_caches.remove(path);
+        if self.settings.last_project.as_deref() == Some(path) {
+            self.settings.last_project = None;
+            self.save_settings();
+        }
         if self.last_log.as_ref().is_some_and(|last| last.path == path) {
             self.last_log = None;
         }
@@ -771,6 +786,10 @@ impl Workspace {
 
     pub fn select_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(project) = self.projects.iter().find(|p| p.path == path).cloned() else { return };
+        if self.settings.last_project.as_ref() != Some(&path) {
+            self.settings.last_project = Some(path.clone());
+            self.save_settings();
+        }
         self.loads += 1;
         let generation = self.loads;
         // Reading the same repository again keeps its filters; another one starts with none.
@@ -1985,8 +2004,10 @@ impl Workspace {
             Phase::Ready(_) => {
                 let pane_open = repo.commit.is_some();
                 let expanded = repo.expanded && pane_open;
-                let middle = (!expanded).then(|| self.render_middle(pane_open, cx));
                 let width = layout::pane_width(self.pane_width, total, sidebar_width);
+                // What is left for the graph beside the sidebar and the file pane (and its divider).
+                let area = total - sidebar_width - if pane_open { width + 6. } else { 0. };
+                let middle = (!expanded).then(|| self.render_middle(area, cx));
                 let divider = (pane_open && !expanded).then(|| self.splitter("pane-divider", Splitter::Pane, cx));
                 let pane = pane_open.then(|| self.render_pane(window, width, cx));
                 div().size_full().flex().children(middle).children(divider).children(pane).into_any_element()
@@ -1995,7 +2016,7 @@ impl Workspace {
     }
 
     /// The branch header and the commit graph.
-    fn render_middle(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_middle(&self, area: f32, cx: &mut Context<Self>) -> AnyElement {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Phase::Ready(view) = &repo.phase else { return div().into_any_element() };
 
@@ -2052,7 +2073,7 @@ impl Workspace {
             .flex_col()
             .child(header)
             .child(self.render_filter_bar(repo, view, cx))
-            .child(self.render_graph(compact, cx))
+            .child(self.render_graph(area, cx))
             .into_any_element()
     }
 
@@ -2152,18 +2173,19 @@ impl Workspace {
             .child(div().text_color(rgb(t().text)).child(base.name))
     }
 
-    fn render_graph(&self, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_graph(&self, area: f32, cx: &mut Context<Self>) -> AnyElement {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Phase::Ready(view) = &repo.phase else { return div().into_any_element() };
         let count = view.entries.len();
         let width = view.graph_width;
+        let cols = layout::Columns::fit(area, width);
 
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(graph::columns(width, compact))
+            .child(graph::columns(width, cols))
             .child(
                 uniform_list(
                     "commits",
@@ -2195,7 +2217,7 @@ impl Workspace {
                                     view.graph_width,
                                     selected == Some(ix),
                                     highlight,
-                                    compact,
+                                    cols,
                                     density,
                                     cx,
                                 ))

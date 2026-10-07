@@ -13,6 +13,82 @@ pub const GRAPH_MIN: f32 = 320.;
 /// Without a width of its own, the file pane takes this share of what is right of the sidebar.
 pub const PANE_SHARE: f32 = 0.56;
 
+/// How the date is written in the graph's Date column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateStyle {
+    /// `7 Oct 2026 15:32`.
+    Full,
+    /// `7 Oct 15:32`: no year.
+    Short,
+    Hidden,
+}
+
+/// Which of the graph's columns after Description fit. Description always gets its share first: the
+/// others are dropped, the date shortened or hidden, author and commit hidden, until it has room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Columns {
+    pub date: DateStyle,
+    pub author: bool,
+    pub commit: bool,
+}
+
+impl Columns {
+    pub const DATE_W: f32 = 130.;
+    pub const SHORT_DATE_W: f32 = 92.;
+    pub const AUTHOR_W: f32 = 130.;
+    pub const COMMIT_W: f32 = 64.;
+    /// What Description is kept at least, before anything else is given room.
+    pub const DESCRIPTION_MIN: f32 = 340.;
+    /// The row's padding and the gap between its columns.
+    const PADDING: f32 = 16.;
+    const GAP: f32 = 8.;
+
+    /// The columns for a graph area `area` wide whose graph drawing takes `graph`.
+    pub fn fit(area: f32, graph: f32) -> Self {
+        let tiers = [
+            Columns { date: DateStyle::Full, author: true, commit: true },
+            Columns { date: DateStyle::Full, author: false, commit: false },
+            Columns { date: DateStyle::Short, author: false, commit: false },
+        ];
+        let room = area - graph - Self::PADDING - Self::GAP;
+        tiers
+            .into_iter()
+            .find(|tier| room - tier.width() >= Self::DESCRIPTION_MIN)
+            .unwrap_or(Columns { date: DateStyle::Hidden, author: false, commit: false })
+    }
+
+    pub fn date_width(&self) -> f32 {
+        match self.date {
+            DateStyle::Full => Self::DATE_W,
+            DateStyle::Short => Self::SHORT_DATE_W,
+            DateStyle::Hidden => 0.,
+        }
+    }
+
+    /// What the columns take, with the gap before each.
+    fn width(&self) -> f32 {
+        let mut width = 0.;
+        if self.date != DateStyle::Hidden {
+            width += self.date_width() + Self::GAP;
+        }
+        if self.author {
+            width += Self::AUTHOR_W + Self::GAP;
+        }
+        if self.commit {
+            width += Self::COMMIT_W + Self::GAP;
+        }
+        width
+    }
+}
+
+/// `7 Oct 2026 15:32` as `7 Oct 15:32`.
+pub fn short_date(date: &str) -> String {
+    date.split_whitespace()
+        .filter(|word| !(word.len() == 4 && word.chars().all(|c| c.is_ascii_digit())))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The sidebar's width for a requested one in a window `total` wide.
 pub fn sidebar_width(requested: f32, total: f32, pane_open: bool) -> f32 {
     let reserved = GRAPH_MIN + if pane_open { PANE_MIN } else { 0. };
@@ -45,6 +121,32 @@ mod tests {
     use super::*;
 
     const WIDE: f32 = 1600.;
+
+    #[test]
+    fn description_keeps_its_room_and_the_other_columns_give_way_first() {
+        use super::{Columns, DateStyle};
+        let graph = 100.;
+        assert_eq!(Columns::fit(1400., graph), Columns { date: DateStyle::Full, author: true, commit: true });
+        let tier = |area| Columns::fit(area, graph);
+        // Narrower: author and commit go, then the year, then the date.
+        assert_eq!(tier(800.), Columns { date: DateStyle::Full, author: false, commit: false });
+        assert_eq!(tier(610.), Columns { date: DateStyle::Full, author: false, commit: false });
+        assert_eq!(tier(580.), Columns { date: DateStyle::Short, author: false, commit: false });
+        assert_eq!(tier(540.).date, DateStyle::Hidden);
+        // Whatever is shown, Description keeps at least its minimum (unless even that does not fit).
+        for area in [500., 540., 580., 640., 800., 1000., 1400., 2000.] {
+            let cols = tier(area);
+            let used = graph + 16. + 8. + cols.width();
+            assert!(area - used >= Columns::DESCRIPTION_MIN || cols.date == DateStyle::Hidden, "{area}: {cols:?}");
+        }
+    }
+
+    #[test]
+    fn a_short_date_drops_only_the_year() {
+        assert_eq!(super::short_date("7 Oct 2026 15:32"), "7 Oct 15:32");
+        assert_eq!(super::short_date("12 Jan 2025 09:05"), "12 Jan 09:05");
+        assert_eq!(super::short_date(""), "");
+    }
 
     #[test]
     fn the_sidebar_stays_between_its_limits() {

@@ -1919,3 +1919,59 @@ async fn long_lines_scroll_sideways_and_the_minimap_jumps_to_a_block(cx: &mut Te
     draw(cx, &ws);
     assert!(top(cx) < 30, "back near the start, row {}", top(cx));
 }
+
+#[gpui::test]
+async fn the_project_open_last_time_opens_again_on_the_next_start(cx: &mut TestAppContext) {
+    let fx = merged_pr("last-project");
+    let data = fx.data();
+    // The app keeps the real path (on a Mac /var is really /private/var).
+    let repo = fx.repo().canonicalize().unwrap();
+    {
+        let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(data.clone())), cx));
+        assert!(ws.read_with(cx, |ws, _| ws.repo.is_none()), "nothing was open before");
+        open_project(&ws, cx, &fx.repo());
+        assert_eq!(Store::at(data.clone()).settings().unwrap().last_project, Some(repo.clone()));
+    }
+    // A new start: the project is open and its history is read without a click.
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(data.clone())), cx));
+    cx.run_until_parked();
+    let open = ws.read_with(cx, |ws, _| ws.repo.as_ref().map(|r| r.project.path.clone()));
+    assert_eq!(open, Some(repo.clone()));
+    assert!(!summaries(&ws, cx).is_empty(), "the history is there");
+
+    // Removing it forgets it: the next start opens nothing.
+    ws.update(cx, |ws, cx| ws.remove_project(&repo, cx));
+    assert_eq!(Store::at(data.clone()).settings().unwrap().last_project, None);
+    let (again, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(data.clone())), cx));
+    assert!(again.read_with(cx, |ws, _| ws.repo.is_none()));
+}
+
+#[gpui::test]
+async fn a_last_project_whose_folder_is_gone_is_not_opened(cx: &mut TestAppContext) {
+    let fx = merged_pr("last-gone");
+    let data = fx.data();
+    {
+        let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(data.clone())), cx));
+        open_project(&ws, cx, &fx.repo());
+    }
+    std::fs::remove_dir_all(fx.repo()).unwrap();
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(data.clone())), cx));
+    cx.run_until_parked();
+    assert!(ws.read_with(cx, |ws, _| ws.repo.is_none()), "no error screen for a folder that moved");
+}
+
+#[gpui::test]
+async fn the_date_gives_way_so_the_description_keeps_its_room(cx: &mut TestAppContext) {
+    let fx = merged_pr("narrow-columns");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    // A wide window shows the whole row; the graph pane squeezed narrow by an open file pane draws without
+    // panicking too.
+    draw(cx, &ws);
+    select(&ws, cx, "Merge pull request #1 from owner/feat/x");
+    draw(cx, &ws);
+    cx.simulate_resize(size(px(900.), px(600.)));
+    let view = AnyView::from(ws.clone());
+    cx.draw(point(px(0.), px(0.)), size(AvailableSpace::Definite(px(900.)), AvailableSpace::Definite(px(600.))), move |_, _| view);
+    assert!(cx.debug_bounds("row-0").is_some());
+}

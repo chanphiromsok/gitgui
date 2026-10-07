@@ -77,6 +77,8 @@ pub struct Settings {
     pub file_layout: FileLayout,
     /// A file's diff unified or split. Remembered from one launch to the next.
     pub diff_mode: DiffMode,
+    /// The project that was open last, to open again on the next start.
+    pub last_project: Option<PathBuf>,
     /// How large the graph is drawn (commit circles, lanes, row height), in percent. 100 is the default.
     pub graph_scale: u32,
 }
@@ -104,6 +106,7 @@ impl Default for Settings {
             file_layout: FileLayout::Tree,
             diff_mode: DiffMode::Unified,
             graph_scale: 100,
+            last_project: None,
         }
     }
 }
@@ -576,5 +579,14 @@ mod tests {
         // A hand-edited value outside the range is brought inside rather than drawing a 0 px graph.
         assert_eq!(Settings { graph_scale: 0, ..Settings::default() }.graph_factor(), 0.75);
         assert_eq!(Settings { graph_scale: 9000, ..Settings::default() }.graph_factor(), 2.0);
+    }
+
+    #[test]
+    fn the_last_open_project_is_remembered() {
+        let scratch = Scratch::new("last-project");
+        let store = scratch.store();
+        assert_eq!(store.settings().unwrap().last_project, None);
+        store.save_settings(&Settings { last_project: Some(PathBuf::from("/work/app")), ..Settings::default() }).unwrap();
+        assert_eq!(scratch.store().settings().unwrap().last_project, Some(PathBuf::from("/work/app")));
     }
 }

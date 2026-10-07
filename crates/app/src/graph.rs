@@ -18,6 +18,7 @@ use gpui::{
 
 use crate::avatars::Avatar;
 use crate::icons;
+use crate::layout::{Columns, DateStyle, short_date};
 use crate::menu::MenuTarget;
 use crate::ui::{self, MONO, line_color};
 use crate::workspace::Workspace;
@@ -64,7 +65,6 @@ impl Density {
     }
 }
 pub const MAX_DRAWN_LANES: usize = 14;
-const DATE_COMPACT_W: f32 = 120.;
 /// How much of a branch line's color remains when another line is in front.
 const DIMMED: f32 = 0.22;
 /// How much remains of a commit, and a line, that is not part of the current branch's history.
@@ -397,8 +397,8 @@ pub fn graph_width(widest_lanes: usize, density: Density) -> f32 {
     widest_lanes.min(MAX_DRAWN_LANES + 1) as f32 * density.lane_w + 8.
 }
 
-/// `compact` drops the Author and Commit columns, to leave room beside the file pane.
-pub fn columns(graph_width: f32, compact: bool) -> impl IntoElement {
+/// The column titles; `cols` says which of the columns after Description fit.
+pub fn columns(graph_width: f32, cols: Columns) -> impl IntoElement {
     let cell = |text: &'static str| div().font_weight(FontWeight::SEMIBOLD).child(text);
     div()
         .h(px(28.))
@@ -411,9 +411,10 @@ pub fn columns(graph_width: f32, compact: bool) -> impl IntoElement {
         .border_b_1()
         .border_color(rgb(t().border))
         .child(cell("Graph").w(px(graph_width)))
-        .child(cell("Description").flex_1())
-        .child(cell("Date").w(px(if compact { DATE_COMPACT_W } else { 130. })))
-        .when(!compact, |row| row.child(cell("Author").w(px(130.))).child(cell("Commit").w(px(64.))))
+        .child(cell("Description").flex_1().min_w_0())
+        .when(cols.date != DateStyle::Hidden, |row| row.child(cell("Date").w(px(cols.date_width()))))
+        .when(cols.author, |row| row.child(cell("Author").w(px(Columns::AUTHOR_W))))
+        .when(cols.commit, |row| row.child(cell("Commit").w(px(Columns::COMMIT_W))))
 }
 
 fn faded(color: Rgba, alpha: f32) -> Rgba {
@@ -528,7 +529,7 @@ pub fn render_entry(
     graph_width: f32,
     selected: bool,
     highlight: Option<usize>,
-    compact: bool,
+    cols: Columns,
     density: Density,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
@@ -720,19 +721,21 @@ pub fn render_entry(
                 }))
                 .children(chips),
         )
-        .child(
-            div()
-                .w(px(if compact { DATE_COMPACT_W } else { 130. }))
-                .flex_none()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_color(rgb(t().muted))
-                .child(entry.date.clone()),
-        )
-        .when(!compact, |row| {
+        .when(cols.date != DateStyle::Hidden, |row| {
             row.child(
                 div()
-                    .w(px(130.))
+                    .w(px(cols.date_width()))
+                    .flex_none()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_color(rgb(t().muted))
+                    .child(if cols.date == DateStyle::Short { SharedString::from(short_date(&entry.date)) } else { entry.date.clone() }),
+            )
+        })
+        .when(cols.author, |row| {
+            row.child(
+                div()
+                    .w(px(Columns::AUTHOR_W))
                     .flex_none()
                     .flex()
                     .items_center()
@@ -742,7 +745,9 @@ pub fn render_entry(
                     .when(entry.commit.is_some(), |cell| cell.child(ui::avatar(&entry.person.name, &entry.person.email, avatar, 16. * density.scale)))
                     .child(div().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(entry.author.clone())),
             )
-            .child(div().w(px(64.)).flex_none().font_family(MONO).text_color(rgb(t().muted)).child(entry.short_id.clone()))
+        })
+        .when(cols.commit, |row| {
+            row.child(div().w(px(Columns::COMMIT_W)).flex_none().font_family(MONO).text_color(rgb(t().muted)).child(entry.short_id.clone()))
         })
 }
 
