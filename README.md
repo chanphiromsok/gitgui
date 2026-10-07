@@ -1,6 +1,17 @@
 # gitgui
 
-A Git GUI in Rust, on GPUI. Feature inventory and architecture: `docs/feature-spec.md`.
+A fast Git GUI in Rust, on GPUI, for reading history on repositories that work through pull requests.
+
+![gitgui showing a release branch with its pull requests, their commits indented underneath, and squash-merged branches marked as merged](docs/screenshot.webp)
+
+**What it fixes**
+
+- **"Is this branch merged?"** Squash and rebase merges leave no link in git history, so most tools show the branch as unmerged forever. gitgui finds them (same changes, same PR number, same messages) and marks the branch *✓ squash-merged into release/1.0.0 (#45)*. The squash commit says *squash of branch …*.
+- **A pull request's commits are scattered through the log.** They are listed indented under the PR, with a guide line, and fold away.
+- **Where did this branch start?** Each branch is one coloured line down to its fork point, with the current branch ringed.
+- **Slow on big histories.** It scrolls 10,000-line diffs and thousands of commits smoothly, and refreshes do not re-scan.
+
+Also: Tree/Flat file list, Unified/Split diff (both remembered), line comments, and right-click checkout, merge, rebase, push and more, always asking before anything destructive. Feature inventory and architecture: `docs/feature-spec.md`.
 
 ## Build and run
 
