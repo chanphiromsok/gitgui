@@ -390,6 +390,8 @@ pub struct Workspace {
     file_ticket: Arc<AtomicU64>,
     commit_ticket: Arc<AtomicU64>,
     last_log: Option<LastLog>,
+    /// The pictures the file pane drew last; each is handed back to the window once it is not shown.
+    shown_pictures: Vec<Arc<gpui::RenderImage>>,
     /// How much background work has actually run.
     pub(crate) counts: Arc<Counts>,
 }
@@ -586,6 +588,7 @@ impl Workspace {
             file_ticket: Arc::new(AtomicU64::new(0)),
             commit_ticket: Arc::new(AtomicU64::new(0)),
             last_log: None,
+            shown_pictures: Vec::new(),
             counts: Arc::default(),
         }
     }
@@ -1085,8 +1088,8 @@ impl Workspace {
                 };
                 // A picture is shown before and after, as well as (for an SVG) diffed as text.
                 let images = image.then(|| preview::Images {
-                    old: old.clone().and_then(|bytes| preview::preview(path, bytes)),
-                    new: new.clone().and_then(|bytes| preview::preview(path, bytes)),
+                    old: old.as_deref().and_then(|bytes| preview::preview(path, bytes)),
+                    new: new.as_deref().and_then(|bytes| preview::preview(path, bytes)),
                 });
                 if !wanted() {
                     return None;
@@ -1561,6 +1564,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.release_pictures(window);
         let total = f32::from(window.viewport_size().width);
         let pane_open = self.repo.as_ref().is_some_and(|repo| repo.commit.is_some());
         let sidebar_width = self.shown_sidebar_width(total, pane_open);
@@ -1608,6 +1612,20 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// Hands back to the window the pictures the file pane no longer shows: GPUI keeps a drawn
+    /// picture's texture until it is told to let go, so every picture ever looked at would stay.
+    fn release_pictures(&mut self, window: &mut Window) {
+        let now: Vec<Arc<gpui::RenderImage>> = match self.repo.as_ref().and_then(|repo| repo.file.as_ref()) {
+            Some(FileState { images: Some(images), .. }) => images.pictures().cloned().collect(),
+            _ => Vec::new(),
+        };
+        for gone in std::mem::replace(&mut self.shown_pictures, now) {
+            if !self.shown_pictures.iter().any(|shown| Arc::ptr_eq(shown, &gone)) {
+                window.drop_image(gone).ok();
+            }
+        }
+    }
+
     /// The sidebar can be hidden only while a repository is open, so there is always a way to pick one.
     pub fn sidebar_shown(&self) -> bool {
         !self.settings.sidebar_hidden || self.repo.is_none()

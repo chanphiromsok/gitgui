@@ -1695,3 +1695,39 @@ async fn stepping_through_files_quickly_reads_only_the_one_left_open(cx: &mut Te
     cx.run_until_parked();
     assert_eq!(count(&ws, cx, |c| &c.file_reads), before);
 }
+
+#[gpui::test]
+async fn pictures_looked_at_are_let_go_once_another_file_is_open(cx: &mut TestAppContext) {
+    let fx = fixture("pictures-let-go");
+    for n in 0..4u8 {
+        let picture = image::RgbaImage::from_fn(64, 48, |x, y| image::Rgba([x as u8, y as u8, n, 255]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        picture.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        std::fs::write(fx.repo().join(format!("p{n}.png")), out.into_inner()).unwrap();
+    }
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "pictures"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "pictures");
+
+    let mut seen = Vec::new();
+    for n in 0..4 {
+        ws.update(cx, |ws, cx| ws.open_file(n, cx));
+        cx.run_until_parked();
+        draw(cx, &ws);
+        let picture = ws.read_with(cx, |ws, _| {
+            let images = ws.repo.as_ref().unwrap().file.as_ref().unwrap().images.clone().expect("a picture");
+            assert_eq!(images.new.as_ref().map(|p| (p.width, p.height)), Some((64, 48)));
+            images.new.unwrap().source
+        });
+        seen.push(std::sync::Arc::downgrade(&picture));
+    }
+    draw(cx, &ws);
+    // Only the one open is still held; the window was told to drop the others' textures.
+    let alive: Vec<bool> = seen.iter().map(|p| p.upgrade().is_some()).collect();
+    assert_eq!(alive, [false, false, false, true]);
+    ws.update(cx, |ws, cx| ws.close_pane(cx));
+    draw(cx, &ws);
+    assert!(seen[3].upgrade().is_none(), "closing the pane lets go of the last one too");
+}

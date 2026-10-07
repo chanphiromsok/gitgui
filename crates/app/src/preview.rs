@@ -1,10 +1,15 @@
 //! Pictures in the file pane: an image a commit added, removed or changed is shown, before and
 //! after, with its size in pixels and in bytes.
+//!
+//! Pictures are decoded here, in the background, rather than handed to GPUI as encoded bytes: GPUI
+//! keeps every image it decodes, and its texture, for as long as the app runs, so each picture ever
+//! looked at would stay in memory. Decoded here, the pane hands each one back (`Window::drop_image`)
+//! once it is no longer shown.
 
 use std::io::Cursor;
 use std::sync::Arc;
 
-use gpui::{Image, ImageFormat, ImageSource, RenderImage};
+use gpui::{ImageFormat, RenderImage};
 
 /// Images bigger than this are not read for a preview.
 const MAX_BYTES: usize = 30 << 20;
@@ -14,27 +19,12 @@ const SVG_PIXELS: u32 = 1024;
 /// One side of a changed image.
 #[derive(Clone)]
 pub struct Preview {
-    pub source: Picture,
+    /// The pixels, ready to draw (an SVG is drawn here too: GPUI's own swaps its colors).
+    pub source: Arc<RenderImage>,
     pub width: u32,
     pub height: u32,
     /// The file's size.
     pub bytes: usize,
-}
-
-/// What to draw: an image GPUI decodes itself, or an SVG drawn here (GPUI's own swaps its colors).
-#[derive(Clone)]
-pub enum Picture {
-    Decoded(Arc<Image>),
-    Drawn(Arc<RenderImage>),
-}
-
-impl Picture {
-    pub fn source(&self) -> ImageSource {
-        match self {
-            Picture::Decoded(image) => image.clone().into(),
-            Picture::Drawn(image) => image.clone().into(),
-        }
-    }
 }
 
 /// Both sides of a changed image; a side is `None` where the file was not there (or would not read).
@@ -42,6 +32,13 @@ impl Picture {
 pub struct Images {
     pub old: Option<Preview>,
     pub new: Option<Preview>,
+}
+
+impl Images {
+    /// The pictures to draw.
+    pub fn pictures(&self) -> impl Iterator<Item = &Arc<RenderImage>> {
+        [&self.old, &self.new].into_iter().flatten().map(|preview| &preview.source)
+    }
 }
 
 fn format_of(path: &str) -> Option<ImageFormat> {
@@ -64,25 +61,54 @@ pub fn is_image(path: &str) -> bool {
 }
 
 /// A preview of `bytes`, the file `path`; `None` when it does not read as an image.
-pub fn preview(path: &str, bytes: Vec<u8>) -> Option<Preview> {
+pub fn preview(path: &str, bytes: &[u8]) -> Option<Preview> {
     let size = bytes.len();
     if size > MAX_BYTES {
         return None;
     }
     match format_of(path)? {
         ImageFormat::Svg => {
-            let svg = std::str::from_utf8(&bytes).ok()?;
+            let svg = std::str::from_utf8(bytes).ok()?;
             let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).ok()?;
             let (width, height) = (tree.size().width().round() as u32, tree.size().height().round() as u32);
             let drawn = crate::icons::rasterize(svg, SVG_PIXELS)?;
-            Some(Preview { source: Picture::Drawn(drawn), width, height, bytes: size })
+            Some(Preview { source: drawn, width, height, bytes: size })
         }
         format => {
             let (width, height) =
-                image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
-            Some(Preview { source: Picture::Decoded(Arc::new(Image::from_bytes(format, bytes))), width, height, bytes: size })
+                image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
+            Some(Preview { source: decode(format, bytes)?, width, height, bytes: size })
         }
     }
+}
+
+/// Decodes a picture the way GPUI does (every frame of a GIF), in the blue, green, red, alpha order it
+/// draws in.
+fn decode(format: ImageFormat, bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    use image::AnimationDecoder;
+    let to_bgra = |pixels: &mut [u8]| pixels.chunks_exact_mut(4).for_each(|pixel| pixel.swap(0, 2));
+    let frames: Vec<image::Frame> = match format {
+        ImageFormat::Gif => {
+            let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).ok()?;
+            let mut frames = decoder.into_frames().collect_frames().ok()?;
+            frames.iter_mut().for_each(|frame| to_bgra(frame.buffer_mut()));
+            frames
+        }
+        format => {
+            let format = match format {
+                ImageFormat::Png => image::ImageFormat::Png,
+                ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+                ImageFormat::Webp => image::ImageFormat::WebP,
+                ImageFormat::Bmp => image::ImageFormat::Bmp,
+                ImageFormat::Tiff => image::ImageFormat::Tiff,
+                _ => return None,
+            };
+            let mut pixels = image::load_from_memory_with_format(bytes, format).ok()?.into_rgba8();
+            to_bgra(&mut pixels);
+            vec![image::Frame::new(pixels)]
+        }
+    };
+    (!frames.is_empty()).then(|| Arc::new(RenderImage::new(frames)))
 }
 
 /// `245.3 KB`, counting a kilobyte as 1000 bytes, as Finder does.
@@ -130,25 +156,40 @@ mod tests {
     fn a_png_reads_its_size_in_pixels_and_bytes() {
         let bytes = png();
         let size = bytes.len();
-        let preview = preview("a.png", bytes).unwrap();
+        let preview = preview("a.png", &bytes).unwrap();
         assert_eq!((preview.width, preview.height, preview.bytes), (3, 2, size));
-        assert!(matches!(preview.source, Picture::Decoded(_)));
+        // Decoded here, blue first as GPUI draws: the pixel is (10, 20, 30).
+        assert_eq!(preview.source.as_bytes(0).unwrap()[..4], [30, 20, 10, 255]);
     }
 
     #[test]
     fn an_svg_is_drawn_here_at_its_own_proportions() {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#0288d1"/></svg>"##;
-        let preview = preview("a.svg", svg.as_bytes().to_vec()).unwrap();
+        let preview = preview("a.svg", svg.as_bytes()).unwrap();
         assert_eq!((preview.width, preview.height), (40, 20));
-        let Picture::Drawn(drawn) = &preview.source else { panic!("drawn here") };
-        assert_eq!(drawn.size(0).width.0, SVG_PIXELS as i32);
-        assert_eq!(drawn.size(0).height.0, SVG_PIXELS as i32 / 2);
+        assert_eq!(preview.source.size(0).width.0, SVG_PIXELS as i32);
+        assert_eq!(preview.source.size(0).height.0, SVG_PIXELS as i32 / 2);
+    }
+
+    #[test]
+    fn every_frame_of_a_gif_is_decoded() {
+        let mut out = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
+            for shade in [0u8, 200] {
+                let frame = image::RgbaImage::from_pixel(4, 3, image::Rgba([shade, 0, 255, 255]));
+                encoder.encode_frame(image::Frame::new(frame)).unwrap();
+            }
+        }
+        let preview = preview("anim.gif", &out).unwrap();
+        assert_eq!((preview.width, preview.height, preview.source.frame_count()), (4, 3, 2));
+        assert_eq!(preview.source.as_bytes(0).unwrap()[..4], [255, 0, 0, 255], "blue first");
     }
 
     #[test]
     fn something_that_is_not_an_image_gives_no_preview() {
-        assert!(preview("a.png", b"not a png".to_vec()).is_none());
-        assert!(preview("a.txt", png()).is_none());
+        assert!(preview("a.png", b"not a png").is_none());
+        assert!(preview("a.txt", &png()).is_none());
     }
 
     #[test]

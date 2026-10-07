@@ -213,7 +213,7 @@ fn image_compare(images: &Images) -> AnyElement {
                     .items_center()
                     .justify_center()
                     .child(match preview {
-                        Some(p) => gpui::img(p.source.source()).size_full().object_fit(gpui::ObjectFit::ScaleDown).into_any_element(),
+                        Some(p) => gpui::img(p.source.clone()).size_full().object_fit(gpui::ObjectFit::ScaleDown).into_any_element(),
                         None => div().text_xs().text_color(rgb(t().muted)).child("—").into_any_element(),
                     }),
             )
