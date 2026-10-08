@@ -201,6 +201,6 @@ mod tests {
     fn a_saved_width_is_pulled_back_in_when_the_window_shrinks() {
         let was = pane_width(Some(900.), WIDE, 240.);
         let now = pane_width(Some(was), 1000., 240.);
-        assert!(now <= 1000. - 240. - GRAPH_MIN + 0.01 && now >= PANE_MIN);
+        assert!((PANE_MIN..=1000. - 240. - GRAPH_MIN + 0.01).contains(&now));
     }
 }

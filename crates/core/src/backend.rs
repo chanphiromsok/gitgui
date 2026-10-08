@@ -837,11 +837,9 @@ fn local_or_other(full: &str) -> Option<Ref> {
     } else if let Some(name) = full.strip_prefix("refs/remotes/") {
         // `origin/HEAD` only says which branch the remote shows by default; it is not a branch.
         (!name.ends_with("/HEAD")).then(|| Ref { name: name.to_owned(), kind: RefKind::RemoteBranch })
-    } else if let Some(name) = full.strip_prefix("refs/tags/") {
-        Some(Ref { name: name.to_owned(), kind: RefKind::Tag })
     } else {
         // refs/stash is shown as `stash@{n}` instead; notes and pull refs stay hidden.
-        None
+        full.strip_prefix("refs/tags/").map(|name| Ref { name: name.to_owned(), kind: RefKind::Tag })
     }
 }
 
@@ -959,10 +957,11 @@ mod tests {
     #[test]
     fn joins_name_status_with_numstat_by_new_path() {
         let names = b"M\0src/a.rs\0A\0new.rs\0R087\0old.rs\0renamed.rs\0D\0gone.rs\0A\0img.png\0";
-        let counts = b"3\t1\tsrc/a.rs\010\t0\tnew.rs\02\t2\t\0old.rs\0renamed.rs\00\t5\tgone.rs\0-\t-\timg.png\0";
+        let counts = b"3\t1\tsrc/a.rs\x0010\t0\tnew.rs\x002\t2\t\0old.rs\0renamed.rs\x000\t5\tgone.rs\0-\t-\timg.png\0";
         let changes = parse_changes(names, counts);
 
-        let got: Vec<(&str, Option<&str>, FileStatus, Option<u32>, Option<u32>)> = changes
+        type Counted<'a> = (&'a str, Option<&'a str>, FileStatus, Option<u32>, Option<u32>);
+        let got: Vec<Counted> = changes
             .iter()
             .map(|c| (c.path.as_str(), c.old_path.as_deref(), c.status, c.additions, c.deletions))
             .collect();

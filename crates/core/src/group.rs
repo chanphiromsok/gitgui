@@ -88,10 +88,8 @@ pub fn group_by_parent(commits: &[Commit], squashed: &HashMap<String, String>) -
         }
     }
     let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        if !grouped[i] {
-            emit(i, 0, None, &groups, &mut out);
-        }
+    for (i, _) in grouped.iter().enumerate().filter(|(_, grouped)| !**grouped) {
+        emit(i, 0, None, &groups, &mut out);
     }
     out
 }
