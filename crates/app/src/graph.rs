@@ -841,10 +841,38 @@ fn paint_lanes(
     let style = graph_style::active();
     let corner = graph_style::corner(density.row_h, density.lane_w);
     let dot_r = density.dot_r;
-    let x = |lane: usize| bounds.origin.x + px(density.x(lane));
-    let top = bounds.origin.y;
-    let mid = top + bounds.size.height / 2.;
-    let bottom = top + bounds.size.height;
+    // Lines are whole device pixels wide and sit on device pixels, so every lane is as sharp and as thick as the
+    // next. A lane's place depends only on its line's width, so it meets itself exactly in the rows above and below.
+    let scale = window.scale_factor();
+    let width_of = |line: usize| {
+        graph_style::crisp_width(density.line * style.weight + if highlight == Some(line) { 1. } else { 0. }, scale)
+    };
+    let x = |lane: usize, width: f32| graph_style::crisp(bounds.origin.x + px(density.x(lane)), width, scale);
+    let top = graph_style::crisp(bounds.origin.y, 0., scale);
+    let bottom = graph_style::crisp(bounds.origin.y + bounds.size.height, 0., scale);
+    let mid_at = |width: f32| graph_style::crisp(bounds.origin.y + bounds.size.height / 2., width, scale);
+    let mid = mid_at(width_of(lineage));
+    // The radius of the commit's mark: its picture or its dot, the ring of a folding commit, or the ring around either
+    // that says branches were cut from it. Lines stop just inside its outer edge, so the marks can be hollow and a
+    // dimmed one see-through: whatever is behind them (the row's own color when it is selected) shows, never a line.
+    let fork_ring = fork_line.filter(|_| dot != Dot::Current && fold.is_none());
+    let node_r = if plain {
+        match style.node {
+            graph_style::Node::Ring => dot_r + 0.6,
+            graph_style::Node::Square => dot_r * 0.95,
+            graph_style::Node::Dot => dot_r,
+        }
+    } else {
+        density.node / 2.
+    };
+    let mark = match (fold, dot) {
+        (Some(_), Dot::Current) => dot_r + 5.5,
+        (Some(_), _) => dot_r + 3.,
+        (None, Dot::Uncommitted) => dot_r,
+        _ if fork_ring.is_some() => node_r + 2.5,
+        _ => node_r,
+    };
+    let commit_gap = (mark - 1.).max(0.);
     let gray = dot == Dot::Uncommitted;
     // With a line selected, every other line steps back; otherwise what the current branch does
     // not have steps back a little.
@@ -858,22 +886,29 @@ fn paint_lanes(
         }
     };
 
-    // Dimmed lines first, so the selected line is drawn over any crossing.
+    // Lines running straight down first, then the bends across them (a bend is what happens in this row, so it is
+    // drawn over the lanes it crosses), the longest first so that where bends share the commit's height each keeps
+    // its own color up to its own corner. The selected line goes over everything.
     let mut order: Vec<&Stroke> = strokes.iter().collect();
-    order.sort_by_key(|s| highlight == Some(s.lineage));
+    order.sort_by_key(|s| (highlight == Some(s.lineage), s.from != s.to, std::cmp::Reverse(s.from.abs_diff(s.to))));
     for stroke in order {
+        let width = width_of(stroke.lineage);
+        let middle = mid_at(width);
         let (from, to) = match stroke.half {
-            Half::Top => (point(x(stroke.from), top), point(x(stroke.to), mid)),
-            Half::Bottom => (point(x(stroke.from), mid), point(x(stroke.to), bottom)),
-            Half::Through => (point(x(stroke.from), top), point(x(stroke.to), bottom)),
+            Half::Top => (point(x(stroke.from, width), top), point(x(stroke.to, width), middle)),
+            Half::Bottom => (point(x(stroke.from, width), middle), point(x(stroke.to, width), bottom)),
+            Half::Through => (point(x(stroke.from, width), top), point(x(stroke.to, width), bottom)),
         };
-        let width = density.line * style.weight + if highlight == Some(stroke.lineage) { 1. } else { 0. };
-        if let Some(path) = graph_style::stroke(style.shape, stroke.half, from, to, mid, corner, width) {
+        // A merge that bends into a line already running down to its parent stops where it meets that line.
+        let onto_line = stroke.from != stroke.to
+            && strokes.iter().any(|s| s.half == Half::Through && s.from == stroke.to && s.lineage == stroke.lineage);
+        let piece = graph_style::Piece { half: stroke.half, from, to, onto_line, commit_gap };
+        if let Some(path) = graph_style::stroke(style.shape, piece, corner, width) {
             window.paint_path(path, tone(stroke.lineage));
         }
     }
 
-    let center = point(x(lane), mid);
+    let center = point(x(lane, width_of(lineage)), mid);
     let color = if off_branch && highlight.is_none() { faded(tone(lineage), OFF_BRANCH) } else { tone(lineage) };
     let mut circle = |radius: f32, fill: Rgba, border: f32, border_color: Rgba| {
         window.paint_quad(quad(
@@ -885,17 +920,19 @@ fn paint_lanes(
             BorderStyle::default(),
         ));
     };
-    // A commit other branches were branched from gets a ring in the color of the first of them.
-    if let Some(line) = fork_line.filter(|_| dot != Dot::Current && fold.is_none()) {
-        circle(density.node / 2. + 2.5, rgb(t().bg), 1.5, tone(line));
+    let hollow = Rgba { r: 0., g: 0., b: 0., a: 0. };
+    // A commit other branches were branched from gets a ring in the color of the first of them, a little way out from
+    // its node (its picture, or its dot), with the lines kept out of the gap between.
+    if let Some(line) = fork_ring {
+        circle(node_r + 2.5, hollow, 1.5, tone(line));
     }
     if let Some(folded) = fold {
         // A ring with a chevron in it: down while the commits under it show, right while folded.
         let r = dot_r + 3.;
         if dot == Dot::Current {
-            circle(r + 2.5, rgb(t().bg), 2., rgb(t().text_strong));
+            circle(r + 2.5, hollow, 2., rgb(t().text_strong));
         }
-        circle(r, rgb(t().bg), 1.5, color);
+        circle(r, hollow, 1.5, color);
         let a = r * 0.45;
         let points = if folded {
             [(-a * 0.5, -a), (a * 0.6, 0.), (-a * 0.5, a)]
@@ -918,7 +955,7 @@ fn paint_lanes(
         Dot::Filled | Dot::Current if plain => match style.node {
             graph_style::Node::Dot => circle(dot_r, color, 0., color),
             // Hollow: the background shows through, in a line as thick as the lines.
-            graph_style::Node::Ring => circle(dot_r + 0.6, rgb(t().bg), (density.line * style.weight + 0.4).max(1.5), color),
+            graph_style::Node::Ring => circle(dot_r + 0.6, hollow, (density.line * style.weight + 0.4).max(1.5), color),
             graph_style::Node::Square => {
                 let half = dot_r * 0.95;
                 window.paint_quad(quad(
@@ -932,7 +969,7 @@ fn paint_lanes(
             }
         },
         Dot::Filled | Dot::Current => {}
-        Dot::Uncommitted => circle(dot_r, rgb(t().bg), 2., color),
+        Dot::Uncommitted => circle(dot_r, hollow, 2., color),
     }
 }
 

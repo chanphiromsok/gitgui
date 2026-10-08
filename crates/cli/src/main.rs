@@ -100,14 +100,16 @@ fn render(commit: &Commit, row: &Row) -> String {
         let through = row.strokes.iter().any(|s| s.half == Half::Through && s.from == col);
         let joins_in = row.strokes.iter().find(|s| s.half == Half::Top && s.from == col && col != row.lane);
         let leaves_to = row.strokes.iter().find(|s| s.half == Half::Bottom && s.to == col && col != row.lane);
+        // A line that turns into this column at the commit's row is shown as the turn, even where the column's own
+        // line carries on through the row.
         graph.push(if col == row.lane {
             '*'
-        } else if through {
-            '|'
         } else if joins_in.is_some() {
             if col > row.lane { '/' } else { '\\' }
         } else if leaves_to.is_some() {
             if col > row.lane { '\\' } else { '/' }
+        } else if through {
+            '|'
         } else {
             ' '
         });

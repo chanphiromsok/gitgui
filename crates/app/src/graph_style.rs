@@ -13,14 +13,15 @@ use gpui::{Bounds, Path, PathBuilder, Pixels, Point, Window, point, px, quad, rg
 
 use crate::theme::{self, t};
 
-/// How a line changes lane.
+/// How a line changes lane. In every shape it runs across at its commit's height and straight up or down its lane,
+/// the way a wire is laid; only the turn between the two differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
-    /// A smooth bend into the lane.
+    /// A wide, round turn: the largest that fits in the half row.
     Curve,
-    /// A straight diagonal.
+    /// The corner cut by a straight diagonal at 45 degrees, like a line on a metro map.
     Straight,
-    /// Straight up and down with a rounded right-angle corner, like a circuit board.
+    /// A tight round corner, like a wire on a circuit board.
     Elbow,
 }
 
@@ -167,7 +168,7 @@ const fn style(
 
 /// The styles, in the order the settings show them. The first follows the color theme.
 pub const STYLES: &[GraphStyle] = &[
-    style("theme", "Theme", "Your color theme's own", &[], Shape::Curve, 1.0, Node::Dot, Badge::Tinted),
+    style("theme", "Theme", "Your color theme's own", &[], Shape::Elbow, 1.0, Node::Dot, Badge::Tinted),
     style(
         "aurora",
         "Aurora",
@@ -437,98 +438,250 @@ pub fn fit(color: u32, background: u32) -> u32 {
 
 // ---- lines ---------------------------------------------------------------------------------------
 
-/// The path of a line that changes lane within a row. `from` and `to` are where it starts and ends, `mid` the
-/// height of the row's middle (where the commit is) and `corner` the radius of an elbow.
-pub fn stroke(shape: Shape, half: Half, from: Point<Pixels>, to: Point<Pixels>, mid: Pixels, corner: f32, width: f32) -> Option<Path<Pixels>> {
+/// One piece of a line within a row.
+#[derive(Clone, Copy, Debug)]
+pub struct Piece {
+    pub half: Half,
+    /// Where it starts: on its lane at the row's top edge, or (leaving a commit) at the commit in the row's middle.
+    pub from: Point<Pixels>,
+    /// Where it ends: at the commit, or on its lane at the row's bottom edge.
+    pub to: Point<Pixels>,
+    /// The lane it bends into has a line running down it already, in the same color: only the turn is drawn, up to
+    /// where it meets that line, so a translucent line is not laid twice over itself.
+    pub onto_line: bool,
+    /// How far short of the commit it stops: about the radius of the commit's mark, so a dimmed, see-through mark
+    /// shows what is behind it rather than a line running into its middle.
+    pub commit_gap: f32,
+}
+
+/// How far a cubic's control points sit along the tangents for it to follow a quarter circle.
+const QUARTER: f32 = 0.552_284_8;
+
+/// The points a piece passes through, corners included, in the order it is drawn: down its lane to the commit's
+/// height and across into the commit, or across out of the commit and down its lane. At most four.
+fn waypoints(piece: Piece) -> ([Point<Pixels>; 4], usize) {
+    let Piece { half, from, to, .. } = piece;
+    if from.x == to.x {
+        return ([from, to, to, to], 2);
+    }
+    match half {
+        Half::Top => ([from, point(from.x, to.y), to, to], 3),
+        Half::Bottom => ([from, point(to.x, from.y), to, to], 3),
+        // Lanes only change at a commit, so the layout never asks for this; it is drawn as a step at the middle.
+        Half::Through => {
+            let mid = (from.y + to.y) / 2.;
+            ([from, point(from.x, mid), point(to.x, mid), to], 4)
+        }
+    }
+}
+
+/// One step along a piece's outline.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Step {
+    /// A straight line to this point.
+    Line(Point<Pixels>),
+    /// A turn on a quarter circle to `to`, as a cubic with these control points.
+    Turn { to: Point<Pixels>, a: Point<Pixels>, b: Point<Pixels> },
+}
+
+/// Where a piece starts and the steps it takes: at most five (along, turn, across, turn, along).
+#[derive(Clone, Copy, Debug)]
+pub struct Outline {
+    pub start: Point<Pixels>,
+    steps: [Step; 5],
+    count: usize,
+}
+
+impl Outline {
+    pub fn steps(&self) -> &[Step] {
+        &self.steps[..self.count]
+    }
+
+    /// Where the outline has got to.
+    pub fn end(&self) -> Point<Pixels> {
+        match self.steps().last() {
+            Some(Step::Line(to) | Step::Turn { to, .. }) => *to,
+            None => self.start,
+        }
+    }
+
+    /// Adds a step; a line that goes nowhere is left out.
+    fn push(&mut self, step: Step) {
+        if step == Step::Line(self.end()) {
+            return;
+        }
+        self.steps[self.count] = step;
+        self.count += 1;
+    }
+}
+
+/// The outline of one piece of a line within a row. A piece that changes lane runs across at the commit's height and
+/// straight along its lane, and `shape` decides the turn between: an [`Shape::Elbow`] turns on a quarter circle
+/// `corner` across, a [`Shape::Curve`] on the largest quarter circle that fits, and [`Shape::Straight`] cuts the
+/// corner at 45 degrees. A turn stays inside its half row and short of the row's edge, so pieces in neighboring rows
+/// meet on the lane running straight along it: no notch, no kink where one row ends and the next begins.
+pub fn outline(shape: Shape, piece: Piece, corner: f32) -> Outline {
+    let (mut points, count) = waypoints(piece);
+    let length = |a: Point<Pixels>, b: Point<Pixels>| f32::from((b.x - a.x).abs() + (b.y - a.y).abs());
+    // The room a turn has on the leg from point `i` to the next. At the commit, the gap left there comes off, so a turn
+    // never runs into the commit's mark. At the row's edge, a short straight run along the lane is kept (a quarter of
+    // the leg for a cut corner, which would otherwise meet the next row at an angle).
+    let leg = |i: usize| {
+        let full = length(points[i], points[i + 1]);
+        let (first, last) = (i == 0, i + 2 == count);
+        let (at_commit, at_edge) = match piece.half {
+            Half::Top => (last, first),
+            Half::Bottom => (first, last),
+            Half::Through => (false, first || last),
+        };
+        let kept = if at_edge && shape == Shape::Straight { full / 4. } else if at_edge { 1.5f32.min(full / 4.) } else { 0. };
+        (full - kept - if at_commit { piece.commit_gap.max(0.) } else { 0. }).max(0.)
+    };
+    // Each turn gets its radius, at most half of a leg it shares with another turn.
+    let mut radius = [0f32; 4];
+    let wanted = if shape == Shape::Elbow { corner } else { f32::INFINITY };
+    for (at, turn) in radius.iter_mut().enumerate().take(count - 1).skip(1) {
+        let before = leg(at - 1) / if at > 1 { 2. } else { 1. };
+        let after = leg(at) / if at + 2 < count { 2. } else { 1. };
+        *turn = wanted.min(before).min(after).max(0.);
+    }
+    let toward = |a: Point<Pixels>, b: Point<Pixels>| {
+        let (dx, dy) = (f32::from(b.x - a.x), f32::from(b.y - a.y));
+        let length = (dx * dx + dy * dy).sqrt().max(f32::EPSILON);
+        (dx / length, dy / length)
+    };
+    let at = |p: Point<Pixels>, (dx, dy): (f32, f32), by: f32| point(p.x + px(dx * by), p.y + px(dy * by));
+    // The end at the commit is pulled back out of the commit's mark, though never into a turn.
+    if piece.half != Half::Through && piece.commit_gap > 0. {
+        let (end, next) = if piece.half == Half::Top { (count - 1, count - 2) } else { (0, 1) };
+        let room = (length(points[next], points[end]) - radius[next]).max(0.);
+        points[end] = at(points[end], toward(points[end], points[next]), piece.commit_gap.min(room));
+    }
+    // Laid onto a line already in its lane, it starts (coming into a commit) or stops (leaving one) where its turn
+    // meets that line.
+    let onto = piece.onto_line && count == 3;
+    let (first, last) = match piece.half {
+        Half::Top if onto => (1, count - 1),
+        _ if onto => (0, count - 2),
+        _ => (0, count - 1),
+    };
+    let start = if first == 1 { at(points[1], toward(points[1], points[0]), radius[1]) } else { points[0] };
+    let mut outline = Outline { start, steps: [Step::Line(start); 5], count: 0 };
+    for here in 1..count - 1 {
+        let (r, incoming, outgoing) = (radius[here], toward(points[here - 1], points[here]), toward(points[here], points[here + 1]));
+        let (enter, leave) = (at(points[here], incoming, -r), at(points[here], outgoing, r));
+        if here > first {
+            outline.push(Step::Line(enter));
+        }
+        if r > 0. {
+            outline.push(match shape {
+                Shape::Straight => Step::Line(leave),
+                Shape::Curve | Shape::Elbow => {
+                    Step::Turn { to: leave, a: at(enter, incoming, r * QUARTER), b: at(leave, outgoing, -r * QUARTER) }
+                }
+            });
+        }
+        if here == last {
+            return outline;
+        }
+    }
+    outline.push(Step::Line(points[count - 1]));
+    outline
+}
+
+/// The path of one piece of a line within a row, `width` wide: see [`outline`].
+pub fn stroke(shape: Shape, piece: Piece, corner: f32, width: f32) -> Option<Path<Pixels>> {
+    let outline = outline(shape, piece, corner);
     let mut line = PathBuilder::stroke(px(width));
-    line.move_to(from);
-    let dx = f32::from(to.x - from.x);
-    if dx == 0. || half == Half::Through && shape != Shape::Elbow || shape == Shape::Straight {
-        line.line_to(to);
-    } else if shape == Shape::Curve {
-        // Comes down the lane then bends into the commit; leaves the commit sideways then bends down.
-        line.curve_to(to, if half == Half::Top { point(from.x, mid) } else { point(to.x, mid) });
-    } else {
-        let side = dx.signum();
-        let r = corner.min(dx.abs() / 2.);
-        let (bend_in, bend_out) = (px(r), px(side * r));
-        match half {
-            Half::Top => {
-                line.line_to(point(from.x, mid - bend_in));
-                line.curve_to(point(from.x + bend_out, mid), point(from.x, mid));
-                line.line_to(to);
-            }
-            Half::Bottom => {
-                line.line_to(point(to.x - bend_out, mid));
-                line.curve_to(point(to.x, mid + bend_in), point(to.x, mid));
-                line.line_to(to);
-            }
-            Half::Through => {
-                line.line_to(point(from.x, mid - bend_in));
-                line.curve_to(point(from.x + bend_out, mid), point(from.x, mid));
-                line.line_to(point(to.x - bend_out, mid));
-                line.curve_to(point(to.x, mid + bend_in), point(to.x, mid));
-                line.line_to(to);
-            }
+    line.move_to(outline.start);
+    for step in outline.steps() {
+        match *step {
+            Step::Line(to) => line.line_to(to),
+            Step::Turn { to, a, b } => line.cubic_bezier_to(to, a, b),
         }
     }
     line.build().ok()
 }
 
-/// The radius of an elbow for rows `row_h` tall and lanes `lane_w` apart.
+/// The radius of an elbow's corner for rows `row_h` tall and lanes `lane_w` apart: a little over a quarter of the
+/// lane pitch, the way a wire is bent, and never so round that the turn runs out of its half row.
 pub fn corner(row_h: f32, lane_w: f32) -> f32 {
-    (row_h * 0.32).min(lane_w * 0.5)
+    (lane_w * 0.28).min(row_h * 0.3)
+}
+
+/// A line width made a whole number of device pixels (at least one) at `scale`, so its edges are sharp.
+pub fn crisp_width(width: f32, scale: f32) -> f32 {
+    (width * scale).round().max(1.) / scale
+}
+
+/// `at` moved by under a device pixel so that a line `width` wide centered there has both edges on device pixels:
+/// every lane is then drawn sharp, wherever the graph happens to sit in the window.
+pub fn crisp(at: Pixels, width: f32, scale: f32) -> Pixels {
+    let half = width * scale / 2.;
+    px(((f32::from(at) * scale - half).round() + half) / scale)
 }
 
 // ---- the picture on a settings card ------------------------------------------------------------------
 
-/// A small history drawn in `style`: a main line, a branch that is merged back, and one that is still open,
-/// beside bars standing for the messages.
+/// A small history drawn in `style` the way the graph draws it, scaled to the card: a merge, the merged branch
+/// running down to the commit it was cut from, and a branch still open, beside bars standing for the messages.
 pub fn paint_preview(style: &GraphStyle, colors: &[u32], bounds: Bounds<Pixels>, window: &mut Window) {
     let theme = t();
     let rows = 5usize;
     let row_h = f32::from(bounds.size.height) / rows as f32;
-    let lane_w = (row_h * 1.15).min(20.);
+    // The graph's own proportions (lane pitch, line, corner) at this row height.
+    let shrink = row_h / crate::graph::ROW_H;
+    let lane_w = 20. * shrink;
     let radius = (row_h * 0.2).clamp(2.6, 3.6);
-    let width = 1.7 * style.weight;
+    let scale = window.scale_factor();
+    let width = crisp_width((2. * shrink).max(1.5) * style.weight, scale);
     let color = |lineage: usize| rgb(colors[lineage % colors.len()]);
-    let x = |lane: usize| bounds.origin.x + px(14. + lane as f32 * lane_w);
-    let top = |row: usize| bounds.origin.y + px(row as f32 * row_h);
-    let mid = |row: usize| top(row) + px(row_h / 2.);
+    let x = |lane: usize| crisp(bounds.origin.x + px(12. + lane as f32 * lane_w), width, scale);
+    let top = |row: usize| crisp(bounds.origin.y + px(row as f32 * row_h), 0., scale);
+    let mid = |row: usize| crisp(top(row) + px(row_h / 2.), width, scale);
 
-    // (half, row, from lane, to lane, the line's color)
-    let strokes: [(Half, usize, usize, usize, usize); 13] = [
+    // (half, row, from lane, to lane, the line's color), one commit to a row as in the graph: the merge in lane 0
+    // opens lane 1 for the branch it merged; a branch still open starts in lane 2; lane 1 comes back into the commit
+    // it was cut from, and lane 2 into the one below.
+    let mut strokes: [(Half, usize, usize, usize, usize); 16] = [
         (Half::Bottom, 0, 0, 0, 0),
         (Half::Bottom, 0, 0, 1, 1),
         (Half::Through, 1, 0, 0, 0),
-        (Half::Top, 1, 1, 1, 1),
-        (Half::Bottom, 1, 1, 1, 1),
+        (Half::Through, 1, 1, 1, 1),
+        (Half::Bottom, 1, 2, 2, 2),
         (Half::Through, 2, 0, 0, 0),
-        (Half::Through, 2, 1, 1, 1),
+        (Half::Top, 2, 1, 1, 1),
+        (Half::Bottom, 2, 1, 1, 1),
+        (Half::Through, 2, 2, 2, 2),
         (Half::Top, 3, 0, 0, 0),
-        (Half::Top, 3, 1, 0, 1),
         (Half::Bottom, 3, 0, 0, 0),
-        (Half::Bottom, 3, 0, 2, 2),
+        (Half::Top, 3, 1, 0, 1),
+        (Half::Through, 3, 2, 2, 2),
         (Half::Top, 4, 0, 0, 0),
-        (Half::Top, 4, 2, 2, 2),
+        (Half::Bottom, 4, 0, 0, 0),
+        (Half::Top, 4, 2, 0, 2),
     ];
+    // As in the graph: straight lines first, then the bends over them, the longest first.
+    strokes.sort_by_key(|&(_, _, from, to, _)| (from != to, std::cmp::Reverse(from.abs_diff(to))));
     for (half, row, from, to, lineage) in strokes {
         let (a, b) = match half {
             Half::Top => (point(x(from), top(row)), point(x(to), mid(row))),
-            Half::Bottom => (point(x(from), mid(row)), point(x(to), top(row) + px(row_h))),
-            Half::Through => (point(x(from), top(row)), point(x(to), top(row) + px(row_h))),
+            Half::Bottom => (point(x(from), mid(row)), point(x(to), top(row + 1))),
+            Half::Through => (point(x(from), top(row)), point(x(to), top(row + 1))),
         };
-        if let Some(path) = stroke(style.shape, half, a, b, mid(row), corner(row_h, lane_w), width) {
+        let piece = Piece { half, from: a, to: b, onto_line: false, commit_gap: radius - 1. };
+        if let Some(path) = stroke(style.shape, piece, corner(row_h, lane_w), width) {
             window.paint_path(path, color(lineage));
         }
     }
 
     // (row, lane, the line's color)
-    for (row, lane, lineage) in [(0usize, 0usize, 0usize), (1, 1, 1), (2, 1, 1), (3, 0, 0), (4, 0, 0), (4, 2, 2)] {
+    for (row, lane, lineage) in [(0usize, 0usize, 0usize), (1, 2, 2), (2, 1, 1), (3, 0, 0), (4, 0, 0)] {
         let center = point(x(lane), mid(row));
         let (r, fill, border) = match style.node {
             Node::Dot => (radius, color(lineage), 0.),
-            Node::Ring => (radius + 0.4, rgb(theme.bg), 1.6),
+            // Hollow, as in the graph: the lines stop at its ring.
+            Node::Ring => (radius + 0.4, gpui::Rgba { r: 0., g: 0., b: 0., a: 0. }, 1.6),
             Node::Square => (radius * 0.3, color(lineage), 0.),
         };
         let half = if style.node == Node::Square { radius * 0.95 } else { radius + if style.node == Node::Ring { 0.4 } else { 0. } };
@@ -724,18 +877,128 @@ mod tests {
         assert_ne!(neon, t().lane(0));
     }
 
+    const SHAPES: [Shape; 3] = [Shape::Curve, Shape::Straight, Shape::Elbow];
+
+    fn at(x: f32, y: f32) -> Point<Pixels> {
+        point(px(x), px(y))
+    }
+
+    fn piece(half: Half, from: Point<Pixels>, to: Point<Pixels>) -> Piece {
+        Piece { half, from, to, onto_line: false, commit_gap: 0. }
+    }
+
+    /// Every point an outline passes through, its start included (control points left out).
+    fn points(outline: &Outline) -> Vec<Point<Pixels>> {
+        std::iter::once(outline.start)
+            .chain(outline.steps().iter().map(|step| match *step {
+                Step::Line(to) | Step::Turn { to, .. } => to,
+            }))
+            .collect()
+    }
+
     #[test]
     fn every_shape_makes_a_path_for_every_half() {
-        let at = |x: f32, y: f32| point(px(x), px(y));
-        for shape in [Shape::Curve, Shape::Straight, Shape::Elbow] {
+        for shape in SHAPES {
             for (half, from, to) in [
                 (Half::Top, at(10., 0.), at(30., 13.)),
                 (Half::Bottom, at(10., 13.), at(30., 26.)),
                 (Half::Through, at(10., 0.), at(30., 26.)),
                 (Half::Through, at(10., 0.), at(10., 26.)),
                 (Half::Top, at(30., 0.), at(10., 13.)),
+                (Half::Bottom, at(10., 13.), at(11., 26.)),
             ] {
-                assert!(stroke(shape, half, from, to, px(13.), corner(26., 20.), 2.).is_some(), "{shape:?} {half:?}");
+                assert!(stroke(shape, piece(half, from, to), corner(26., 20.), 2.).is_some(), "{shape:?} {half:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_bend_runs_across_at_the_commit_and_meets_the_next_row_straight_down_its_lane() {
+        // Rows 26 tall with the commit at 13; lanes 20 apart: lane 0 at x 10, lane 3 at x 70.
+        for shape in SHAPES {
+            for (half, from, to) in [
+                (Half::Bottom, at(10., 13.), at(70., 26.)),
+                (Half::Bottom, at(70., 13.), at(10., 26.)),
+                (Half::Top, at(70., 0.), at(10., 13.)),
+                (Half::Top, at(10., 0.), at(30., 13.)),
+            ] {
+                let outline = outline(shape, piece(half, from, to), corner(26., 20.));
+                let path = points(&outline);
+                assert_eq!((path[0], *path.last().unwrap()), (from, to), "{shape:?} {half:?} starts and ends where asked");
+                for p in &path {
+                    assert!(f32::from(p.x).is_finite() && f32::from(p.y).is_finite(), "{shape:?} {half:?}: {path:?}");
+                    assert!((0. ..=26.).contains(&f32::from(p.y)), "{shape:?} {half:?} leaves its row: {path:?}");
+                    let (low, high) = (from.x.min(to.x), from.x.max(to.x));
+                    assert!(p.x >= low && p.x <= high, "{shape:?} {half:?} leaves its lanes: {path:?}");
+                }
+                // The end on the lane is reached straight along it, and the end at the commit straight across.
+                let (lane_end, lane_next, commit_end, commit_next) = match half {
+                    Half::Top => (path[0], path[1], path[path.len() - 1], path[path.len() - 2]),
+                    _ => (path[path.len() - 1], path[path.len() - 2], path[0], path[1]),
+                };
+                assert_eq!(lane_next.x, lane_end.x, "{shape:?} {half:?}: not straight down the lane at the row's edge");
+                assert_eq!(commit_next.y, commit_end.y, "{shape:?} {half:?}: not straight across at the commit");
+            }
+        }
+    }
+
+    #[test]
+    fn each_shape_turns_its_own_way_and_a_corner_never_outgrows_close_lanes() {
+        let turn = |shape: Shape, to_x: f32, corner: f32| {
+            let path = points(&outline(shape, piece(Half::Bottom, at(10., 13.), at(to_x, 26.)), corner));
+            // The turn is the one step that goes both across and down: how far it reaches each way.
+            path.windows(2)
+                .map(|pair| (f32::from(pair[1].x - pair[0].x).abs(), f32::from(pair[1].y - pair[0].y)))
+                .find(|&(across, down)| across > 0. && down > 0.)
+                .unwrap_or((0., 0.))
+        };
+        // An elbow turns on the corner it is given; a curve on the largest circle that fits the half row, short of its
+        // edge; a straight line cuts the corner at 45 degrees over three quarters of the half row.
+        let close = |(across, down): (f32, f32), r: f32| (across - r).abs() < 1e-4 && (down - r).abs() < 1e-4;
+        assert!(close(turn(Shape::Elbow, 70., 5.6), 5.6));
+        assert!(close(turn(Shape::Curve, 70., 5.6), 11.5));
+        assert!(close(turn(Shape::Straight, 70., 5.6), 9.75));
+        // Lanes closer than the corner: the turn shrinks to the gap, never past the lane.
+        for shape in SHAPES {
+            let (across, down) = turn(shape, 13., 5.6);
+            assert!(across <= 3. + 1e-4 && down <= 3. + 1e-4, "{shape:?}: {across} {down}");
+        }
+        assert!(corner(26., 20.) <= 13. && corner(26., 4.) <= 2., "the corner fits half a row and half a lane");
+    }
+
+    #[test]
+    fn a_piece_stops_short_of_the_commit_and_a_merge_into_a_line_stops_where_it_meets_it() {
+        let gap = Piece { commit_gap: 7.5, ..piece(Half::Bottom, at(10., 13.), at(70., 26.)) };
+        let path = points(&outline(Shape::Elbow, gap, 5.6));
+        assert_eq!(path[0], at(17.5, 13.), "out of the commit's mark, along the line it leaves by");
+        let straight = Piece { commit_gap: 7.5, ..piece(Half::Top, at(10., 0.), at(10., 13.)) };
+        assert_eq!(points(&outline(Shape::Elbow, straight, 5.6)), [at(10., 0.), at(10., 5.5)]);
+        // Lanes 20 apart and a mark 9 across: a curve turns on what is left, 11, instead of running into the mark.
+        let tight = Piece { commit_gap: 9., ..piece(Half::Bottom, at(10., 13.), at(30., 26.)) };
+        let path = points(&outline(Shape::Curve, tight, 5.6));
+        assert_eq!((path[0], path[1]), (at(19., 13.), at(30., 24.)));
+        // Lanes closer than the mark: the line gets no further than its lane, and the turn is a plain corner.
+        let crowded = Piece { commit_gap: 9., ..piece(Half::Bottom, at(10., 13.), at(16., 26.)) };
+        assert_eq!(points(&outline(Shape::Elbow, crowded, 5.6))[0], at(16., 13.));
+
+        let onto = Piece { onto_line: true, ..piece(Half::Bottom, at(10., 13.), at(70., 26.)) };
+        let path = points(&outline(Shape::Elbow, onto, 5.6));
+        let end = *path.last().unwrap();
+        assert!(end.x == px(70.) && (f32::from(end.y) - 18.6).abs() < 1e-4, "the turn ends on the line it joins: {end:?}");
+    }
+
+    #[test]
+    fn crisp_lines_have_both_edges_on_device_pixels() {
+        for scale in [1., 1.5, 2.] {
+            for width in [1., 1.5, 1.7, 2., 2.6, 3.] {
+                let width = crisp_width(width, scale);
+                assert!(((width * scale).fract()).abs() < 1e-4 && width * scale >= 1.);
+                for x in [10., 10.3, 341.37, 0.5] {
+                    let center = f32::from(crisp(px(x), width, scale));
+                    let edge = (center - width / 2.) * scale;
+                    assert!((edge - edge.round()).abs() < 1e-3, "{x} at {scale}x, {width} wide: edge at {edge}");
+                    assert!((center - x).abs() <= 0.5 / scale + 1e-4, "moved by at most half a device pixel");
+                }
             }
         }
     }

@@ -8,6 +8,10 @@
 //! where it forks off another. A lineage keeps one id, and so one color, for its whole length. A
 //! branch's line is never bent into its parent early; it runs down to the commit it was branched
 //! from, and that commit is where it ends, so the fork point is visible.
+//!
+//! A line only changes lane at a commit's row: it leaves a merge sideways into its lane, or comes
+//! down its lane into the commit it was branched from. Everywhere else it runs straight down, so the
+//! lanes read as even, parallel lines and every bend sits beside the commit it belongs to.
 
 /// Which part of a row a graph line crosses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +115,8 @@ impl LaneLayout {
     /// reaches the tip of the trunk it was cut from ends there, bending into a fresh lane where the
     /// trunk's line starts, so the fork point shows. With none carrying on the commit starts
     /// a line in the first free lane. Its first parent carries on in its lane. Any other parent
-    /// starts a new line in a free lane, which runs down to that parent.
+    /// joins the line already running down to it, if there is one; otherwise it starts a new line,
+    /// in the free lane its bend reaches crossing the fewest lines, which runs down to that parent.
     pub fn push_branch<S: AsRef<str>, B: AsRef<str>>(&mut self, id: &str, parents: &[S], rank: i32, branches: &[B]) -> Row {
         let row = self.rows;
         self.rows += 1;
@@ -188,8 +193,23 @@ impl LaneLayout {
             if ix == 0 {
                 self.waiting[lane] = Some(Wait { id: parent.to_owned(), lineage });
                 strokes.push(Stroke { from: lane, to: lane, half: Half::Bottom, lineage });
+                continue;
+            }
+            let running: Vec<usize> = (0..self.waiting.len())
+                .filter(|&at| self.waiting[at].as_ref().is_some_and(|wait| wait.id == parent))
+                .collect();
+            if running.contains(&lane) {
+                // The same parent twice: the commit's own line already goes there.
+                continue;
+            }
+            if let Some(at) = running.into_iter().min_by_key(|&at| (self.crossings(lane, at), at.abs_diff(lane))) {
+                // A line already runs down to this parent (an earlier merge brought the same branch in, or the
+                // branch went on after it was merged): the merge bends into that line, in its color, instead of
+                // opening a lane beside it.
+                let joined = self.waiting[at].as_ref().map_or(0, |wait| wait.lineage);
+                strokes.push(Stroke { from: lane, to: at, half: Half::Bottom, lineage: joined });
             } else {
-                let free = self.take_free_lane();
+                let free = self.merge_lane(lane);
                 let started = self.start_line(row, Some(row), 0);
                 self.waiting[free] = Some(Wait { id: parent.to_owned(), lineage: started });
                 strokes.push(Stroke { from: lane, to: free, half: Half::Bottom, lineage: started });
@@ -222,6 +242,27 @@ impl LaneLayout {
             self.waiting.push(None);
             self.waiting.len() - 1
         })
+    }
+
+    /// How many lines a bend from lane `a` across to lane `b` crosses: the lanes between them that are taken.
+    fn crossings(&self, a: usize, b: usize) -> usize {
+        let (low, high) = (a.min(b), a.max(b));
+        (low + 1..high).filter(|&at| self.waiting.get(at).is_some_and(Option::is_some)).count()
+    }
+
+    /// The lane for a line a merge in `lane` opens. Its bend runs across at the merge's row, so the lane is the free
+    /// one it reaches crossing the fewest lines; then one inside the lanes in use rather than a new one; then one to
+    /// the right, where a branch is looked for; then the nearest.
+    fn merge_lane(&mut self, lane: usize) -> usize {
+        let end = self.waiting.len();
+        let best = (0..=end)
+            .filter(|&at| at == end || self.waiting[at].is_none())
+            .min_by_key(|&at| (self.crossings(lane, at), at == end, at < lane, at.abs_diff(lane)))
+            .unwrap_or(end);
+        if best == end {
+            self.waiting.push(None);
+        }
+        best
     }
 }
 
@@ -379,6 +420,119 @@ mod tests {
         assert_eq!(rows[1].strokes, [stroke(0, 0, Half::Through, 0), stroke(1, 1, Half::Bottom, 1)]);
         assert_eq!((rows[2].lane, rows[2].lineage, rows[2].joins.clone()), (0, 0, vec![1]));
         assert_eq!(rows[2].strokes, [stroke(0, 0, Half::Top, 0), stroke(1, 0, Half::Top, 1)]);
+    }
+
+    #[test]
+    fn a_second_merge_of_the_same_branch_bends_into_the_line_already_running_to_it() {
+        use Half::*;
+        // main (m1) and develop (d1) both merge release (r); release was cut from t1.
+        let mut layout = LaneLayout::new();
+        let rows: Vec<Row> = [
+            ("m1", &["t1", "r"][..]),
+            ("d1", &["t2", "r"][..]),
+            ("r", &["t1"][..]),
+            ("t2", &["t1"][..]),
+            ("t1", &[][..]),
+        ]
+        .into_iter()
+        .map(|(id, parents)| layout.push(id, parents))
+        .collect();
+        assert_eq!(rows[0].strokes, [stroke(0, 0, Bottom, 0), stroke(0, 1, Bottom, 1)]);
+        // develop starts in lane 2 and its merge bends left into release's lane, in release's color: no new lane.
+        assert_eq!(rows[1].lane, 2);
+        assert_eq!(
+            rows[1].strokes,
+            [stroke(0, 0, Through, 0), stroke(1, 1, Through, 1), stroke(2, 2, Bottom, 2), stroke(2, 1, Bottom, 1)]
+        );
+        assert_eq!(rows[1].width, 3);
+        assert_eq!(layout.lineages().len(), 3, "main, release and develop; the second merge opened no line");
+        assert!(rows[2].joins.is_empty(), "r is release's own commit, not a fork point of the merge");
+        assert_eq!(rows[4].joins, [1, 2]);
+    }
+
+    #[test]
+    fn a_merge_opens_its_line_where_the_bend_crosses_the_fewest_lines() {
+        // Lanes 0 and 1 wait for p, 2 for q, 3 for r. At p lane 1 ends and frees up; then r, in lane 3, merges s.
+        let rows = lanes([
+            ("a", &["p"][..]),
+            ("b", &["p"][..]),
+            ("c", &["q"][..]),
+            ("e", &["r"][..]),
+            ("p", &["z"][..]),
+            ("r", &["z", "s"][..]),
+            ("q", &["z"][..]),
+            ("s", &["z"][..]),
+            ("z", &[][..]),
+        ]);
+        assert_eq!(rows[5].lane, 3);
+        // Lane 1 is free, but reaching it would cross lane 2; the bend goes right instead, crossing nothing.
+        assert!(rows[5].strokes.contains(&stroke(3, 4, Half::Bottom, 4)), "{:?}", rows[5].strokes);
+        assert_eq!(rows[7].lane, 4);
+    }
+
+    /// A small deterministic generator, so the random histories are the same on every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, below: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % below.max(1)
+        }
+    }
+
+    #[test]
+    fn on_random_histories_lines_only_bend_at_commits_and_meet_at_every_row_edge() {
+        use std::collections::BTreeSet;
+        for seed in 0..300u64 {
+            let mut rng = Lcg(seed + 7);
+            let n = 3 + rng.next(60);
+            let ids: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+            let history: Vec<(String, Vec<String>)> = (0..n)
+                .map(|i| {
+                    let mut parents = Vec::new();
+                    if i + 1 < n && rng.next(9) != 0 {
+                        parents.push(ids[i + 1 + rng.next((n - i - 1).min(5))].clone());
+                        for _ in 0..rng.next(3).saturating_sub(1) {
+                            let other = ids[i + 1 + rng.next(n - i - 1)].clone();
+                            if !parents.contains(&other) {
+                                parents.push(other);
+                            }
+                        }
+                    }
+                    (ids[i].clone(), parents)
+                })
+                .collect();
+            let mut layout = LaneLayout::new();
+            let rows: Vec<Row> = history.iter().map(|(id, parents)| layout.push(id, parents)).collect();
+
+            let mut above: BTreeSet<(usize, usize)> = BTreeSet::new();
+            for (at, row) in rows.iter().enumerate() {
+                let mut top = BTreeSet::new();
+                let mut bottom = BTreeSet::new();
+                for s in &row.strokes {
+                    match s.half {
+                        Half::Through => {
+                            assert_eq!(s.from, s.to, "seed {seed} row {at}: a line changed lane between commits");
+                            top.insert((s.from, s.lineage));
+                            bottom.insert((s.to, s.lineage));
+                        }
+                        Half::Top => {
+                            assert_eq!(s.to, row.lane, "seed {seed} row {at}: a line bent somewhere but into the commit");
+                            top.insert((s.from, s.lineage));
+                        }
+                        Half::Bottom => {
+                            assert_eq!(s.from, row.lane, "seed {seed} row {at}: a line bent somewhere but out of the commit");
+                            bottom.insert((s.to, s.lineage));
+                        }
+                    }
+                    assert!(s.from < row.width && s.to < row.width, "seed {seed} row {at}: a line outside the row's width");
+                }
+                assert_eq!(top, above, "seed {seed} row {at}: the lines leaving the row above are the ones arriving here");
+                let lanes: BTreeSet<usize> = bottom.iter().map(|&(lane, _)| lane).collect();
+                assert_eq!(lanes.len(), bottom.len(), "seed {seed} row {at}: two lines in one lane");
+                above = bottom;
+            }
+            assert!(above.is_empty(), "seed {seed}: every line reached its commit");
+        }
     }
 
     #[test]
