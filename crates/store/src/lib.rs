@@ -114,6 +114,9 @@ pub struct Settings {
     pub graph_scale: u32,
     /// The graph's look (its colors, how lines bend, how commits are marked), by id; `theme` follows the color theme.
     pub graph_style: String,
+    /// Fetch the open project from its remotes every this many minutes, in the background; 0 is off, the default.
+    /// A fetch contacts only the project's own remotes, but that is still the user's choice to make.
+    pub auto_fetch_minutes: u32,
 }
 
 /// The smallest and largest graph scale, in percent; a saved value outside is brought inside.
@@ -144,6 +147,7 @@ impl Default for Settings {
             review_layout: ReviewLayout::Below,
             last_project: None,
             clone_dir: None,
+            auto_fetch_minutes: 0,
         }
     }
 }
@@ -687,6 +691,18 @@ mod tests {
         assert_eq!(scratch.store().settings().unwrap().graph_faces, GraphFaces::Selected);
         let text = fs::read_to_string(scratch.0.join("data/settings.json")).unwrap();
         assert!(text.contains("\"selected\""), "readable in the file: {text}");
+    }
+
+    #[test]
+    fn fetching_on_its_own_is_off_until_chosen_and_the_choice_is_remembered() {
+        let scratch = Scratch::new("auto-fetch");
+        let store = scratch.store();
+        assert_eq!(store.settings().unwrap().auto_fetch_minutes, 0, "nothing contacts a remote unless asked to");
+        store.save_settings(&Settings { auto_fetch_minutes: 15, ..Settings::default() }).unwrap();
+        assert_eq!(scratch.store().settings().unwrap().auto_fetch_minutes, 15);
+        // A file from before the setting existed keeps it off.
+        fs::write(scratch.0.join("data/settings.json"), r#"{"group_by_parent": false}"#).unwrap();
+        assert_eq!(scratch.store().settings().unwrap().auto_fetch_minutes, 0);
     }
 
     #[test]

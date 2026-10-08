@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use gitgui_core::{Detected, Error, Evidence, Outcome, RefKind, Shape, branch_name, detect, name_problem};
+use gitgui_core::{Detected, Error, Evidence, Outcome, RefKind, Shape, Upstream, branch_name, detect, name_problem};
 use gitgui_store::WorkflowSetting;
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px, rgb};
 
@@ -42,7 +42,29 @@ pub struct BranchPicker {
 /// One line of that list.
 pub(crate) enum PickRow {
     Heading(&'static str),
-    Branch { name: String, remote: bool, note: Option<&'static str> },
+    /// `behind`: a local branch the remote has moved on from, so starting from it would miss commits.
+    Branch { name: String, remote: bool, note: Option<&'static str>, behind: Option<Behind> },
+}
+
+/// How far a local branch is behind the remote branch it tracks, as of the last fetch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Behind {
+    pub count: usize,
+    /// The remote branch, `origin/develop`, and its remote.
+    pub upstream: String,
+    pub remote: String,
+}
+
+impl Behind {
+    /// "3 commits".
+    fn commits(&self) -> String {
+        if self.count == 1 { "1 commit".to_owned() } else { format!("{} commits", self.count) }
+    }
+
+    /// "3 commits behind origin/develop as of the last fetch."
+    fn said(&self) -> String {
+        format!("{} behind {} as of the last fetch.", self.commits(), self.upstream)
+    }
 }
 
 /// How many branches the list draws at most; the search narrows the rest.
@@ -143,6 +165,17 @@ impl Workspace {
             self.projects = projects;
         }
         cx.notify();
+    }
+
+    /// How far the local branch `name` is behind its remote branch, when it is: starting from it would miss those commits.
+    pub(crate) fn behind_upstream(&self, name: &str) -> Option<Behind> {
+        let Phase::Ready(view) = &self.repo.as_ref()?.phase else { return None };
+        match view.upstreams.get(name)? {
+            Upstream::Tracking { name, remote, behind, .. } if *behind > 0 => {
+                Some(Behind { count: *behind, upstream: name.clone(), remote: remote.clone() })
+            }
+            _ => None,
+        }
     }
 
     /// Branches to offer to start from: the workflow's base, the current branch, then the usual trunks, each as the
@@ -303,6 +336,8 @@ impl Workspace {
             .collect();
         // Where it starts: the branch, and a click opens the list to search.
         let base_note = self.branches().and_then(|b| workflow.base.as_deref().and_then(|base| b.resolve(base))).filter(|base| *base == wizard.base).map(|_| "team's base");
+        // A local branch the remote has moved on from would start the work from old code.
+        let behind = self.behind_upstream(&wizard.base).filter(|behind| branches.remotes.contains(&behind.upstream));
         let start = div()
             .id("branch-base")
             .debug_selector(|| "branch-base".to_owned())
@@ -356,6 +391,22 @@ impl Workspace {
                 .child(field("Name", preview.into_any_element()))
                 .when(exists, |panel| panel.child(div().pl(px(100.)).text_xs().text_color(rgb(t().warning)).child("A branch with this name already exists.")))
                 .child(field("Start from", start))
+                .when_some(behind, |panel, behind| {
+                    let upstream = behind.upstream.clone();
+                    panel.child(
+                        div()
+                            .pl(px(100.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().min_w_0().flex_1().text_xs().text_color(rgb(t().modified)).child(behind.said()))
+                            .child(
+                                button("branch-base-upstream", format!("Use {upstream}"))
+                                    .debug_selector(|| "branch-base-upstream".to_owned())
+                                    .on_click(cx.listener(move |this, _, _, cx| this.set_branch_base(&upstream, cx))),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .pl(px(100.))
@@ -420,7 +471,8 @@ impl Workspace {
             rows.push(PickRow::Heading(heading));
             for (name, remote) in names.into_iter().take(PICK_LIMIT - count) {
                 listed.insert(name.clone());
-                rows.push(PickRow::Branch { note: note(&name), name, remote });
+                let behind = if remote { None } else { self.behind_upstream(&name) };
+                rows.push(PickRow::Branch { note: note(&name), name, remote, behind });
                 count += 1;
             }
         };
@@ -522,7 +574,7 @@ impl Workspace {
                     .text_color(rgb(t().muted))
                     .child(*text)
                     .into_any_element(),
-                PickRow::Branch { name, remote, note } => {
+                PickRow::Branch { name, remote, note, behind } => {
                     let this_one = seen;
                     seen += 1;
                     let (chosen, current) = (this_one == highlight, wizard.base == *name);
@@ -558,6 +610,9 @@ impl Workspace {
                                 .child(SharedString::from(name.clone())),
                         )
                         .children(note.map(|note| div().flex_none().text_xs().text_color(rgb(t().muted)).child(note)))
+                        .children(behind.as_ref().map(|behind| {
+                            div().flex_none().text_xs().text_color(rgb(t().modified)).child(format!("{} behind {}", behind.count, behind.remote))
+                        }))
                         .when(current, |row| row.child(div().flex_none().text_xs().text_color(rgb(t().accent)).child("chosen")))
                         .into_any_element()
                 }
@@ -565,6 +620,15 @@ impl Workspace {
             .collect();
 
         let empty = names.is_empty();
+        // The highlighted branch is behind its remote branch: say so where Enter would pick it. Room for that is kept
+        // while any branch listed is behind, so the list does not jump as the highlight moves.
+        let any_behind = rows.iter().any(|row| matches!(row, PickRow::Branch { behind: Some(_), .. }));
+        let advice = rows.iter().find_map(|row| match row {
+            PickRow::Branch { name, behind: Some(behind), .. } if names.get(highlight) == Some(&name.as_str()) => {
+                Some(format!("{name} is {} behind {}. Pick {} to start from the latest.", behind.commits(), behind.upstream, behind.upstream))
+            }
+            _ => None,
+        });
         Some(modal(
             div()
                 .w(px(480.))
@@ -609,7 +673,19 @@ impl Workspace {
                         .justify_between()
                         .border_t_1()
                         .border_color(rgb(t().border))
-                        .child(div().flex_1().min_w_0().line_clamp(1).text_ellipsis().text_xs().text_color(rgb(t().muted)).child("Remote branches are as of the last fetch."))
+                        .child(
+                            div().flex_1().min_w_0().flex().items_center().when(any_behind, |text| text.min_h(px(32.))).child(match advice {
+                                Some(advice) => div().flex_1().min_w_0().text_xs().text_color(rgb(t().modified)).child(SharedString::from(advice)),
+                                None => div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .line_clamp(1)
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .text_color(rgb(t().muted))
+                                    .child("Remote branches are as of the last fetch."),
+                            }),
+                        )
                         .child(
                             div()
                                 .flex()

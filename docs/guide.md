@@ -13,7 +13,7 @@ A fast Git GUI in Rust, on GPUI, for reading history on repositories that work t
 - **Where did this branch start?** Each branch is one coloured line down to its fork point, with the current branch ringed.
 - **Slow on big histories.** It scrolls 10,000-line diffs and thousands of commits smoothly, and refreshes do not re-scan.
 
-Also: a **Pull (rebase)** button, the last project reopens at start, a Graph size setting, author pictures (Gravatar, and GitHub through `gh` for plain-email authors), Tree/Flat file list, Unified/Split diff (both remembered), line comments, and right-click checkout, merge, rebase, push and more, always asking before anything destructive. Feature inventory and architecture: [the feature spec](feature-spec.md).
+Also: **Fetch**, **Pull** (rebase) and **Push** buttons (the one that matters is lit: Push when the branch is ahead or not on the remote yet, Pull when it is behind; the header says `↑2 origin`, `✓ origin` or `not on a remote yet`; both always ask first and never force), an optional **automatic fetch** (Settings → Projects: off, or every 5, 15 or 30 minutes), the New branch window's **Push to origin**, a note in the Start from list when a local branch is behind its remote, the last project reopens at start, a Graph size setting, author pictures (Gravatar, and GitHub through `gh` for plain-email authors), Tree/Flat file list, Unified/Split diff (both remembered), line comments, and right-click checkout, merge, rebase, push and more, always asking before anything destructive. Feature inventory and architecture: [the feature spec](feature-spec.md).
 
 ## Build and run
 

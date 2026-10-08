@@ -2812,3 +2812,306 @@ async fn the_graph_can_be_limited_to_an_author_and_to_days_from_the_search_box_a
     let dates: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&crate::menu::MenuTarget::Dates).iter().map(|i| i.label.to_string()).collect());
     assert!(dates.iter().any(|l| l.starts_with('✓') && l.contains("Last 7 days")), "the chosen preset is ticked: {dates:?}");
 }
+
+// ---- the remote: ahead and behind, Push, fetching on its own -------------------------------------------
+
+/// Gives the fixture a bare `origin` with `main` pushed to it and tracked; returns the remote's folder.
+fn with_origin(fx: &Fixture) -> PathBuf {
+    let remote = fx.0.join("remote.git");
+    fx.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    fx.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fx.git(&["push", "-q", "-u", "origin", "main"]);
+    remote
+}
+
+/// A colleague's clone of `remote`, who commits `file` on `branch` and pushes it.
+fn colleague_pushes(fx: &Fixture, remote: &Path, branch: &str, file: &str) {
+    let other = fx.0.join("other");
+    if !other.exists() {
+        git_as_bo(&fx.0, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+    }
+    git_as_bo(&other, &["fetch", "-q", "origin"]);
+    git_as_bo(&other, &["switch", "-q", "-C", branch, &format!("origin/{branch}")]);
+    std::fs::write(other.join(file), "theirs\n").unwrap();
+    git_as_bo(&other, &["add", "."]);
+    git_as_bo(&other, &["commit", "-q", "-m", file]);
+    git_as_bo(&other, &["push", "-q", "origin", branch]);
+}
+
+fn upstream_now(ws: &Entity<Workspace>, cx: &VisualTestContext) -> Option<gitgui_core::Upstream> {
+    ws.read_with(cx, |ws, _| match ws.repo.as_ref().map(|r| &r.phase) {
+        Some(Phase::Ready(view)) => view.upstream().cloned(),
+        _ => None,
+    })
+}
+
+fn dialog_text(ws: &Entity<Workspace>, cx: &VisualTestContext) -> (String, String, String) {
+    ws.read_with(cx, |ws, _| {
+        let d = ws.dialog.as_ref().expect("a question is asked first");
+        (d.title.to_string(), d.body.to_string(), d.confirm.to_string())
+    })
+}
+
+#[gpui::test]
+async fn the_header_says_where_the_branch_stands_against_its_remote_and_push_asks_then_publishes(cx: &mut TestAppContext) {
+    use crate::workspace::{Emphasis, sync_emphasis};
+    use gitgui_core::Upstream;
+    let fx = bare_fixture("push-button");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    // No remote: nothing to fetch, pull or push, and nothing to be ahead of.
+    assert!(cx.debug_bounds("push").is_none() && cx.debug_bounds("fetch").is_none());
+    assert!(cx.debug_bounds("branch-upstream").is_none());
+
+    let remote = with_origin(&fx);
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("push").is_some() && cx.debug_bounds("branch-upstream").is_some());
+    let in_step = Upstream::Tracking { name: "origin/main".into(), remote: "origin".into(), ahead: 0, behind: 0 };
+    assert_eq!(upstream_now(&ws, cx), Some(in_step.clone()));
+    assert_eq!(sync_emphasis(Some(&in_step)), (Emphasis::Plain, Emphasis::Plain), "in step: both quiet");
+
+    // A commit of ours: one ahead, and Push is the thing to do.
+    commit_file(&fx, "mine.txt", "m\n", "mine");
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    let ahead = upstream_now(&ws, cx).unwrap();
+    assert_eq!((ahead.ahead(), ahead.behind()), (1, 0));
+    assert_eq!(sync_emphasis(Some(&ahead)), (Emphasis::Plain, Emphasis::Lit));
+
+    // Clicking Push only asks, and says where it goes.
+    draw(cx, &ws);
+    let at = center_of(cx, "push".to_owned());
+    click(cx, MouseButton::Left, at);
+    let (title, body, confirm) = dialog_text(&ws, cx);
+    assert_eq!((title.as_str(), confirm.as_str()), ("Push main to origin?", "Push"));
+    assert!(body.contains("Sends 1 commit") && body.contains("Nothing is forced"), "{body}");
+    assert!(git_as_bo(&remote, &["log", "--format=%s", "main"]).starts_with("base"), "nothing is pushed yet");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    assert!(git_as_bo(&remote, &["log", "--format=%s", "main"]).starts_with("mine"), "now it is");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| !n.warn && n.text.contains("Pushed main"))));
+    assert_eq!(upstream_now(&ws, cx), Some(in_step));
+
+    // A colleague pushes: after a fetch we are one behind, Pull is the thing to do, and a push would be refused.
+    colleague_pushes(&fx, &remote, "main", "theirs.txt");
+    ws.update(cx, |ws, cx| ws.fetch(cx));
+    cx.run_until_parked();
+    let behind = upstream_now(&ws, cx).unwrap();
+    assert_eq!((behind.ahead(), behind.behind()), (0, 1));
+    assert_eq!(sync_emphasis(Some(&behind)), (Emphasis::Lit, Emphasis::Plain));
+    with_window(&ws, cx, |ws, window, cx| ws.push_current(window, cx));
+    assert!(dialog_text(&ws, cx).1.contains("will be rejected: Pull first"));
+    ws.update(cx, |ws, cx| ws.cancel_dialog(cx));
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::PullRebase, window, cx));
+    assert!(dialog_text(&ws, cx).1.starts_with("`origin/main` has 1 commit that `main` does not."));
+    ws.update(cx, |ws, cx| ws.cancel_dialog(cx));
+
+    // A branch made here is not on a remote yet: Push publishes it, and then it tracks its remote branch.
+    fx.git(&["switch", "-q", "-c", "feature/new"]);
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(upstream_now(&ws, cx), Some(Upstream::None));
+    assert_eq!(sync_emphasis(Some(&Upstream::None)), (Emphasis::Idle, Emphasis::Lit));
+    with_window(&ws, cx, |ws, window, cx| ws.push_current(window, cx));
+    let (title, body, confirm) = dialog_text(&ws, cx);
+    assert_eq!((title.as_str(), confirm.as_str()), ("Publish feature/new to origin?", "Publish"));
+    assert!(body.contains("`origin/feature/new`"), "{body}");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    assert!(!git_as_bo(&remote, &["branch", "--list", "feature/new"]).trim().is_empty(), "it is on the remote");
+    assert!(matches!(upstream_now(&ws, cx), Some(Upstream::Tracking { ref name, ahead: 0, behind: 0, .. }) if name == "origin/feature/new"));
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.text.contains("Published feature/new to origin"))));
+
+    // Its remote branch deleted and pruned: gone, and Push puts it back.
+    git_as_bo(&fx.0.join("other"), &["push", "-q", "origin", "--delete", "feature/new"]);
+    ws.update(cx, |ws, cx| ws.fetch(cx));
+    cx.run_until_parked();
+    assert!(matches!(upstream_now(&ws, cx), Some(Upstream::Gone { .. })));
+    with_window(&ws, cx, |ws, window, cx| ws.push_current(window, cx));
+    assert_eq!(dialog_text(&ws, cx).0, "Push feature/new to origin again?");
+    ws.update(cx, |ws, cx| ws.cancel_dialog(cx));
+    // And Pull says why there is nothing to pull, without asking first.
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::PullRebase, window, cx));
+    assert!(ws.read_with(cx, |ws, _| ws.dialog.is_none()));
+    let said = ws.read_with(cx, |ws, _| ws.notice.as_ref().map(|n| n.text.to_string())).unwrap_or_default();
+    assert!(said.contains("origin/feature/new was deleted"), "{said}");
+
+    // A detached HEAD has no branch to push.
+    fx.git(&["switch", "-q", "--detach", "main"]);
+    ws.update(cx, |ws, cx| ws.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(upstream_now(&ws, cx), None);
+    assert_eq!(sync_emphasis(None), (Emphasis::Idle, Emphasis::Idle));
+    with_window(&ws, cx, |ws, window, cx| ws.push_current(window, cx));
+    assert!(ws.read_with(cx, |ws, _| ws.dialog.is_none() && ws.notice.as_ref().is_some_and(|n| n.text.contains("detached HEAD"))));
+    draw(cx, &ws);
+}
+
+/// A local branch the remote has moved on from is marked in the list of branches to start from and in the New branch
+/// window, which offers its remote branch instead.
+#[gpui::test]
+async fn a_branch_behind_its_remote_is_marked_where_new_work_starts_from(cx: &mut TestAppContext) {
+    let fx = bare_fixture("start-behind");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    let remote = with_origin(&fx);
+    fx.git(&["switch", "-q", "-c", "develop"]);
+    fx.git(&["push", "-q", "-u", "origin", "develop"]);
+    fx.git(&["switch", "-q", "main"]);
+    colleague_pushes(&fx, &remote, "develop", "one.txt");
+    colleague_pushes(&fx, &remote, "develop", "two.txt");
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let develop_behind = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            ws.branch_pick_rows("develop").into_iter().find_map(|row| match row {
+                crate::workflow_ui::PickRow::Branch { name, behind, .. } if name == "develop" => Some(behind),
+                _ => None,
+            })
+        })
+        .expect("develop is listed")
+    };
+    assert_eq!(develop_behind(&ws, cx), None, "not known to be behind before a fetch");
+    ws.update(cx, |ws, cx| ws.fetch(cx));
+    cx.run_until_parked();
+    let behind = develop_behind(&ws, cx).expect("two behind after the fetch");
+    assert_eq!((behind.count, behind.upstream.as_str(), behind.remote.as_str()), (2, "origin/develop", "origin"));
+    // The remote branch itself is not marked.
+    let remote_row = ws.read_with(cx, |ws, _| {
+        ws.branch_pick_rows("origin/develop").into_iter().any(|row| matches!(row, crate::workflow_ui::PickRow::Branch { name, behind: None, .. } if name == "origin/develop"))
+    });
+    assert!(remote_row);
+
+    // Starting from it in the New branch window says so, and one click starts from the remote branch instead.
+    ws.update_in(cx, |ws, window, cx| ws.open_new_branch(window, cx));
+    ws.update(cx, |ws, cx| ws.set_branch_base("develop", cx));
+    draw(cx, &ws);
+    let at = center_of(cx, "branch-base-upstream".to_owned());
+    click(cx, MouseButton::Left, at);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.new_branch.as_ref().map(|w| w.base.clone())), Some("origin/develop".to_owned()));
+    // The list draws its note too.
+    with_window(&ws, cx, |ws, window, cx| ws.open_branch_picker(window, cx));
+    draw(cx, &ws);
+}
+
+/// Fetching on its own: off by default; when on, it fetches the open project in the background without a banner,
+/// keeps what is selected, reads the repository again only when something came in, waits for an operation that is
+/// running, and says so only when it fails twice in a row.
+#[gpui::test]
+async fn fetching_on_its_own_brings_in_new_branches_quietly_and_only_rereads_when_something_changed(cx: &mut TestAppContext) {
+    use crate::workspace::AUTO_FETCH_TICK;
+    use std::time::Duration;
+    let fx = bare_fixture("auto-fetch");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    commit_file(&fx, "b.txt", "next\n", "next");
+    let remote = with_origin(&fx);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    assert!(!ws.read_with(cx, |ws, _| ws.auto_fetch_scheduled()), "off until chosen");
+    select(&ws, cx, "base");
+    let selected = |cx: &VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().selected_id());
+    let base_id = selected(cx);
+
+    // Chosen in Settings, by a click.
+    ws.update(cx, |ws, cx| {
+        ws.open_settings(cx);
+        ws.set_settings_page(crate::settings_view::SettingsPage::Projects, cx);
+    });
+    draw(cx, &ws);
+    let at = center_of(cx, "setting-auto-fetch-5".to_owned());
+    click(cx, MouseButton::Left, at);
+    ws.update(cx, |ws, cx| ws.close_settings(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.auto_fetch_scheduled()));
+    assert_eq!(Store::at(fx.data()).settings().unwrap().auto_fetch_minutes, 5, "kept for the next start");
+
+    let fetches = |cx: &VisualTestContext| count(&ws, cx, |c| &c.fetches);
+    let reads = |cx: &VisualTestContext| count(&ws, cx, |c| &c.repo_reads);
+    let wait = |cx: &mut VisualTestContext, by: Duration| {
+        cx.executor().advance_clock(by);
+        cx.run_until_parked();
+    };
+
+    // A colleague pushes a branch; the first look after it is turned on fetches it, without a banner.
+    git_as_bo(&fx.0, &["clone", "-q", remote.to_str().unwrap(), fx.0.join("other").to_str().unwrap()]);
+    colleague_pushes(&fx, &remote, "main", "theirs.txt");
+    let before = reads(cx);
+    wait(cx, AUTO_FETCH_TICK);
+    assert_eq!(fetches(cx), 1);
+    assert_eq!(reads(cx), before + 1, "something came in, so the repository was read again");
+    assert_eq!(upstream_now(&ws, cx).map(|u| u.behind()), Some(1), "and it shows");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.is_none() && ws.busy.is_none()), "quietly");
+    assert_eq!(selected(cx), base_id, "what was selected stays selected");
+
+    // Not again until five minutes have passed; then nothing new, so nothing is read again.
+    wait(cx, AUTO_FETCH_TICK);
+    assert_eq!(fetches(cx), 1);
+    let before = reads(cx);
+    wait(cx, Duration::from_secs(5 * 60));
+    assert_eq!(fetches(cx), 2);
+    assert_eq!(reads(cx), before, "nothing changed, nothing read");
+
+    // Never while an operation runs.
+    ws.update(cx, |ws, _| ws.busy = Some("Pulling…".into()));
+    wait(cx, Duration::from_secs(10 * 60));
+    assert_eq!(fetches(cx), 2);
+    ws.update(cx, |ws, _| ws.busy = None);
+
+    // The remote goes away: the first failure is not said, the second is, once.
+    fx.git(&["remote", "set-url", "origin", fx.0.join("nowhere.git").to_str().unwrap()]);
+    wait(cx, AUTO_FETCH_TICK);
+    assert_eq!(fetches(cx), 3);
+    assert!(ws.read_with(cx, |ws, _| ws.notice.is_none()), "one failure is not worth a banner");
+    wait(cx, Duration::from_secs(5 * 60));
+    assert_eq!(fetches(cx), 4);
+    let said = ws.read_with(cx, |ws, _| ws.notice.as_ref().map(|n| (n.warn, n.text.to_string())));
+    assert!(said.as_ref().is_some_and(|(warn, text)| *warn && text.contains("failed twice")), "{said:?}");
+    ws.update(cx, |ws, cx| ws.dismiss_notice(cx));
+    wait(cx, Duration::from_secs(5 * 60));
+    assert_eq!(fetches(cx), 5);
+    assert!(ws.read_with(cx, |ws, _| ws.notice.is_none()), "said once, not every time");
+
+    // Off stops it.
+    ws.update(cx, |ws, cx| ws.set_auto_fetch(0, cx));
+    assert!(!ws.read_with(cx, |ws, _| ws.auto_fetch_scheduled()));
+    wait(cx, Duration::from_secs(30 * 60));
+    assert_eq!(fetches(cx), 5);
+}
+
+#[test]
+fn the_header_gives_up_its_words_before_the_counts_as_it_narrows() {
+    use crate::workspace::{HeaderRoom, header_room};
+    let name = "feature/88-offline-mode";
+    // "↑2" and "origin"; "4 ahead · 7 behind origin/develop".
+    let (upstream, base) = (Some((2, 7)), Some(33));
+    let room = |area: f32| header_room(area, name, upstream, base);
+    assert_eq!(room(1100.), HeaderRoom { label: true, base: true, remote: true }, "room for everything");
+    assert_eq!(room(950.), HeaderRoom { label: false, base: true, remote: true }, "the words go first");
+    assert_eq!(room(720.), HeaderRoom { label: false, base: false, remote: true }, "then what it was cut from");
+    assert_eq!(room(560.), HeaderRoom { label: false, base: false, remote: false }, "then the remote's name; the counts stay");
+    // A short name leaves room for more.
+    assert!(header_room(780., "main", upstream, base).base && !room(780.).base);
+    // Nothing to show is never shown.
+    assert!(!header_room(2000., name, None, None).base);
+}
+
+#[test]
+fn the_push_question_names_where_the_push_goes() {
+    use crate::menu::push_question;
+    use gitgui_core::Upstream;
+    let origin = ["origin".to_owned()];
+    // A branch that tracks a remote branch of another name is still pushed to its own name, and the question says so.
+    let other = Upstream::Tracking { name: "origin/develop".into(), remote: "origin".into(), ahead: 1, behind: 0 };
+    let (title, body, confirm) = push_question("feat", &other, &origin);
+    assert_eq!((title.as_str(), confirm), ("Push feat to origin/feat?", "Push"));
+    assert!(body.contains("Its upstream stays `origin/develop`"), "{body}");
+    // In step: nothing to send, said before anything is sent.
+    let same = Upstream::Tracking { name: "origin/feat".into(), remote: "origin".into(), ahead: 0, behind: 0 };
+    assert!(push_question("feat", &same, &origin).1.contains("nothing new to send"));
+    // Not on a remote: published to origin, else the first remote; with none, it says so.
+    assert_eq!(push_question("feat", &Upstream::None, &["fork".to_owned()]).0, "Publish feat to fork?");
+    assert!(push_question("feat", &Upstream::None, &[]).1.contains("no remote"));
+}

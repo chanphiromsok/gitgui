@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitgui_core::{
-    Backend, BranchTip, CheckoutTarget, Error, Evidence, GitCli, LaneLayout, LogOptions, Operation, Outcome, Query, RefKind,
+    Backend, BranchTip, CheckoutTarget, Error, Evidence, GitCli, LaneLayout, LogOptions, Operation, Outcome, Query, RefKind, Upstream,
 };
 
 struct TempRepo(PathBuf);
@@ -1215,4 +1215,62 @@ fn blame_names_the_commit_of_each_line_and_marks_the_uncommitted_ones() {
     let before = git.blame(Some("HEAD^"), "f.txt").unwrap();
     assert_eq!(before.line(2).unwrap().author, "Ada");
     assert!(git.blame(Some("HEAD"), "missing.txt").is_err());
+}
+
+#[test]
+fn each_branch_says_where_it_stands_against_its_remote_branch_from_one_read() {
+    let repo = trunk();
+    let git = GitCli::new(repo.path());
+    // No remote at all: every branch is only here, and there is nothing to fetch.
+    assert!(git.remotes().unwrap().is_empty());
+    assert_eq!(git.upstream_of("main").unwrap(), Upstream::None);
+
+    let remote = std::env::temp_dir().join(format!("gitgui-test-{}-remote-sync", std::process::id()));
+    let _ = std::fs::remove_dir_all(&remote);
+    repo.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    repo.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    git.push_branch("main").unwrap();
+    assert_eq!(git.remotes().unwrap(), ["origin"]);
+    let tracking = |ahead, behind| Upstream::Tracking { name: "origin/main".into(), remote: "origin".into(), ahead, behind };
+    assert_eq!(git.upstream_of("main").unwrap(), tracking(0, 0), "just pushed: in step");
+
+    // One commit of ours, one of a colleague's: two apart once theirs is fetched, and not before.
+    let other = clone_of(&remote, "sync-other");
+    other.commit("theirs.txt", "theirs");
+    other.git(&["push", "-q", "origin", "main"]);
+    repo.commit("mine.txt", "mine");
+    assert_eq!(git.upstream_of("main").unwrap(), tracking(1, 0), "counted against what was last fetched");
+    assert!(git.fetch_changed().unwrap(), "their commit came in");
+    assert_eq!(git.upstream_of("main").unwrap(), tracking(1, 1));
+    assert!(!git.fetch_changed().unwrap(), "nothing new the second time");
+
+    // A branch never pushed, and one whose remote branch was deleted and pruned.
+    git.create_branch("feature/local", Some("main"), false).unwrap();
+    git.create_branch("feature/old", Some("main"), false).unwrap();
+    git.push_branch("feature/old").unwrap();
+    other.git(&["push", "-q", "origin", "--delete", "feature/old"]);
+    assert!(git.fetch_changed().unwrap(), "a remote branch that went is a change too");
+
+    let all = git.branch_sync().unwrap();
+    let of = |name: &str| all.iter().find(|b| b.branch == name).map(|b| b.upstream.clone());
+    assert_eq!(of("main"), Some(tracking(1, 1)));
+    assert_eq!(of("feature/local"), Some(Upstream::None));
+    assert_eq!(of("feature/old"), Some(Upstream::Gone { name: "origin/feature/old".into(), remote: "origin".into() }));
+    assert_eq!(all.len(), 3, "local branches only: {all:?}");
+
+    // Pulling a branch whose remote branch is gone says so, rather than that it was never pushed.
+    repo.git(&["switch", "-q", "feature/old"]);
+    let said = git.pull_rebase().unwrap_err().to_string();
+    assert!(said.contains("origin/feature/old was deleted"), "{said}");
+    // Pushing it puts it back, tracked as before.
+    git.push_branch("feature/old").unwrap();
+    git.fetch().unwrap();
+    assert!(matches!(git.upstream_of("feature/old").unwrap(), Upstream::Tracking { ahead: 0, behind: 0, .. }));
+
+    // A detached HEAD has no branch to compare, but every branch still reads.
+    repo.git(&["switch", "-q", "--detach", "main"]);
+    assert_eq!(git.current_branch().unwrap(), None);
+    assert_eq!(git.branch_sync().unwrap().len(), 3);
+
+    let _ = std::fs::remove_dir_all(&remote);
 }

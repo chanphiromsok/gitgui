@@ -17,6 +17,7 @@
 //! nopeek   as if it had left
 //! hover <text>   rest the pointer on the first diff line whose text has the text (nopeek-style: `hover` alone leaves)
 //! settings [graph|style|files|appearance|projects]
+//! fetch | pull | push     the header's buttons (pull and push open their question)      autofetch 5   fetch on its own every 5 min
 //! shot name               save <folder>/name.png
 //! quit
 //! ```
@@ -135,6 +136,10 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             }
         }
         "search" => workspace.set_search(rest.to_owned(), cx),
+        "fetch" => workspace.fetch(cx),
+        "pull" => workspace.choose(crate::menu::Action::PullRebase, window, cx),
+        "push" => workspace.push_current(window, cx),
+        "autofetch" => workspace.set_auto_fetch(rest.parse().unwrap_or(0), cx),
         "menu" => {
             // menu authors|dates X Y: the menu a click there on that chip would open.
             let (kind, at) = rest.split_once(' ').unwrap_or((rest, "0 0"));

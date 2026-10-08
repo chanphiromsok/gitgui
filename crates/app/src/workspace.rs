@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use gitgui_core::{
     Backend, Blame, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
-    MergeClue, Operation, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, WebRemote, Gap, filter_commits, matches_text, reveal, scan_inputs, stash_count,
-    visible_rows, people, web_remote,
+    MergeClue, Operation, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, Upstream, WebRemote, Gap, fetch_due, filter_commits, matches_text, reveal,
+    scan_inputs, stash_count, visible_rows, people, web_remote,
 };
 use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
 use gpui::{
@@ -82,10 +82,16 @@ pub struct RepoView {
     pub unchecked: usize,
     /// The branches and trunks the merge scan is about, as they were read.
     scan_inputs: ScanInputs,
+    /// Each local branch's upstream and how far apart they are, as of the last fetch.
+    pub upstreams: HashMap<String, Upstream>,
+    /// The repository's remotes; none means there is nothing to fetch, pull or push.
+    pub remotes: Vec<String>,
 }
 
 /// The branches to check for merges and the trunks to check them against.
 type ScanInputs = (Vec<BranchTip>, Vec<BranchTip>);
+/// What reading a file for the diff view gives: its diff, the syntax colors, the pictures of an image, and the file's text.
+type FileRead = (FileDiff, syntax::FileColors, Option<preview::Images>, Option<Arc<String>>);
 
 /// The merge scan that is running, so a refresh that finds the same branches waits for it instead of
 /// starting another, and one that finds different branches stops it.
@@ -96,6 +102,12 @@ struct RunningScan {
 }
 
 impl RepoView {
+    /// Where the current branch stands against its upstream; `None` on a detached HEAD.
+    pub fn upstream(&self) -> Option<&Upstream> {
+        let branch = self.current_branch.as_ref()?;
+        Some(self.upstreams.get(branch.as_ref()).unwrap_or(&Upstream::None))
+    }
+
     /// Tip commit of each squash-merged branch → the commit that carries its changes.
     fn squashed(&self) -> HashMap<String, String> {
         self.clues
@@ -504,6 +516,8 @@ pub const PANE_HEIGHT_MIN: f32 = 180.;
 pub const GRAPH_HEIGHT_MIN: f32 = 160.;
 /// About what the banner at the bottom takes while it shows.
 const NOTICE_HEIGHT: f32 = 36.;
+/// How often, while fetching on its own is on, the app looks whether the open project is due a fetch.
+pub(crate) const AUTO_FETCH_TICK: Duration = Duration::from_secs(30);
 
 gpui::actions!(workspace, [PreviousFile, NextFile]);
 
@@ -584,6 +598,15 @@ pub struct Workspace {
     shown_pictures: Vec<Arc<gpui::RenderImage>>,
     /// How much background work has actually run.
     pub(crate) counts: Arc<Counts>,
+    /// Wakes now and then to fetch the open project, while that is on; dropping it stops it.
+    auto_fetch_timer: Option<gpui::Task<()>>,
+    /// A fetch the app started on its own is running.
+    pub auto_fetching: bool,
+    /// When each project was last fetched, by hand or on its own, by the executor's clock.
+    fetched_at: HashMap<PathBuf, Instant>,
+    /// Fetches on its own that failed in a row, and whether the banner has said so.
+    auto_fetch_failures: u32,
+    auto_fetch_warned: bool,
 }
 
 /// Background work done so far, counted so tests can tell work that ran from work that was skipped.
@@ -593,6 +616,8 @@ pub(crate) struct Counts {
     pub scans: AtomicUsize,
     pub commit_reads: AtomicUsize,
     pub file_reads: AtomicUsize,
+    /// Fetches the app started on its own.
+    pub fetches: AtomicUsize,
 }
 
 impl Drop for Workspace {
@@ -629,6 +654,9 @@ struct RepoData {
     work: Vec<WorkFile>,
     /// The day it is here, for `date:today` in the search.
     today: gitgui_core::Day,
+    /// Each local branch's upstream, from one `git for-each-ref`.
+    upstreams: HashMap<String, Upstream>,
+    remotes: Vec<String>,
 }
 
 /// Reads the repository; the commits are left unparsed (`None`) when the log is the one `unchanged`
@@ -662,7 +690,10 @@ fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_cor
     let work = git.work_status().unwrap_or_default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let today = gitgui_core::day_of(now, git.utc_offset());
-    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), in_progress, web, work, today })
+    // Nice to know, not worth failing the read over.
+    let upstreams = git.branch_sync().unwrap_or_default().into_iter().map(|b| (b.branch, b.upstream)).collect();
+    let remotes = git.remotes().unwrap_or_default();
+    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), in_progress, web, work, today, upstreams, remotes })
 }
 
 /// A commit's record and the files it changed; `None` when it stopped early because `wanted` said the
@@ -849,7 +880,13 @@ impl Workspace {
             last_log: None,
             shown_pictures: Vec::new(),
             counts: Arc::default(),
+            auto_fetch_timer: None,
+            auto_fetching: false,
+            fetched_at: HashMap::new(),
+            auto_fetch_failures: 0,
+            auto_fetch_warned: false,
         };
+        this.schedule_auto_fetch(cx);
         this.reopen_last_project(cx);
         this
     }
@@ -1074,7 +1111,7 @@ impl Workspace {
             move |this, result, cx| {
                 this.reading = false;
                 let settings = this.settings.clone();
-                let stale = this.reread || !this.repo.as_ref().is_some_and(|repo| repo.generation == generation);
+                let stale = this.reread || this.repo.as_ref().is_none_or(|repo| repo.generation != generation);
                 if stale {
                     // Something asked for a newer read meanwhile: this answer may predate it.
                     if this.repo.as_ref().is_some_and(|repo| matches!(repo.phase, Phase::Loading)) {
@@ -1131,6 +1168,8 @@ impl Workspace {
                             scanning: false,
                             unchecked: 0,
                             scan_inputs: (branches, targets),
+                            upstreams: data.upstreams,
+                            remotes: data.remotes,
                         };
                         // Branches that have not moved since the last scan are known at once.
                         let cache = this.scan_caches.entry(path.clone()).or_default().clone();
@@ -1144,6 +1183,9 @@ impl Workspace {
                         view.scanning = scan;
                         view.rebuild(&settings, &repo.collapsed, &repo.graph_filter);
                         let inputs = view.scan_inputs.clone();
+                        // Read again in the background (after a fetch), the selected commit stays selected wherever its row went.
+                        let selected = repo.selected_id();
+                        repo.selected = selected.and_then(|id| view.entries.iter().position(|e| e.commit.as_deref() == Some(id.as_str())));
                         repo.phase = Phase::Ready(view);
                         if let Some(operation) = in_progress.filter(|_| this.notice.is_none()) {
                             this.notice = Some(Notice {
@@ -1240,6 +1282,103 @@ impl Workspace {
         if let Some(path) = self.repo.as_ref().map(|repo| repo.project.path.clone()) {
             self.select_project(path, cx);
         }
+    }
+
+    // ---- fetching on its own ----------------------------------------------------------------
+
+    /// Fetch the open project every `minutes` in the background, or never (0). Kept for the next launch.
+    pub fn set_auto_fetch(&mut self, minutes: u32, cx: &mut Context<Self>) {
+        if self.settings.auto_fetch_minutes != minutes {
+            self.settings.auto_fetch_minutes = minutes;
+            self.save_settings();
+            (self.auto_fetch_failures, self.auto_fetch_warned) = (0, false);
+            self.schedule_auto_fetch(cx);
+        }
+        cx.notify();
+    }
+
+    /// Starts or stops the timer behind fetching on its own, to match the setting.
+    fn schedule_auto_fetch(&mut self, cx: &mut Context<Self>) {
+        self.auto_fetch_timer = (self.settings.auto_fetch_minutes > 0).then(|| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(AUTO_FETCH_TICK).await;
+                    if this.update(cx, |this, cx| this.auto_fetch_tick(cx)).is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+    }
+
+    /// Fetching on its own is on: there is a timer for it.
+    #[cfg(test)]
+    pub(crate) fn auto_fetch_scheduled(&self) -> bool {
+        self.auto_fetch_timer.is_some()
+    }
+
+    /// The open project was just fetched by hand: the next fetch on its own counts from now.
+    pub(crate) fn note_fetched(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.repo.as_ref().map(|repo| repo.project.path.clone()) {
+            self.fetched_at.insert(path, cx.background_executor().now());
+        }
+    }
+
+    /// The timer went off: fetches the open project if it is due one and nothing else is running.
+    fn auto_fetch_tick(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_ref() else { return };
+        let Phase::Ready(view) = &repo.phase else { return };
+        if view.remotes.is_empty() || self.busy.is_some() || self.reading || self.auto_fetching {
+            return;
+        }
+        let last = self.fetched_at.get(&repo.project.path).copied();
+        if fetch_due(self.settings.auto_fetch_minutes, last, cx.background_executor().now()) {
+            self.auto_fetch(cx);
+        }
+    }
+
+    /// Fetches the open project in the background without a banner, and reads it again only when a remote branch or
+    /// tag changed. The second failure in a row is said, once, until one works again.
+    fn auto_fetch(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.repo.as_ref().map(|repo| repo.project.path.clone()) else { return };
+        self.auto_fetching = true;
+        cx.notify();
+        let (fetch_path, counts) = (path.clone(), self.counts.clone());
+        self.spawn_load(
+            cx,
+            move || {
+                counts.fetches.fetch_add(1, Ordering::Relaxed);
+                GitCli::new(&fetch_path).fetch_changed()
+            },
+            move |this, result, cx| {
+                this.auto_fetching = false;
+                this.fetched_at.insert(path.clone(), cx.background_executor().now());
+                match result {
+                    Ok(changed) => {
+                        (this.auto_fetch_failures, this.auto_fetch_warned) = (0, false);
+                        // An operation that is running reads the repository again when it ends anyway.
+                        let open = this.repo.as_ref().is_some_and(|repo| repo.project.path == path);
+                        if changed && open && this.busy.is_none() {
+                            this.start_read(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.auto_fetch_failures += 1;
+                        let warning_up = this.notice.as_ref().is_some_and(|notice| notice.warn);
+                        if this.auto_fetch_failures >= 2 && !this.auto_fetch_warned && !warning_up {
+                            this.auto_fetch_warned = true;
+                            let said = crate::menu::explain(&error);
+                            this.notice = Some(Notice::warn(format!(
+                                "Fetching from the remote on its own failed twice in a row: {}. It tries again every {} minutes; Settings, Projects turns it off.",
+                                said.trim_end_matches('.'),
+                                this.settings.auto_fetch_minutes
+                            )));
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     // ---- commits ----------------------------------------------------------------------------
@@ -1356,7 +1495,7 @@ impl Workspace {
         let (latest, counts) = (self.file_ticket.clone(), self.counts.clone());
         self.spawn_load(
             cx,
-            move || -> Option<Result<(FileDiff, syntax::FileColors, Option<preview::Images>, Option<Arc<String>>), gitgui_core::Error>> {
+            move || -> Option<Result<FileRead, gitgui_core::Error>> {
                 let wanted = || current(&latest, ticket);
                 if !wanted() {
                     return None;
@@ -2511,18 +2650,38 @@ impl Workspace {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Phase::Ready(view) = &repo.phase else { return div().into_any_element() };
 
+        // With no remote there is nothing to be ahead of or behind.
+        let upstream = view.upstream().filter(|_| !view.remotes.is_empty());
         let current = match &view.current_branch {
-            Some(name) => div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(ui::ring(rgb(t().accent)))
-                .when(area >= 640., |row| row.child(div().text_color(rgb(t().muted)).child("Current branch")))
-                .child(div().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(name.clone()))
-                .children(view.base.clone().map(|base| self.render_base(base, cx))),
+            Some(name) => {
+                let spare = if view.remotes.is_empty() { SYNC_BUTTONS } else { 0. };
+                let room = header_room(area + spare, name, upstream.map(|u| upstream_chars(name, u)), view.base.as_ref().map(base_chars));
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(ui::ring(rgb(t().accent)))
+                    .when(room.label, |row| row.child(div().flex_none().text_color(rgb(t().muted)).child("Current branch")))
+                    .child(
+                        div()
+                            .flex_1()
+                            // Some of a long name stays; a short one keeps no room it does not use.
+                            .min_w(px((name.chars().count() as f32 * 7.6).min(48.)))
+                            .overflow_hidden()
+                            // The row does not wrap, and text that may not wrap is never cut short with an ellipsis.
+                            .whitespace_normal()
+                            .line_clamp(1)
+                            .text_ellipsis()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(t().text_strong))
+                            .child(name.clone()),
+                    )
+                    .children(upstream.map(|upstream| render_upstream(name, upstream, room.remote)))
+                    .children(view.base.clone().filter(|_| room.base).map(|base| self.render_base(base, cx)))
+            }
             None => div().text_color(rgb(t().warning)).child("HEAD is detached"),
         };
         let header = div()
@@ -2542,7 +2701,8 @@ impl Workspace {
                     .min_w_0()
                     .flex_1()
                     .overflow_hidden()
-                    .whitespace_nowrap()
+                    .line_clamp(1)
+                    .text_ellipsis()
                     .text_xs()
                     .text_color(rgb(t().muted))
                     .child(if view.scanning {
@@ -2558,16 +2718,7 @@ impl Workspace {
                     .debug_selector(|| "new-branch".to_owned())
                     .on_click(cx.listener(|this, _, window, cx| this.open_new_branch(window, cx))),
             )
-            .child(
-                button("fetch", "Fetch")
-                    .debug_selector(|| "fetch".to_owned())
-                    .on_click(cx.listener(|this, _, _, cx| this.fetch(cx))),
-            )
-            .child(
-                button("pull-rebase", "Pull (rebase)")
-                    .debug_selector(|| "pull-rebase".to_owned())
-                    .on_click(cx.listener(|this, _, window, cx| this.choose(crate::menu::Action::PullRebase, window, cx))),
-            )
+            .children((!view.remotes.is_empty()).then(|| self.render_sync_buttons(view.upstream(), cx)))
             .child(button("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 
         div()
@@ -2692,6 +2843,22 @@ impl Workspace {
             .child(search)
             .children(status.map(|text| div().flex_none().text_xs().text_color(rgb(t().muted)).child(text)))
             .into_any_element()
+    }
+
+    /// Fetch, Pull and Push side by side. The one the current branch needs is lit: Push when it has commits the remote
+    /// does not or is not on a remote yet, Pull when the remote has commits it does not (pull first, then push).
+    fn render_sync_buttons(&self, upstream: Option<&Upstream>, cx: &mut Context<Self>) -> AnyElement {
+        let (pull, push) = sync_emphasis(upstream);
+        // A fetch the app started on its own is running: quietly greyed, not a banner.
+        let fetch = sync_button("fetch", "Fetch", if self.auto_fetching { Emphasis::Idle } else { Emphasis::Plain })
+            .rounded_l_sm()
+            .on_click(cx.listener(|this, _, _, cx| this.fetch(cx)));
+        let pull = sync_button("pull-rebase", "Pull", pull)
+            .on_click(cx.listener(|this, _, window, cx| this.choose(crate::menu::Action::PullRebase, window, cx)));
+        let push = sync_button("push", "Push", push)
+            .rounded_r_sm()
+            .on_click(cx.listener(|this, _, window, cx| this.push_current(window, cx)));
+        div().flex().flex_none().gap(px(1.)).child(fetch).child(pull).child(push).into_any_element()
     }
 
     /// "2 ahead · 1 behind release/1.0.0": click it to go to the commit the branch was cut from.
@@ -2850,6 +3017,138 @@ fn diff_mode_of(mode: Mode) -> DiffMode {
         Mode::Unified => DiffMode::Unified,
         Mode::Split => DiffMode::Split,
     }
+}
+
+/// How a button of the Fetch, Pull and Push group looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Emphasis {
+    /// The thing to do next.
+    Lit,
+    Plain,
+    /// Nothing to do: there is no remote branch to pull from, or no branch to push.
+    Idle,
+}
+
+/// How Pull and Push look for where the current branch stands (`None` on a detached HEAD).
+pub(crate) fn sync_emphasis(upstream: Option<&Upstream>) -> (Emphasis, Emphasis) {
+    match upstream {
+        None => (Emphasis::Idle, Emphasis::Idle),
+        Some(Upstream::None | Upstream::Gone { .. }) => (Emphasis::Idle, Emphasis::Lit),
+        // A push of a branch the remote has moved on from is rejected: pull first.
+        Some(Upstream::Tracking { behind, .. }) if *behind > 0 => (Emphasis::Lit, Emphasis::Plain),
+        Some(Upstream::Tracking { ahead, .. }) if *ahead > 0 => (Emphasis::Plain, Emphasis::Lit),
+        Some(Upstream::Tracking { .. }) => (Emphasis::Plain, Emphasis::Plain),
+    }
+}
+
+/// One button of the Fetch, Pull and Push group: a `button` whose fill says how much it matters now. The caller rounds
+/// the outer corners.
+fn sync_button(id: &'static str, label: &'static str, look: Emphasis) -> gpui::Stateful<gpui::Div> {
+    let (fill, hover) = match look {
+        Emphasis::Lit => (theme::mix(t().element, t().accent, 0.3), theme::mix(t().element, t().accent, 0.45)),
+        Emphasis::Plain | Emphasis::Idle => (t().element, t().element_hover),
+    };
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .flex_none()
+        .px_2()
+        .h(px(22.))
+        .flex()
+        .items_center()
+        .bg(rgb(fill))
+        .text_xs()
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(hover)))
+        .when(look == Emphasis::Lit, |b| b.text_color(rgb(t().text_strong)).font_weight(FontWeight::SEMIBOLD))
+        .when(look == Emphasis::Idle, |b| b.text_color(rgb(t().muted)))
+        .child(label)
+}
+
+/// What the branch header has room for beside the current branch's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeaderRoom {
+    /// The words "Current branch".
+    pub label: bool,
+    /// What the branch was cut from, and how far apart they are.
+    pub base: bool,
+    /// The remote's name after the ↑↓ counts.
+    pub remote: bool,
+}
+
+/// About what the header's other parts take: the sidebar button, New branch, Fetch Pull Push, Refresh, gaps, padding;
+/// and of that, Fetch Pull Push, which a repository with no remote does not show.
+const HEADER_FIXED: f32 = 420.;
+const SYNC_BUTTONS: f32 = 110.;
+
+/// What fits in a header `area` wide, by a rough measure of the text (about 7.6 px a bold character, 6.4 a small
+/// one): `upstream` is the length of the ↑↓ part and of the remote's name, `base` the length of the base's words.
+/// What says least goes first: the words "Current branch", then the base, then the remote's name; the branch's own
+/// name is cut short last, and the counts stay.
+pub(crate) fn header_room(area: f32, name: &str, upstream: Option<(usize, usize)>, base: Option<usize>) -> HeaderRoom {
+    let small = |chars: usize| chars as f32 * 6.4;
+    let room = area - HEADER_FIXED;
+    let name = name.chars().count() as f32 * 7.6;
+    let (counts, remote) = upstream.map_or((0., 0.), |(counts, remote)| (small(counts) + 8., small(remote) + 4.));
+    let base_w = base.map_or(0., |chars| small(chars) + 24.);
+    let show_remote = room >= name.min(160.) + counts + remote;
+    let remote = if show_remote { remote } else { 0. };
+    let show_base = base.is_some() && room >= name.min(220.) + counts + remote + base_w;
+    let base_w = if show_base { base_w } else { 0. };
+    HeaderRoom { label: room >= name + counts + remote + base_w + 108., base: show_base, remote: show_remote }
+}
+
+/// How long the parts of [`render_upstream`] are: the counts (or the words said instead), and the remote's name.
+fn upstream_chars(branch: &str, upstream: &Upstream) -> (usize, usize) {
+    let count = |n: usize| if n > 0 { 1 + n.to_string().len() } else { 0 };
+    match upstream {
+        Upstream::None => ("not on a remote yet".len(), 0),
+        // "remote gone", or "origin/x was deleted" when there is room.
+        Upstream::Gone { name, .. } => (11, (name.chars().count() + 12).saturating_sub(11)),
+        Upstream::Tracking { ahead, behind, .. } => {
+            let counts = (count(*ahead) + count(*behind)).max(1) + usize::from(*ahead > 0 && *behind > 0);
+            (counts, upstream_shown(branch, upstream).map_or(0, |shown| shown.chars().count() + 1))
+        }
+    }
+}
+
+/// The remote branch as the header names it: the remote alone when the branch there has this branch's name.
+fn upstream_shown<'a>(branch: &str, upstream: &'a Upstream) -> Option<&'a str> {
+    match upstream {
+        Upstream::Tracking { name, remote, .. } | Upstream::Gone { name, remote } => {
+            Some(if name.strip_prefix(remote.as_str()).and_then(|rest| rest.strip_prefix('/')) == Some(branch) { remote } else { name })
+        }
+        Upstream::None => None,
+    }
+}
+
+/// How long "2 ahead · 1 behind develop" is.
+fn base_chars(base: &graph::Base) -> usize {
+    format!("{} ahead · {} behind {}", base.ahead, base.behind, base.name).chars().count()
+}
+
+/// "↑2 ↓1 origin" beside the current branch: what a push would send and a pull would bring, as of the last fetch; a
+/// check when there is neither. The remote branch is named in full only when its name is not the branch's own, and
+/// only with `remote` room for it.
+fn render_upstream(branch: &str, upstream: &Upstream, remote: bool) -> AnyElement {
+    let chip = div()
+        .debug_selector(|| "branch-upstream".to_owned())
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .text_color(rgb(t().muted));
+    match upstream {
+        Upstream::None => chip.child("not on a remote yet"),
+        Upstream::Gone { name, .. } => chip.text_color(rgb(t().warning)).child(if remote { format!("{name} was deleted") } else { "remote gone".to_owned() }),
+        Upstream::Tracking { ahead, behind, .. } => chip
+            .when(*ahead == 0 && *behind == 0, |chip| chip.child("✓"))
+            .when(*ahead > 0, |chip| chip.child(div().text_color(rgb(t().added)).child(format!("↑{ahead}"))))
+            .when(*behind > 0, |chip| chip.child(div().text_color(rgb(t().modified)).child(format!("↓{behind}"))))
+            .when_some(upstream_shown(branch, upstream).filter(|_| remote), |chip, shown| chip.child(SharedString::from(shown.to_owned()))),
+    }
+    .into_any_element()
 }
 
 fn centered(content: impl IntoElement) -> AnyElement {

@@ -53,7 +53,7 @@ impl SettingsPage {
             Self::Workflow => "How this project's team names branches and where new work starts.",
             Self::Files => "How a commit's changed files and their diffs are laid out.",
             Self::Appearance => "Colors and file icons.",
-            Self::Projects => "Where new clones go, and where gitgui keeps its own files.",
+            Self::Projects => "Where new clones go, fetching from remotes, and where gitgui keeps its own files.",
         }
     }
 }
@@ -331,6 +331,11 @@ impl Workspace {
                         .text_color(rgb(t().muted))
                         .child(SharedString::from(text))
                 };
+                let every = |minutes: u32, label: &'static str| {
+                    segment(("setting-auto-fetch", minutes as usize), label, s.auto_fetch_minutes == minutes)
+                        .debug_selector(move || format!("setting-auto-fetch-{minutes}"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_auto_fetch(minutes, cx)))
+                };
                 vec![card(
                     None,
                     vec![
@@ -346,6 +351,12 @@ impl Workspace {
                                     button("setting-clone-folder", "Change…")
                                         .on_click(cx.listener(|this, _, _, cx| this.choose_default_clone_folder(cx))),
                                 ),
+                        ),
+                        row(
+                            "Fetch from the remote automatically",
+                            "Runs git fetch for the open project in the background, so what there is to pull stays current. \
+                             Only its own remotes are contacted, and no local branch changes.",
+                            segmented(vec![every(0, "Off"), every(5, "5 min"), every(15, "15 min"), every(30, "30 min")]),
                         ),
                         row(
                             "Data folder",

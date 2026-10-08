@@ -6,7 +6,7 @@
 //! in the banner at the bottom: what was done, why git refused, or (for a merge, rebase or cherry-pick
 //! that hit conflicts) a button that puts everything back.
 
-use gitgui_core::{CheckoutTarget, Error, Evidence, GitCli, Label, LabelKind, Operation, Outcome};
+use gitgui_core::{CheckoutTarget, Error, Evidence, GitCli, Label, LabelKind, Operation, Outcome, Upstream, default_remote, nothing_to_pull};
 use gpui::{
     AnyElement, ClipboardItem, Context, FontWeight, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px,
     rgb, rgba,
@@ -164,6 +164,14 @@ impl Workspace {
         }
     }
 
+    /// Where `branch` stands against its upstream, and the repository's remotes, as last read.
+    pub(crate) fn sync_of(&self, branch: &str) -> (Upstream, Vec<String>) {
+        match self.repo.as_ref().map(|repo| &repo.phase) {
+            Some(Phase::Ready(view)) => (view.upstreams.get(branch).cloned().unwrap_or(Upstream::None), view.remotes.clone()),
+            _ => (Upstream::None, Vec::new()),
+        }
+    }
+
     /// What the scan found about this branch, if it found anything.
     fn clue_for(&self, branch: &str) -> Option<gitgui_core::MergeClue> {
         match &self.repo.as_ref()?.phase {
@@ -296,6 +304,13 @@ impl Workspace {
         if self.busy.is_some() {
             return self.say(Notice::warn("Another operation is still running."), cx);
         }
+        // A pull that has nothing to pull from is not worth a question.
+        if action == Action::PullRebase
+            && let Some(branch) = self.current_branch_name()
+            && let Some(why) = nothing_to_pull(&branch, &self.sync_of(&branch).0)
+        {
+            return self.say(Notice::warn(why), cx);
+        }
         match action {
             Action::Checkout(target) => {
                 let name = match &target {
@@ -361,28 +376,27 @@ impl Workspace {
                 true,
                 None,
             ),
-            Action::Push(branch) => (
-                format!("Push {branch}?"),
-                format!(
-                    "Sends `{branch}` to its remote (`origin` when it has no upstream yet, which then becomes its upstream). \
-                     The push is never forced: if the remote has commits you do not, it is rejected."
-                ),
-                "Push",
-                false,
-                None,
-            ),
-            Action::PullRebase => (
-                format!("Pull {current} with rebase?"),
-                format!(
-                    "Fetches the upstream of `{current}` and replays the commits that are only on your side on top of it \
-                     (`git pull --rebase`), so history stays a straight line with no merge commit. Your unpushed commits are \
-                     rewritten, which is safe because they are not shared yet. Nothing is forced. If there are conflicts it \
-                     stops and you can abort to put everything back. Git refuses if you have uncommitted changes."
-                ),
-                "Pull",
-                false,
-                None,
-            ),
+            Action::Push(branch) => {
+                let (upstream, remotes) = self.sync_of(branch);
+                let (title, body, confirm) = push_question(branch, &upstream, &remotes);
+                (title, body, confirm, false, None)
+            }
+            Action::PullRebase => {
+                let (upstream, _) = self.sync_of(&current);
+                (
+                    format!("Pull {current} with rebase?"),
+                    format!(
+                        "{}Fetches the upstream of `{current}` and replays the commits that are only on your side on top of it \
+                         (`git pull --rebase`), so history stays a straight line with no merge commit. Your unpushed commits are \
+                         rewritten, which is safe because they are not shared yet. Nothing is forced. If there are conflicts it \
+                         stops and you can abort to put everything back. Git refuses if you have uncommitted changes.",
+                        pull_lead(&current, &upstream)
+                    ),
+                    "Pull",
+                    false,
+                    None,
+                )
+            }
             Action::CherryPick(id) => {
                 let summary = self.summary_of(id).unwrap_or_default();
                 (
@@ -463,7 +477,12 @@ impl Workspace {
                 self.run(format!("Rebasing onto {onto}…"), format!("Rebased {on} onto {onto}."), None, move |git| git.rebase(&onto), cx);
             }
             Action::Push(branch) => {
-                self.run(format!("Pushing {branch}…"), format!("Pushed {branch}."), None, move |git| git.push_branch(&branch).map(Outcome::Done), cx);
+                let (upstream, remotes) = self.sync_of(&branch);
+                let done = match (&upstream, default_remote(&remotes)) {
+                    (Upstream::None, Some(remote)) => format!("Published {branch} to {remote}."),
+                    _ => format!("Pushed {branch}."),
+                };
+                self.run(format!("Pushing {branch}…"), done, None, move |git| git.push_branch(&branch).map(Outcome::Done), cx);
             }
             Action::PullRebase => {
                 let on = self.current_branch_name().unwrap_or_default();
@@ -662,7 +681,20 @@ impl Workspace {
         if self.busy.is_some() {
             return self.say(Notice::warn("Another operation is still running."), cx);
         }
+        // One the app started on its own is already doing it.
+        if self.auto_fetching {
+            return;
+        }
+        self.note_fetched(cx);
         self.run("Fetching…".into(), "Fetched: the remote branches are up to date.".into(), None, |git| git.fetch().map(Outcome::Done), cx);
+    }
+
+    /// The header's Push: asks, then pushes the checked-out branch, publishing it when it is not on a remote yet.
+    pub fn push_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.current_branch_name() {
+            Some(branch) => self.choose(Action::Push(branch), window, cx),
+            None => self.say(Notice::warn("Switch to a branch first: a detached HEAD has no branch to push."), cx),
+        }
     }
 
     /// The banner's button.
@@ -835,6 +867,62 @@ impl Workspace {
                         .child(confirm),
                 ),
         ))
+    }
+}
+
+/// The question before pushing `branch`: its title, what will happen, and the confirm button's word, from where the
+/// branch stood against its upstream when last read. It names where the push goes as `push_branch` does: the same
+/// name, on the upstream's remote, or `origin` (else the first remote) when it has no upstream yet.
+pub(crate) fn push_question(branch: &str, upstream: &Upstream, remotes: &[String]) -> (String, String, &'static str) {
+    let commits = |n: usize| if n == 1 { "1 commit".to_owned() } else { format!("{n} commits") };
+    let never = "Nothing is forced: if the remote has commits you do not, the push is rejected and nothing changes there.";
+    match upstream {
+        Upstream::None => match default_remote(remotes) {
+            Some(remote) => (
+                format!("Publish {branch} to {remote}?"),
+                format!(
+                    "`{branch}` is not on a remote yet. This pushes it to `{remote}/{branch}` and makes that its upstream, \
+                     so others can see it and Pull follows it. {never}"
+                ),
+                "Publish",
+            ),
+            None => (format!("Push {branch}?"), "This repository has no remote to push to; add one first.".to_owned(), "Push"),
+        },
+        Upstream::Gone { name, remote } => (
+            format!("Push {branch} to {remote} again?"),
+            format!("`{name}` was deleted from the remote. This pushes `{branch}` there again, so it is back for others. {never}"),
+            "Push",
+        ),
+        Upstream::Tracking { name, remote, ahead, behind } => {
+            let target = format!("{remote}/{branch}");
+            let what = if *behind > 0 {
+                format!(
+                    "`{name}` has {} that `{branch}` does not, as of the last fetch, so the push will be rejected: Pull first, then push.",
+                    commits(*behind)
+                )
+            } else if *ahead > 0 {
+                format!("Sends {} that `{target}` does not have yet.", commits(*ahead))
+            } else {
+                format!("`{target}` already has everything on `{branch}`, as of the last fetch: there is nothing new to send.")
+            };
+            // A branch can track a remote branch of another name; the push still goes to its own name, said in full.
+            let (to, elsewhere) =
+                if *name == target { (remote.clone(), String::new()) } else { (target.clone(), format!(" Its upstream stays `{name}`.")) };
+            (format!("Push {branch} to {to}?"), format!("{what}{elsewhere} {never}"), "Push")
+        }
+    }
+}
+
+/// What the pull question says first: how far apart the branch and its upstream were at the last fetch.
+fn pull_lead(branch: &str, upstream: &Upstream) -> String {
+    let commits = |n: usize| if n == 1 { "1 commit".to_owned() } else { format!("{n} commits") };
+    match upstream {
+        Upstream::Tracking { name, behind: 0, .. } => format!("`{name}` had nothing new at the last fetch; this fetches again to be sure. "),
+        Upstream::Tracking { name, ahead: 0, behind, .. } => format!("`{name}` has {} that `{branch}` does not. ", commits(*behind)),
+        Upstream::Tracking { name, ahead, behind, .. } => {
+            format!("`{name}` has {} that `{branch}` does not, and your {} go on top of them. ", commits(*behind), commits(*ahead))
+        }
+        Upstream::None | Upstream::Gone { .. } => String::new(),
     }
 }
 

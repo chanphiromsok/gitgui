@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::{Command as Process, Stdio};
 
 use crate::backend::{Backend, Error, GitCli};
+use crate::sync::{default_remote, nothing_to_pull};
 
 /// A multi-step operation git can leave half done when it meets conflicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,25 +159,36 @@ impl GitCli {
     /// Git refuses, and says so, with uncommitted changes, a detached HEAD or no upstream. On conflicts
     /// it stops like a rebase and [`GitCli::abort`] puts everything back.
     pub fn pull_rebase(&self) -> Result<Outcome, Error> {
+        let Some(branch) = self.current_branch()? else {
+            return Err(Error::Parse("switch to a branch first: there is no branch checked out to pull into.".into()));
+        };
         // A branch made here has no remote branch until it is pushed; git's own words for that are about tracking.
-        match self.current_branch()? {
-            None => return Err(Error::Parse("switch to a branch first: there is no branch checked out to pull into.".into())),
-            Some(branch) if self.write(&["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")]).is_err() => {
-                return Err(Error::Parse(format!(
-                    "{branch} is not on a remote yet, so there is nothing to pull. Push it first (right-click it, then Push)."
-                )));
-            }
-            Some(_) => {}
+        if let Some(why) = nothing_to_pull(&branch, &self.upstream_of(&branch)?) {
+            return Err(Error::Parse(why));
         }
         self.finish(Operation::Rebase, &["pull", "--rebase", "--no-stat"])
     }
 
+    /// The remotes' names: `origin`, and any others.
+    pub fn remotes(&self) -> Result<Vec<String>, Error> {
+        let out = self.run(&["remote"])?;
+        Ok(String::from_utf8_lossy(&out).lines().map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned).collect())
+    }
+
     /// Brings in what the remotes have without touching any local branch; branches gone from a remote leave the list.
     pub fn fetch(&self) -> Result<String, Error> {
-        if self.write(&["remote"])?.trim().is_empty() {
+        if self.remotes()?.is_empty() {
             return Err(Error::Parse("this repository has no remote to fetch from.".into()));
         }
         self.write(&["fetch", "--all", "--prune"])
+    }
+
+    /// [`GitCli::fetch`], and whether it changed anything here: a remote branch or tag that came, moved or went.
+    pub fn fetch_changed(&self) -> Result<bool, Error> {
+        let refs = || self.run(&["for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes", "refs/tags"]);
+        let before = refs()?;
+        self.fetch()?;
+        Ok(refs()? != before)
     }
 
     /// Applies one commit on top of the current branch. A merge commit is refused: which side to
@@ -223,12 +235,8 @@ impl GitCli {
         match remote {
             Some(remote) => self.write(&["push", &remote, name]),
             None => {
-                let remotes = self.write(&["remote"])?;
-                let remote = if remotes.lines().any(|r| r == "origin") {
-                    "origin"
-                } else {
-                    remotes.lines().next().ok_or_else(|| Error::Parse("this repository has no remote to push to".into()))?
-                };
+                let remotes = self.remotes()?;
+                let remote = default_remote(&remotes).ok_or_else(|| Error::Parse("this repository has no remote to push to".into()))?;
                 self.write(&["push", "--set-upstream", remote, name])
             }
         }
