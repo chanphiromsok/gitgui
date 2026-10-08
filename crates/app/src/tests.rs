@@ -1714,16 +1714,71 @@ async fn the_new_branch_window_names_the_branch_the_way_the_team_does(cx: &mut T
     assert!(ws.read_with(cx, |ws, _| ws.workflow_hint("driver-reporting")).unwrap().contains("type"));
     assert_eq!(ws.read_with(cx, |ws, _| ws.workflow_hint("feature/74-driver-reporting")), None);
 
-    // The window: the first type, the team's base, and the name as it is typed.
+    // The window: no type until one is clicked, the team's base, and the name as it is typed.
     ws.update_in(cx, |ws, window, cx| ws.open_new_branch(window, cx));
     ws.update(cx, |ws, cx| {
         ws.branch_ticket.update(cx, |input, cx| input.set_text("#101", cx));
         ws.branch_title.update(cx, |input, cx| input.set_text("Driver Reporting v2", cx));
     });
     draw(cx, &ws);
-    assert_eq!(ws.read_with(cx, |ws, cx| ws.typed_branch_name(cx)), "feature/101-driver-reporting-v2");
+    let name = |ws: &Entity<Workspace>, cx: &VisualTestContext| ws.read_with(cx, |ws, cx| ws.typed_branch_name(cx));
+    assert_eq!(name(&ws, cx), "101-driver-reporting-v2", "a name does not have to start with a type");
     assert!(cx.debug_bounds("new-branch-create").is_some(), "the window is drawn");
     assert_eq!(ws.read_with(cx, |ws, _| ws.new_branch.as_ref().map(|w| w.base.clone())), Some("develop".to_owned()));
+
+    // A click on a type fills in its prefix; another takes it off.
+    let feature = center_of(cx, "kind-feature".to_owned());
+    click(cx, MouseButton::Left, feature);
+    assert_eq!(name(&ws, cx), "feature/101-driver-reporting-v2");
+    draw(cx, &ws);
+    let feature = center_of(cx, "kind-feature".to_owned());
+    click(cx, MouseButton::Left, feature);
+    assert_eq!(name(&ws, cx), "101-driver-reporting-v2");
+    draw(cx, &ws);
+    let feature = center_of(cx, "kind-feature".to_owned());
+    click(cx, MouseButton::Left, feature);
+    assert_eq!(name(&ws, cx), "feature/101-driver-reporting-v2");
+
+    // "Start from" opens a list to search: it narrows as it is typed, and a click on a branch starts from it.
+    draw(cx, &ws);
+    let base = center_of(cx, "branch-base".to_owned());
+    click(cx, MouseButton::Left, base);
+    assert!(ws.read_with(cx, |ws, _| ws.branch_picker.is_some()), "the list opens");
+    let listed = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, cx| {
+            let query = ws.branch_search.read(cx).text().to_owned();
+            ws.branch_pick_rows(&query)
+                .into_iter()
+                .filter_map(|row| match row {
+                    crate::workflow_ui::PickRow::Branch { name, .. } => Some(name),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let everything = listed(&ws, cx);
+    assert!(everything.iter().any(|b| b == "develop") && everything.iter().any(|b| b == "bugfix/90-crash"), "{everything:?}");
+    assert_eq!(everything.iter().filter(|b| *b == "develop").count(), 1, "each branch once");
+    ws.update(cx, |ws, cx| ws.branch_search.update(cx, |input, cx| input.set_text("bug", cx)));
+    // Newest first, like the graph.
+    let found = listed(&ws, cx);
+    assert_eq!(found.len(), 2);
+    assert!(found.contains(&"bugfix/90-crash".to_owned()) && found.contains(&"bugfix/91-typo".to_owned()), "{found:?}");
+    ws.update(cx, |ws, cx| ws.step_branch_pick(1, cx));
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.pick_highlighted_branch(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.branch_picker.is_none()), "the list closes");
+    assert_eq!(ws.read_with(cx, |ws, _| ws.new_branch.as_ref().map(|w| w.base.clone())), Some(found[1].clone()), "Down, then Enter, picks the second");
+    // A click on a row picks that one.
+    draw(cx, &ws);
+    let base = center_of(cx, "branch-base".to_owned());
+    click(cx, MouseButton::Left, base);
+    ws.update(cx, |ws, cx| ws.branch_search.update(cx, |input, cx| input.set_text("devel", cx)));
+    draw(cx, &ws);
+    let row = center_of(cx, "pick-branch-0".to_owned());
+    click(cx, MouseButton::Left, row);
+    assert_eq!(ws.read_with(cx, |ws, _| ws.new_branch.as_ref().map(|w| w.base.clone())), Some("develop".to_owned()));
+    assert!(ws.read_with(cx, |ws, _| ws.new_branch.is_some()), "the window is still there");
 
     // A name already taken is not made.
     ws.update(cx, |ws, cx| {
@@ -1969,6 +2024,93 @@ async fn the_graph_size_setting_scales_the_rows_and_is_remembered(cx: &mut TestA
     // Out of range values are brought inside.
     ws.update(cx, |ws, cx| ws.set_graph_scale(5000, cx));
     assert_eq!(ws.read_with(cx, |ws, _| ws.settings.graph_scale), 200);
+}
+
+/// Runs git in `dir` as a colleague would.
+fn git_as_bo(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Bo")
+        .env("GIT_AUTHOR_EMAIL", "bo@example.com")
+        .env("GIT_COMMITTER_NAME", "Bo")
+        .env("GIT_COMMITTER_EMAIL", "bo@example.com")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// "Fetch" brings in what colleagues pushed, so it can be started from; a new branch can be pushed as it is made, and
+/// one that was not says so when pulled instead of git's words about tracking.
+#[gpui::test]
+async fn fetch_brings_in_remote_branches_and_a_new_branch_can_be_pushed_as_it_is_made(cx: &mut TestAppContext) {
+    let fx = bare_fixture("fetch-publish");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    let remote = fx.0.join("remote.git");
+    fx.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    fx.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fx.git(&["push", "-q", "-u", "origin", "main"]);
+    // A colleague pushes a branch of their own.
+    let other = fx.0.join("other");
+    git_as_bo(&fx.0, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+    git_as_bo(&other, &["switch", "-q", "-c", "feature/theirs"]);
+    std::fs::write(other.join("theirs.txt"), "t\n").unwrap();
+    git_as_bo(&other, &["add", "."]);
+    git_as_bo(&other, &["commit", "-q", "-m", "theirs"]);
+    git_as_bo(&other, &["push", "-q", "origin", "feature/theirs"]);
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    let listed = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            ws.branch_pick_rows("")
+                .into_iter()
+                .filter_map(|row| match row {
+                    crate::workflow_ui::PickRow::Branch { name, .. } => Some(name),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert!(!listed(&ws, cx).iter().any(|b| b.contains("theirs")), "not known here yet");
+    let at = center_of(cx, "fetch".to_owned());
+    click(cx, MouseButton::Left, at);
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert!(listed(&ws, cx).iter().any(|b| b == "origin/feature/theirs"), "{:?}", listed(&ws, cx));
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| !n.warn && n.text.contains("Fetched"))));
+    assert!(!fx.repo().join("theirs.txt").exists(), "fetching changes no files");
+
+    // A branch made and pushed in one go has a remote branch to pull from.
+    ws.update_in(cx, |ws, window, cx| ws.open_new_branch(window, cx));
+    ws.update(cx, |ws, cx| ws.branch_title.update(cx, |input, cx| input.set_text("pushed work", cx)));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("branch-publish").is_some(), "there is a remote to push to");
+    let at = center_of(cx, "branch-publish".to_owned());
+    click(cx, MouseButton::Left, at);
+    ws.update(cx, |ws, cx| ws.create_new_branch(cx));
+    cx.run_until_parked();
+    assert_eq!(git_as_bo(&fx.repo(), &["rev-parse", "--abbrev-ref", "pushed-work@{upstream}"]).trim(), "origin/pushed-work");
+    assert!(!git_as_bo(&remote, &["branch", "--list", "pushed-work"]).trim().is_empty(), "it is on the remote");
+
+    // One that was not pushed says why a pull has nothing to do.
+    ws.update_in(cx, |ws, window, cx| ws.open_new_branch(window, cx));
+    ws.update(cx, |ws, cx| ws.branch_title.update(cx, |input, cx| input.set_text("local only", cx)));
+    ws.update(cx, |ws, cx| ws.create_new_branch(cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let at = center_of(cx, "pull-rebase".to_owned());
+    click(cx, MouseButton::Left, at);
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    let said = ws.read_with(cx, |ws, _| ws.notice.as_ref().map(|n| (n.warn, n.text.to_string())));
+    assert!(said.as_ref().is_some_and(|(warn, text)| *warn && text.contains("local-only is not on a remote yet")), "{said:?}");
 }
 
 #[gpui::test]

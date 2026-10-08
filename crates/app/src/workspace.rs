@@ -502,6 +502,12 @@ pub struct Workspace {
     pub branch_title: Entity<TextInput>,
     /// Asks the next draw to give the title the keyboard (after "Enter" in the ticket).
     pub branch_focus_title: std::cell::Cell<bool>,
+    /// The list of branches to start from, while it is open on top of the "New branch" window.
+    pub branch_picker: Option<crate::workflow_ui::BranchPicker>,
+    pub branch_search: Entity<TextInput>,
+    pub(crate) branch_pick_scroll: gpui::ScrollHandle,
+    /// Asks the next draw to bring the highlighted branch into view.
+    pub(crate) branch_pick_reveal: std::cell::Cell<bool>,
     /// What is being done right now, while a git operation runs.
     pub busy: Option<SharedString>,
     loads: u64,
@@ -706,6 +712,14 @@ impl Workspace {
         })
         .detach();
 
+        let branch_search = cx.new(|cx| TextInput::new("Search branches (Up, Down and Enter work too)", cx));
+        cx.subscribe(&branch_search, |this, _input, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Submit => this.pick_highlighted_branch(cx),
+            TextInputEvent::Cancel => this.close_branch_picker(cx),
+            TextInputEvent::Changed => this.search_branches_changed(cx),
+        })
+        .detach();
+
         let (store, mut notice) = match store {
             Ok(store) => (Some(store), None),
             Err(err) => (None, Some(format!("Projects and comments will not be saved: {err}"))),
@@ -753,6 +767,10 @@ impl Workspace {
             branch_ticket,
             branch_title,
             branch_focus_title: Default::default(),
+            branch_picker: None,
+            branch_search,
+            branch_pick_scroll: gpui::ScrollHandle::new(),
+            branch_pick_reveal: Default::default(),
             settings,
             settings_open: false,
             hover_line: None,
@@ -1434,6 +1452,9 @@ impl Workspace {
         if self.dialog.is_some() {
             return self.cancel_dialog(cx);
         }
+        if self.branch_picker.is_some() {
+            return self.close_branch_picker(cx);
+        }
         if self.new_branch.is_some() {
             return self.close_new_branch(cx);
         }
@@ -1689,7 +1710,7 @@ impl Workspace {
 
     /// A text field has the keyboard, so keys like the arrows are its own.
     pub fn typing(&self, window: &Window, cx: &App) -> bool {
-        [&self.input, &self.filter_input, &self.search_input, &self.commit_input, &self.dialog_input, &self.branch_ticket, &self.branch_title]
+        [&self.input, &self.filter_input, &self.search_input, &self.commit_input, &self.dialog_input, &self.branch_ticket, &self.branch_title, &self.branch_search]
             .into_iter()
             .any(|input| gpui::Focusable::focus_handle(input.read(cx), cx).is_focused(window))
     }
@@ -2037,12 +2058,16 @@ impl Render for Workspace {
             // Before anything under the pointer: a text field that is clicked focuses itself after this.
             .capture_any_mouse_down(cx.listener(|this, _, window, _| window.focus(&this.focus)))
             .on_action(cx.listener(|this, _: &PreviousFile, window, cx| {
-                if !this.typing(window, cx) {
+                if this.branch_picker.is_some() {
+                    this.step_branch_pick(-1, cx);
+                } else if !this.typing(window, cx) {
                     this.step_file(-1, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NextFile, window, cx| {
-                if !this.typing(window, cx) {
+                if this.branch_picker.is_some() {
+                    this.step_branch_pick(1, cx);
+                } else if !this.typing(window, cx) {
                     this.step_file(1, cx);
                 }
             }))
@@ -2472,6 +2497,11 @@ impl Workspace {
                 button("new-branch", "New branch…")
                     .debug_selector(|| "new-branch".to_owned())
                     .on_click(cx.listener(|this, _, window, cx| this.open_new_branch(window, cx))),
+            )
+            .child(
+                button("fetch", "Fetch")
+                    .debug_selector(|| "fetch".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.fetch(cx))),
             )
             .child(
                 button("pull-rebase", "Pull (rebase)")

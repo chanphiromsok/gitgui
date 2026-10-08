@@ -899,6 +899,46 @@ fn pull_rebase_replays_local_commits_on_the_remotes_and_stops_cleanly_on_conflic
 }
 
 #[test]
+fn fetch_brings_in_the_remotes_branches_and_a_new_local_branch_says_it_is_not_on_the_remote_yet() {
+    let repo = trunk();
+    let git = GitCli::new(repo.path());
+    assert!(git.fetch().is_err(), "no remote, nothing to fetch");
+
+    let remote = std::env::temp_dir().join(format!("gitgui-test-{}-remote-fetch", std::process::id()));
+    let _ = std::fs::remove_dir_all(&remote);
+    repo.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    repo.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    git.push_branch("main").unwrap();
+
+    // A colleague pushes a new branch: it is not here until fetched, and fetching changes no local branch.
+    let other = clone_of(&remote, "fetch-other");
+    other.git(&["switch", "-q", "-c", "feature/theirs"]);
+    other.commit("theirs.txt", "theirs");
+    other.git(&["push", "-q", "origin", "feature/theirs"]);
+    let refs = |name: &str| String::from_utf8_lossy(&Command::new("git").arg("-C").arg(repo.path()).args(["branch", "-a", "--list", name]).output().unwrap().stdout).into_owned();
+    assert!(refs("origin/feature/theirs").trim().is_empty(), "not fetched yet");
+    let main_before = Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "main"]).output().unwrap().stdout;
+    git.fetch().unwrap();
+    assert!(refs("origin/feature/theirs").contains("origin/feature/theirs"), "now it is");
+    let main_after = Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "main"]).output().unwrap().stdout;
+    assert_eq!(main_before, main_after, "no local branch moved");
+
+    // A branch deleted on the remote leaves the list.
+    other.git(&["push", "-q", "origin", "--delete", "feature/theirs"]);
+    git.fetch().unwrap();
+    assert!(refs("origin/feature/theirs").trim().is_empty(), "pruned");
+
+    // A branch just made here has no upstream: pulling says so in plain words, and pushing it gives it one.
+    git.create_branch("feature/mine", Some("main"), true).unwrap();
+    let said = git.pull_rebase().unwrap_err().to_string();
+    assert!(said.contains("feature/mine") && said.contains("not on a remote yet"), "{said}");
+    git.push_branch("feature/mine").unwrap();
+    assert!(matches!(git.pull_rebase(), Ok(Outcome::Done(_))), "after pushing, pulling works");
+
+    let _ = std::fs::remove_dir_all(&remote);
+}
+
+#[test]
 fn clone_copies_a_repository_by_address_and_refuses_what_could_run_a_program_or_overwrite() {
     let source = trunk();
     let url = format!("file://{}", source.path().display());

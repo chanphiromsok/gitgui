@@ -114,10 +114,15 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             // `newbranch kind ticket title…` also fills it in.
             let mut words = rest.splitn(3, ' ');
             if let (Some(kind), Some(ticket), Some(title)) = (words.next(), words.next(), words.next()) {
-                workspace.set_branch_kind(kind, cx);
+                workspace.set_branch_kind(if kind == "-" { "" } else { kind }, cx);
                 workspace.branch_ticket.update(cx, |input, cx| input.replace_text(if ticket == "-" { "" } else { ticket }, cx));
                 workspace.branch_title.update(cx, |input, cx| input.replace_text(title, cx));
             }
+        }
+        // pickbase [query]: the list of branches to start from, with a search typed in it.
+        "pickbase" => {
+            workspace.open_branch_picker(window, cx);
+            workspace.branch_search.update(cx, |input, cx| input.replace_text(rest, cx));
         }
         "search" => workspace.set_search(rest.to_owned(), cx),
         "menu" => {

@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::process::{Command as Process, Stdio};
 
-use crate::backend::{Error, GitCli};
+use crate::backend::{Backend, Error, GitCli};
 
 /// A multi-step operation git can leave half done when it meets conflicts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +158,25 @@ impl GitCli {
     /// Git refuses, and says so, with uncommitted changes, a detached HEAD or no upstream. On conflicts
     /// it stops like a rebase and [`GitCli::abort`] puts everything back.
     pub fn pull_rebase(&self) -> Result<Outcome, Error> {
+        // A branch made here has no remote branch until it is pushed; git's own words for that are about tracking.
+        match self.current_branch()? {
+            None => return Err(Error::Parse("switch to a branch first: there is no branch checked out to pull into.".into())),
+            Some(branch) if self.write(&["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")]).is_err() => {
+                return Err(Error::Parse(format!(
+                    "{branch} is not on a remote yet, so there is nothing to pull. Push it first (right-click it, then Push)."
+                )));
+            }
+            Some(_) => {}
+        }
         self.finish(Operation::Rebase, &["pull", "--rebase", "--no-stat"])
+    }
+
+    /// Brings in what the remotes have without touching any local branch; branches gone from a remote leave the list.
+    pub fn fetch(&self) -> Result<String, Error> {
+        if self.write(&["remote"])?.trim().is_empty() {
+            return Err(Error::Parse("this repository has no remote to fetch from.".into()));
+        }
+        self.write(&["fetch", "--all", "--prune"])
     }
 
     /// Applies one commit on top of the current branch. A merge commit is refused: which side to

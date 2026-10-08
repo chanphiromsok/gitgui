@@ -4,11 +4,11 @@
 
 use std::collections::HashSet;
 
-use gitgui_core::{Detected, Evidence, Outcome, RefKind, Shape, branch_name, detect, name_problem};
+use gitgui_core::{Detected, Error, Evidence, Outcome, RefKind, Shape, branch_name, detect, name_problem};
 use gitgui_store::WorkflowSetting;
 use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px, rgb};
 
-use crate::menu::modal;
+use crate::menu::{explain, modal};
 use crate::settings_view::card;
 use crate::theme::t;
 use crate::ui::{MONO, button, segment, segmented, toggle};
@@ -23,12 +23,30 @@ const TRUNKS: [&str; 4] = ["develop", "main", "master", "trunk"];
 
 /// The window for a new branch, while it is open.
 pub struct NewBranch {
+    /// The type whose prefix the name starts with; none until one is clicked, because a name does not have to have one.
     pub kind: String,
     /// The branch (or remote branch) it starts from.
     pub base: String,
     /// Switch to it once made.
     pub switch: bool,
+    /// Push it to the remote once made, so it is there for others and has a remote branch to pull from.
+    pub publish: bool,
 }
+
+/// The list of branches to start from, while it is open.
+pub struct BranchPicker {
+    /// Which of the branches listed (not counting headings) Enter would choose.
+    pub highlight: usize,
+}
+
+/// One line of that list.
+pub(crate) enum PickRow {
+    Heading(&'static str),
+    Branch { name: String, remote: bool, note: Option<&'static str> },
+}
+
+/// How many branches the list draws at most; the search narrows the rest.
+const PICK_LIMIT: usize = 150;
 
 /// The branches there are, local and remote, read from every commit's refs.
 #[derive(Default)]
@@ -151,7 +169,6 @@ impl Workspace {
             return self.say(crate::menu::Notice::warn("Another operation is still running."), cx);
         }
         let Some((workflow, _)) = self.workflow_in_use() else { return };
-        let kind = offered_types(&workflow).into_iter().next().unwrap_or_default();
         let base = self
             .base_choices(workflow.base.as_deref())
             .into_iter()
@@ -164,21 +181,29 @@ impl Workspace {
         let shape = Shape::from_id(&workflow.shape).unwrap_or(Shape::TypeSlug);
         let first = if shape.uses_ticket() { &self.branch_ticket } else { &self.branch_title };
         first.update(cx, |input, _| input.focus(window));
-        self.new_branch = Some(NewBranch { kind, base, switch: true });
+        self.new_branch = Some(NewBranch { kind: String::new(), base, switch: true, publish: false });
         cx.notify();
     }
 
     pub fn close_new_branch(&mut self, cx: &mut Context<Self>) {
+        self.branch_picker = None;
         if self.new_branch.take().is_some() {
             cx.notify();
         }
     }
 
+    /// Starts the name with `kind`'s prefix; the empty string takes it off.
     pub fn set_branch_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
         if let Some(wizard) = self.new_branch.as_mut() {
             wizard.kind = kind.to_owned();
             cx.notify();
         }
+    }
+
+    /// A click on a type: fills in its prefix, or takes it off when it is the one already there.
+    pub fn toggle_branch_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
+        let on = self.new_branch.as_ref().is_some_and(|wizard| wizard.kind == kind);
+        self.set_branch_kind(if on { "" } else { kind }, cx);
     }
 
     pub fn set_branch_base(&mut self, base: &str, cx: &mut Context<Self>) {
@@ -191,6 +216,13 @@ impl Workspace {
     pub fn toggle_branch_switch(&mut self, cx: &mut Context<Self>) {
         if let Some(wizard) = self.new_branch.as_mut() {
             wizard.switch = !wizard.switch;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_branch_publish(&mut self, cx: &mut Context<Self>) {
+        if let Some(wizard) = self.new_branch.as_mut() {
+            wizard.publish = !wizard.publish;
             cx.notify();
         }
     }
@@ -213,16 +245,34 @@ impl Workspace {
         if self.branches().is_some_and(|branches| branches.exists(&name)) {
             return;
         }
-        let (base, switch) = (wizard.base.clone(), wizard.switch);
+        let has_remote = self.branches().is_some_and(|branches| !branches.remotes.is_empty());
+        let (base, switch, publish) = (wizard.base.clone(), wizard.switch, wizard.publish && has_remote);
         if self.saved_workflow().is_none()
             && let Some((workflow, _)) = self.workflow_in_use()
         {
             self.save_workflow(Some(WorkflowSetting { base: Some(self.branches().map_or(base.clone(), |b| b.short(&base).to_owned())), ..workflow }), cx);
         }
         self.new_branch = None;
-        let done = format!("Created {name} from {base}{}.", if switch { " and switched to it" } else { "" });
+        let done = format!(
+            "Created {name} from {base}{}{}.",
+            if switch { " and switched to it" } else { "" },
+            if publish { ", and pushed it" } else { "" }
+        );
         let shown = name.clone();
-        self.run(format!("Creating {shown}…"), done, None, move |git| git.create_branch(&name, Some(&base), switch).map(Outcome::Done), cx);
+        self.run(
+            format!("Creating {shown}…"),
+            done,
+            None,
+            move |git| {
+                git.create_branch(&name, Some(&base), switch)?;
+                if publish {
+                    // It exists now; a push that fails leaves it made, and says so.
+                    git.push_branch(&name).map_err(|err| Error::Parse(format!("Created {name}, but pushing it failed: {}", explain(&err))))?;
+                }
+                Ok(Outcome::Done(String::new()))
+            },
+            cx,
+        );
     }
 
     pub(crate) fn render_new_branch(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -232,26 +282,47 @@ impl Workspace {
         let branches = self.branches().unwrap_or_default();
         let name = self.typed_branch_name(cx);
         let exists = !name.is_empty() && branches.exists(&name);
+        // The remote a new branch would be pushed to: the one `push_branch` picks.
+        let remote_name = {
+            let remotes: Vec<&str> = branches.remotes.iter().filter_map(|r| r.split_once('/').map(|(remote, _)| remote)).collect();
+            remotes.iter().copied().find(|r| *r == "origin").or_else(|| remotes.first().copied()).map(str::to_owned)
+        };
 
+        // Types are shortcuts: a click puts the prefix on the name, another takes it off.
         let kinds: Vec<_> = offered_types(&workflow)
             .into_iter()
             .map(|kind| {
                 let chosen = wizard.kind == kind;
                 let value = kind.clone();
-                segment(SharedString::from(format!("kind-{kind}")), kind, chosen)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_branch_kind(&value, cx)))
+                let id = format!("kind-{kind}");
+                button(SharedString::from(id.clone()), kind)
+                    .debug_selector(move || id.clone())
+                    .when(chosen, |chip| chip.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_branch_kind(&value, cx)))
             })
             .collect();
-        let bases: Vec<_> = self
-            .base_choices(workflow.base.as_deref())
-            .into_iter()
-            .map(|base| {
-                let chosen = wizard.base == base;
-                let value = base.clone();
-                segment(SharedString::from(format!("base-{base}")), base, chosen)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_branch_base(&value, cx)))
-            })
-            .collect();
+        // Where it starts: the branch, and a click opens the list to search.
+        let base_note = self.branches().and_then(|b| workflow.base.as_deref().and_then(|base| b.resolve(base))).filter(|base| *base == wizard.base).map(|_| "team's base");
+        let start = div()
+            .id("branch-base")
+            .debug_selector(|| "branch-base".to_owned())
+            .h(px(28.))
+            .w_full()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(t().input_border))
+            .bg(rgb(t().input_bg))
+            .cursor_pointer()
+            .hover(|style| style.border_color(rgb(t().accent)))
+            .on_click(cx.listener(|this, _, window, cx| this.open_branch_picker(window, cx)))
+            .child(div().flex_1().min_w_0().overflow_hidden().line_clamp(1).text_ellipsis().font_family(MONO).text_color(rgb(t().text_strong)).child(SharedString::from(wizard.base.clone())))
+            .children(base_note.map(|note| div().flex_none().text_xs().text_color(rgb(t().muted)).child(note)))
+            .child(div().flex_none().text_xs().text_color(rgb(t().accent)).child("Change"))
+            .into_any_element();
         let label = |text: &'static str| div().w(px(92.)).flex_none().text_xs().text_color(rgb(t().muted)).child(text);
         let field = |text: &'static str, control: AnyElement| div().flex().items_center().gap_2().child(label(text)).child(div().min_w_0().flex_1().child(control));
         // After "Enter" in the ticket, the title.
@@ -274,14 +345,29 @@ impl Workspace {
                 .flex_col()
                 .gap_3()
                 .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("New branch"))
-                .child(div().text_xs().text_color(rgb(t().muted)).child(format!("Named like {} — from {source}.", shape.example(&wizard.kind))))
+                .child(div().text_xs().text_color(rgb(t().muted)).child(format!(
+                    "Named like {} — from {source}.{}",
+                    shape.example(offered_types(&workflow).first().map_or("", String::as_str)),
+                    if shape.uses_type() { " Click a type to add its prefix, or leave it out." } else { "" }
+                )))
                 .when(shape.uses_type(), |panel| panel.child(field("Type", div().flex().flex_wrap().gap_1().children(kinds).into_any_element())))
                 .when(shape.uses_ticket(), |panel| panel.child(field("Ticket", self.branch_ticket.clone().into_any_element())))
                 .child(field("Title", self.branch_title.clone().into_any_element()))
                 .child(field("Name", preview.into_any_element()))
                 .when(exists, |panel| panel.child(div().pl(px(100.)).text_xs().text_color(rgb(t().warning)).child("A branch with this name already exists.")))
-                .child(field("Start from", div().flex().flex_wrap().gap_1().children(bases).into_any_element()))
-                .child(div().pl(px(100.)).flex().child(toggle("branch-switch", "Switch to it", wizard.switch).on_click(cx.listener(|this, _, _, cx| this.toggle_branch_switch(cx)))))
+                .child(field("Start from", start))
+                .child(
+                    div()
+                        .pl(px(100.))
+                        .flex()
+                        .gap_2()
+                        .child(toggle("branch-switch", "Switch to it", wizard.switch).on_click(cx.listener(|this, _, _, cx| this.toggle_branch_switch(cx))))
+                        .children(remote_name.map(|remote| {
+                            toggle("branch-publish", format!("Push to {remote}"), wizard.publish)
+                                .debug_selector(|| "branch-publish".to_owned())
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_branch_publish(cx)))
+                        })),
+                )
                 .child(
                     div()
                         .flex()
@@ -295,6 +381,249 @@ impl Workspace {
                                 .text_color(rgb(if name.is_empty() || exists { t().muted } else { t().on_accent }))
                                 .font_weight(FontWeight::BOLD)
                                 .on_click(cx.listener(|this, _, _, cx| this.create_new_branch(cx))),
+                        ),
+                ),
+        ))
+    }
+
+    // ---- the list of branches to start from -----------------------------------------------------
+
+    /// What the list shows for what is typed in its search: first what the workflow suggests (while nothing is typed),
+    /// then the local branches, then the remote ones; each branch once.
+    pub(crate) fn branch_pick_rows(&self, query: &str) -> Vec<PickRow> {
+        let Some(branches) = self.branches() else { return Vec::new() };
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let fits = |name: &str| {
+            let lower = name.to_lowercase();
+            terms.iter().all(|term| lower.contains(term.as_str()))
+        };
+        let current = self.current_branch_name();
+        let team_base = self.workflow_in_use().and_then(|(workflow, _)| workflow.base).and_then(|base| branches.resolve(&base));
+        let note = |name: &str| {
+            if current.as_deref() == Some(name) {
+                Some("current")
+            } else if team_base.as_deref() == Some(name) {
+                Some("team's base")
+            } else {
+                None
+            }
+        };
+
+        let mut rows = Vec::new();
+        let mut listed: HashSet<String> = HashSet::new();
+        let mut count = 0;
+        let mut section = |rows: &mut Vec<PickRow>, heading: &'static str, names: Vec<(String, bool)>| {
+            let names: Vec<_> = names.into_iter().filter(|(name, _)| fits(name) && !listed.contains(name)).collect();
+            if names.is_empty() || count >= PICK_LIMIT {
+                return;
+            }
+            rows.push(PickRow::Heading(heading));
+            for (name, remote) in names.into_iter().take(PICK_LIMIT - count) {
+                listed.insert(name.clone());
+                rows.push(PickRow::Branch { note: note(&name), name, remote });
+                count += 1;
+            }
+        };
+        if terms.is_empty() {
+            let suggested = self.base_choices(team_base.as_deref().map(|base| branches.short(base)));
+            section(&mut rows, "Suggested", suggested.into_iter().map(|name| { let remote = !branches.exists(&name); (name, remote) }).collect());
+        }
+        section(&mut rows, "Local", branches.locals.iter().map(|name| (name.clone(), false)).collect());
+        section(&mut rows, "Remote", branches.remotes.iter().map(|name| (name.clone(), true)).collect());
+        rows
+    }
+
+    /// The branches of `rows`, without the headings.
+    fn pick_names(rows: &[PickRow]) -> Vec<&str> {
+        rows.iter().filter_map(|row| if let PickRow::Branch { name, .. } = row { Some(name.as_str()) } else { None }).collect()
+    }
+
+    pub fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(wizard) = self.new_branch.as_ref() else { return };
+        let base = wizard.base.clone();
+        self.branch_search.update(cx, |input, cx| input.clear(cx));
+        // Starts on the branch that is chosen now.
+        let rows = self.branch_pick_rows("");
+        let highlight = Self::pick_names(&rows).iter().position(|name| *name == base).unwrap_or(0);
+        self.branch_picker = Some(BranchPicker { highlight });
+        self.branch_pick_reveal.set(true);
+        self.branch_search.update(cx, |input, _| input.focus(window));
+        cx.notify();
+    }
+
+    /// Back to the "New branch" window, with the title ready to type in.
+    pub fn close_branch_picker(&mut self, cx: &mut Context<Self>) {
+        if self.branch_picker.take().is_some() {
+            self.branch_focus_title.set(true);
+            cx.notify();
+        }
+    }
+
+    /// What is typed in the search changed: the first match is the one Enter would choose.
+    pub(crate) fn search_branches_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(picker) = self.branch_picker.as_mut() {
+            picker.highlight = 0;
+            self.branch_pick_reveal.set(true);
+            cx.notify();
+        }
+    }
+
+    /// Moves the highlight; it stops at the first and last branch.
+    pub fn step_branch_pick(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let query = self.branch_search.read(cx).text().to_owned();
+        let count = Self::pick_names(&self.branch_pick_rows(&query)).len();
+        if let Some(picker) = self.branch_picker.as_mut() {
+            picker.highlight = picker.highlight.saturating_add_signed(delta).min(count.saturating_sub(1));
+            self.branch_pick_reveal.set(true);
+            cx.notify();
+        }
+    }
+
+    /// Starts the new branch from the highlighted one.
+    pub fn pick_highlighted_branch(&mut self, cx: &mut Context<Self>) {
+        let query = self.branch_search.read(cx).text().to_owned();
+        let rows = self.branch_pick_rows(&query);
+        let at = self.branch_picker.as_ref().map_or(0, |picker| picker.highlight);
+        if let Some(name) = Self::pick_names(&rows).get(at).map(|name| (*name).to_owned()) {
+            self.pick_branch(&name, cx);
+        }
+    }
+
+    pub fn pick_branch(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.set_branch_base(name, cx);
+        self.close_branch_picker(cx);
+    }
+
+    pub(crate) fn render_branch_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.branch_picker.as_ref()?;
+        let wizard = self.new_branch.as_ref()?;
+        let query = self.branch_search.read(cx).text().to_owned();
+        let rows = self.branch_pick_rows(&query);
+        let names = Self::pick_names(&rows);
+        let highlight = picker.highlight.min(names.len().saturating_sub(1));
+        if self.branch_pick_reveal.replace(false)
+            && let Some(at) = rows.iter().position(|row| matches!(row, PickRow::Branch { name, .. } if names.get(highlight) == Some(&name.as_str())))
+        {
+            self.branch_pick_scroll.scroll_to_item(at);
+        }
+
+        let mut seen = 0;
+        let lines: Vec<AnyElement> = rows
+            .iter()
+            .enumerate()
+            .map(|(at, row)| match row {
+                PickRow::Heading(text) => div()
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(t().muted))
+                    .child(*text)
+                    .into_any_element(),
+                PickRow::Branch { name, remote, note } => {
+                    let this_one = seen;
+                    seen += 1;
+                    let (chosen, current) = (this_one == highlight, wizard.base == *name);
+                    let value = name.clone();
+                    div()
+                        .id(("pick-branch", at))
+                        .debug_selector(move || format!("pick-branch-{this_one}"))
+                        .h(px(30.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(chosen, |row| row.bg(rgb(t().selected)).text_color(rgb(t().text_strong)))
+                        .when(!chosen, |row| row.hover(|style| style.bg(rgb(t().hover))))
+                        .on_click(cx.listener(move |this, _, _, cx| this.pick_branch(&value, cx)))
+                        // A solid dot for a branch of this repository, a ring for one that is only on a remote.
+                        .child(if *remote {
+                            div().flex_none().size(px(8.)).rounded_full().border_1().border_color(rgb(t().muted))
+                        } else {
+                            div().flex_none().size(px(8.)).rounded_full().bg(rgb(t().accent))
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .line_clamp(1)
+                                .text_ellipsis()
+                                .font_family(MONO)
+                                .when(current, |name| name.font_weight(FontWeight::BOLD))
+                                .child(SharedString::from(name.clone())),
+                        )
+                        .children(note.map(|note| div().flex_none().text_xs().text_color(rgb(t().muted)).child(note)))
+                        .when(current, |row| row.child(div().flex_none().text_xs().text_color(rgb(t().accent)).child("chosen")))
+                        .into_any_element()
+                }
+            })
+            .collect();
+
+        let empty = names.is_empty();
+        Some(modal(
+            div()
+                .w(px(480.))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .p_4()
+                        .pb_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("Start from"))
+                        .child(div().text_xs().text_color(rgb(t().muted)).child("The new branch begins at the latest commit of the branch you pick.")),
+                )
+                .child(div().px_4().pb_2().child(self.branch_search.clone()))
+                .child(
+                    div()
+                        .id("branch-pick-list")
+                        .h(px(280.))
+                        .px_2()
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.branch_pick_scroll)
+                        .children(lines)
+                        .when(empty, |list| {
+                            list.child(
+                                div()
+                                    .p_4()
+                                    .text_color(rgb(t().muted))
+                                    .child(if query.trim().is_empty() { "There are no branches yet.".to_owned() } else { format!("No branch matches “{}”.", query.trim()) }),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .border_t_1()
+                        .border_color(rgb(t().border))
+                        .child(div().flex_1().min_w_0().line_clamp(1).text_ellipsis().text_xs().text_color(rgb(t().muted)).child("Remote branches are as of the last fetch."))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                // The remote's branches are as of the last fetch; this brings them up to date.
+                                .child(match self.busy.as_ref() {
+                                    Some(busy) => div().text_xs().text_color(rgb(t().muted)).child(busy.clone()).into_any_element(),
+                                    None => button("branch-pick-fetch", "Fetch remotes")
+                                        .debug_selector(|| "branch-pick-fetch".to_owned())
+                                        .on_click(cx.listener(|this, _, _, cx| this.fetch(cx)))
+                                        .into_any_element(),
+                                })
+                                .child(button("branch-pick-back", "Back").on_click(cx.listener(|this, _, _, cx| this.close_branch_picker(cx)))),
                         ),
                 ),
         ))

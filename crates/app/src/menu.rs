@@ -657,6 +657,14 @@ impl Workspace {
         );
     }
 
+    /// Brings in what the remotes have (no local branch moves), then reads the repository again.
+    pub fn fetch(&mut self, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return self.say(Notice::warn("Another operation is still running."), cx);
+        }
+        self.run("Fetching…".into(), "Fetched: the remote branches are up to date.".into(), None, |git| git.fetch().map(Outcome::Done), cx);
+    }
+
     /// The banner's button.
     pub fn run_notice_action(&mut self, action: NoticeAction, cx: &mut Context<Self>) {
         if self.busy.is_some() {
@@ -683,7 +691,13 @@ impl Workspace {
     // ---- drawing ------------------------------------------------------------------------------
 
     pub fn render_overlays(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        [self.render_menu(window, cx), self.render_dialog(cx), self.render_new_branch(window, cx), self.render_settings(window, cx)]
+        [
+            self.render_menu(window, cx),
+            self.render_dialog(cx),
+            self.render_new_branch(window, cx),
+            self.render_branch_picker(cx),
+            self.render_settings(window, cx),
+        ]
             .into_iter()
             .flatten()
             .collect()
