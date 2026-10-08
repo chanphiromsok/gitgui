@@ -143,6 +143,7 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             cx,
         ),
         "ghselect" => workspace.github_select(rest.parse().ok(), cx),
+        "ghwidth" => workspace.github_set_detail_width(rest.parse().unwrap_or(crate::github_ui::DETAIL_WIDTH), cx),
         "sync" => workspace.toggle_sync_merges(cx),
         "isolate" => workspace.isolate_branch(rest, false, cx),
         "clear" => workspace.clear_isolate(cx),

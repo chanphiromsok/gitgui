@@ -19,7 +19,7 @@ use std::fmt;
 
 pub use api::Api;
 pub use device::{DeviceCode, Poll};
-pub use model::{Installation, Issue, Pull, PullState};
+pub use model::{Installation, Issue, Label, Pull, PullState};
 pub use token::Token;
 pub use transport::{Fixture, Http, Method, Request, Response, Transport};
 

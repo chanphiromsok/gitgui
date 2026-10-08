@@ -3664,7 +3664,7 @@ fn github_answers(fx: &Fixture) -> std::path::PathBuf {
     std::fs::write(
         dir.join("pulls.json"),
         r#"[
-          {"number":3,"state":"open","draft":false,"title":"feat: x","user":{"login":"kim"},"html_url":"https://github.com/acme/app/pull/3","head":{"ref":"feat/x","repo":{"full_name":"acme/app"}},"base":{"ref":"main"},"updated_at":"2026-10-08T01:00:00Z","body":"Adds x.","labels":[{"name":"api"}],"requested_reviewers":[{"login":"rom"}],"merged_at":null},
+          {"number":3,"state":"open","draft":false,"title":"feat: x","user":{"login":"kim"},"html_url":"https://github.com/acme/app/pull/3","head":{"ref":"feat/x","repo":{"full_name":"acme/app"}},"base":{"ref":"main"},"updated_at":"2026-10-08T01:00:00Z","body":"Summary\n\n## What\n\nAdds **x** with a [guide](https://docs.example.com/x).\n\n- [x] code\n- [ ] docs\n\n```rust\nfn x() {}\n```\n\n![shot](https://github.com/user-attachments/assets/abc)","labels":[{"name":"api","color":"1d76db"}],"assignees":[{"login":"kim"}],"requested_reviewers":[{"login":"rom"}],"merged_at":null},
           {"number":2,"state":"open","draft":true,"title":"wip","user":{"login":"rom"},"html_url":"u","head":{"ref":"wip","repo":{"full_name":"acme/app"}},"base":{"ref":"main"},"updated_at":"2026-10-07T01:00:00Z","merged_at":null},
           {"number":1,"state":"open","draft":false,"title":"from a fork","user":{"login":"out"},"html_url":"u","head":{"ref":"patch","repo":{"full_name":"out/app"}},"base":{"ref":"main"},"updated_at":"2026-10-06T01:00:00Z","merged_at":null}
         ]"#,
@@ -3721,6 +3721,25 @@ async fn a_github_project_lists_its_pull_requests_and_issues_beside_the_graph(cx
     with_window(&ws, cx, |ws, window, cx| ws.github_checkout(1, window, cx));
     assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.warn && n.text.contains("fork"))));
     assert!(ws.read_with(cx, |ws, _| ws.dialog.is_none() && ws.busy.is_none()));
+
+    // The divider between the list and the panel is dragged: the panel takes the width that meets the pointer, and the
+    // list keeps room however far it goes.
+    let divider = center_of(cx, "github-divider".to_owned());
+    click(cx, MouseButton::Left, divider);
+    cx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: divider, modifiers: Modifiers::default(), click_count: 1, first_mouse: false });
+    let (left, right) = ws.read_with(cx, |ws, _| ws.github.edges.get());
+    assert!(right > left, "the lists have measured themselves: {left}..{right}");
+    drag_to(&ws, cx, right - 500., Some(MouseButton::Left));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.github.detail_width), 500.);
+    drag_to(&ws, cx, left + 10., Some(MouseButton::Left));
+    let widest = ws.read_with(cx, |ws, _| ws.github.detail_width);
+    assert!(widest <= right - left - crate::github_ui::LIST_MIN + 0.5 && widest >= crate::github_ui::DETAIL_MIN, "the list keeps room: {widest}");
+    drag_to(&ws, cx, right - 10., Some(MouseButton::Left));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.github.detail_width), crate::github_ui::DETAIL_MIN, "and the panel never gets thinner than it can read");
+    drag_to(&ws, cx, 0., None); // the button came up somewhere: the drag is over
+    assert!(ws.read_with(cx, |ws, _| ws.resizing.is_none()));
+    ws.update(cx, |ws, cx| ws.github_set_detail_width(400., cx));
+    draw(cx, &ws);
 
     // The filters: mine is the draft, review is the one asked of rom, closed is the merged one.
     let shown = |ws: &Entity<Workspace>, cx: &mut VisualTestContext, filter| -> Vec<u32> {

@@ -15,6 +15,7 @@ mod github_view;
 mod graph_style;
 mod icons;
 mod layout;
+mod markdown;
 mod menu;
 mod minimap;
 mod pane;

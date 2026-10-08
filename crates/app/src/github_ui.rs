@@ -68,7 +68,18 @@ pub struct GithubState {
     pub filter: ListFilter,
     /// The number of the pull request or issue open in the detail panel.
     pub selected: Option<u32>,
+    /// How wide the detail panel is (dragged by its divider), and where the lists begin and end (for the drag to measure
+    /// from, and to leave the list room).
+    pub detail_width: f32,
+    pub edges: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
 }
+
+/// The detail panel's width to begin with, and the least and most it can be dragged to.
+pub const DETAIL_WIDTH: f32 = 400.;
+pub const DETAIL_MIN: f32 = 260.;
+pub const DETAIL_MAX: f32 = 760.;
+/// What the list keeps, however far the panel is dragged.
+pub const LIST_MIN: f32 = 300.;
 
 impl GithubState {
     pub fn new() -> Self {
@@ -83,6 +94,8 @@ impl GithubState {
             tab: MainTab::Graph,
             filter: ListFilter::Open,
             selected: None,
+            detail_width: DETAIL_WIDTH,
+            edges: Default::default(),
         };
         match std::env::var_os("GITGUI_GITHUB_FIXTURE").map(PathBuf::from) {
             Some(dir) => blank(
@@ -423,6 +436,12 @@ impl Workspace {
         cx.notify();
     }
 
+    /// For the screenshot script: the detail panel as wide as that, within what it can be.
+    pub fn github_set_detail_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.github.detail_width = width.clamp(DETAIL_MIN, DETAIL_MAX);
+        cx.notify();
+    }
+
     pub fn github_select(&mut self, number: Option<u32>, cx: &mut Context<Self>) {
         self.github.selected = number;
         cx.notify();
@@ -522,7 +541,9 @@ mod tests {
             url: String::new(),
             body: String::new(),
             labels: Vec::new(),
+            assignees: Vec::new(),
             reviewers: reviewers.iter().map(|r| (*r).to_owned()).collect(),
+            comments: 0,
         }
     }
 

@@ -1,7 +1,7 @@
 //! The look of GitHub in the window: sections under the open project, the tabs beside the graph, the lists, and
 //! the sign-in card in Settings. The doing is in `github_ui`.
 
-use gitgui_forge::{self as forge, Error, Issue, Pull, PullState};
+use gitgui_forge::{self as forge, Error, Issue, Label, Pull, PullState};
 use gpui::prelude::FluentBuilder;
 use gpui::{AnyElement, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, div, px, rgb};
 
@@ -231,6 +231,19 @@ impl Workspace {
 
     // ---- the lists --------------------------------------------------------------------------------------
 
+    /// An invisible child that tells the workspace where the lists begin and end, so a drag of the divider knows how wide
+    /// the panel has to be to meet the pointer, and how much the list must keep.
+    fn github_right_edge(&self) -> AnyElement {
+        let edges = self.github.edges.clone();
+        gpui::canvas(
+            move |bounds, _, _| edges.set((f32::from(bounds.origin.x), f32::from(bounds.origin.x + bounds.size.width))),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
+    }
+
     /// What the middle shows instead of the graph while the Pull requests or Issues tab is chosen.
     pub(crate) fn render_github_main(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some((_, owner, name)) = self.github_repo() else { return div().into_any_element() };
@@ -342,7 +355,17 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(chips)
-            .child(div().flex_1().min_h_0().flex().child(list).children(detail))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(self.github_right_edge())
+                    .child(list)
+                    .children(detail.is_some().then(|| self.splitter("github-divider", crate::workspace::Splitter::GithubDetail, cx)))
+                    .children(detail),
+            )
             .into_any_element()
     }
 
@@ -383,7 +406,8 @@ impl Workspace {
                     .child(one_line(format!("{}  #{number}", pull.title)).font_weight(FontWeight::MEDIUM).text_color(rgb(t().text_strong)))
                     .child(one_line(meta).text_xs().text_color(rgb(t().muted))),
             )
-            .children(pull.labels.iter().take(2).map(|label| label_chip(label)))
+            .children(pull.labels.iter().take(2).map(label_chip))
+            .children(assignee_stack(&pull.assignees))
             .into_any_element()
     }
 
@@ -405,48 +429,92 @@ impl Workspace {
                     .child(one_line(format!("{}  #{number}", issue.title)).font_weight(FontWeight::MEDIUM).text_color(rgb(t().text_strong)))
                     .child(one_line(meta).text_xs().text_color(rgb(t().muted))),
             )
-            .children(issue.labels.iter().take(2).map(|label| label_chip(label)))
+            .children(issue.labels.iter().take(2).map(label_chip))
+            .children(assignee_stack(&issue.assignees))
             .into_any_element()
     }
 
-    fn detail_shell(&self, title: String, meta: String, labels: &[String], body: &str, buttons: Vec<AnyElement>) -> gpui::Stateful<gpui::Div> {
-        let body: String = body.trim().chars().take(1_600).collect();
+    /// The panel at the right of a list: the title and where the item stands, its properties (who it is assigned to, its
+    /// labels, who is to review it), the buttons, and its description read as markdown. It scrolls as one.
+    fn detail_shell(&self, title: String, state: (&'static str, u32), meta: String, properties: Vec<AnyElement>, buttons: Vec<AnyElement>, body: &str) -> AnyElement {
+        let blocks = crate::markdown::parse(body);
+        let (state_name, state_color) = state;
         div()
             .id("github-detail")
             .debug_selector(|| "github-detail".to_owned())
             .flex_none()
-            .w(px(340.))
+            .w(px(self.github.detail_width))
             .h_full()
-            .overflow_y_scroll()
-            .border_l_1()
-            .border_color(rgb(t().border))
-            .p_3()
             .flex()
             .flex_col()
-            .gap_2()
-            .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(title))
-            .child(div().text_xs().text_color(rgb(t().muted)).child(meta))
-            .when(!labels.is_empty(), |panel| panel.child(div().flex().flex_wrap().gap_1().children(labels.iter().map(|label| label_chip(label)))))
-            .child(div().flex().flex_wrap().gap_2().children(buttons))
             .child(
                 div()
-                    .text_color(rgb(t().text))
-                    .child(if body.is_empty() { "No description.".to_owned() } else { body }),
+                    .id("github-detail-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(title))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .px_2()
+                                            .h(px(18.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded_full()
+                                            .bg(rgb(crate::theme::mix(t().bg, state_color, 0.18)))
+                                            .text_color(rgb(state_color))
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(state_name),
+                                    )
+                                    .child(div().min_w_0().flex_1().text_xs().text_color(rgb(t().muted)).child(meta)),
+                            ),
+                    )
+                    .child(div().flex().flex_col().gap_2().children(properties))
+                    .child(div().flex().flex_wrap().gap_2().children(buttons))
+                    .child(div().h(px(1.)).bg(rgb(t().border)))
+                    .child(if blocks.is_empty() {
+                        div().text_color(rgb(t().muted)).child("No description provided.").into_any_element()
+                    } else {
+                        crate::markdown::render(&blocks)
+                    }),
             )
+            .into_any_element()
     }
 
     fn pull_detail(&self, pull: &Pull, now: u64, cx: &mut Context<Self>) -> AnyElement {
         let (number, url) = (pull.number, pull.url.clone());
         let state = match pull.state {
-            PullState::Open => "open",
-            PullState::Draft => "draft",
-            PullState::Merged => "merged",
-            PullState::Closed => "closed",
+            PullState::Open => ("Open", t().added),
+            PullState::Draft => ("Draft", t().muted),
+            PullState::Merged => ("Merged", PR_COLOR),
+            PullState::Closed => ("Closed", t().removed),
         };
-        let mut meta = format!("#{number} · {state} · {} → {} · by {} · {}", pull.head, pull.base, pull.author, ago(pull.updated, now));
-        if !pull.reviewers.is_empty() {
-            meta.push_str(&format!(" · review asked of {}", pull.reviewers.join(", ")));
+        let mut meta = format!("#{number} · {} opened {}", pull.author, ago(pull.updated, now));
+        if pull.comments > 0 {
+            meta.push_str(&format!(" · {} comment{}", pull.comments, if pull.comments == 1 { "" } else { "s" }));
         }
+        let properties = vec![
+            property("Branch", div().text_color(rgb(t().text)).child(format!("{} → {}", pull.head, pull.base)).into_any_element()),
+            property("Assignees", people(&pull.assignees, "Unassigned")),
+            property("Reviewers", people(&pull.reviewers, "None asked")),
+            property("Labels", labels(&pull.labels)),
+        ];
         let mut buttons = vec![
             button("github-show-in-graph", "Show in graph")
                 .debug_selector(|| "github-show-in-graph".to_owned())
@@ -468,21 +536,23 @@ impl Workspace {
                 .on_click(cx.listener(move |this, _, _, cx| this.github_open_url(&url, cx)))
                 .into_any_element(),
         );
-        self.detail_shell(pull.title.clone(), meta, &pull.labels, &pull.body, buttons).into_any_element()
+        self.detail_shell(pull.title.clone(), state, meta, properties, buttons, &pull.body)
     }
 
     fn issue_detail(&self, issue: &Issue, now: u64, cx: &mut Context<Self>) -> AnyElement {
         let url = issue.url.clone();
-        let mut meta = format!("#{} · {} · by {} · {}", issue.number, if issue.open { "open" } else { "closed" }, issue.author, ago(issue.updated, now));
-        if !issue.assignees.is_empty() {
-            meta.push_str(&format!(" · assigned to {}", issue.assignees.join(", ")));
+        let state = if issue.open { ("Open", t().added) } else { ("Closed", PR_COLOR) };
+        let mut meta = format!("#{} · {} opened {}", issue.number, issue.author, ago(issue.updated, now));
+        if issue.comments > 0 {
+            meta.push_str(&format!(" · {} comment{}", issue.comments, if issue.comments == 1 { "" } else { "s" }));
         }
+        let properties = vec![property("Assignees", people(&issue.assignees, "Unassigned")), property("Labels", labels(&issue.labels))];
         let buttons = vec![
             button("github-open", "Open on GitHub")
                 .on_click(cx.listener(move |this, _, _, cx| this.github_open_url(&url, cx)))
                 .into_any_element(),
         ];
-        self.detail_shell(issue.title.clone(), meta, &issue.labels, &issue.body, buttons).into_any_element()
+        self.detail_shell(issue.title.clone(), state, meta, properties, buttons, &issue.body)
     }
 
     // ---- Settings ---------------------------------------------------------------------------------------
@@ -545,17 +615,87 @@ impl Workspace {
     }
 }
 
-fn label_chip(label: &str) -> gpui::Div {
+/// A label of the repository: its color as a dot, its name in the window's own text (so it reads on every theme).
+fn label_chip(label: &Label) -> gpui::Div {
     div()
         .flex_none()
         .px_1p5()
         .h(px(18.))
         .flex()
         .items_center()
+        .gap_1()
         .rounded_sm()
         .border_1()
         .border_color(rgb(t().border))
         .text_size(px(11.))
-        .text_color(rgb(t().muted))
-        .child(SharedString::from(label.to_owned()))
+        .text_color(rgb(t().text))
+        .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(label.color)))
+        .child(SharedString::from(label.name.clone()))
+}
+
+/// One property of an item as a row: a name in a column, and what it is beside.
+fn property(name: &'static str, value: AnyElement) -> AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap_2()
+        .text_xs()
+        .child(div().flex_none().w(px(70.)).pt(px(2.)).text_color(rgb(t().muted)).child(name))
+        .child(div().min_w_0().flex_1().child(value))
+        .into_any_element()
+}
+
+/// People as small chips (their initials on their own color, and their login); `none` says it when there are none.
+fn people(logins: &[String], none: &'static str) -> AnyElement {
+    if logins.is_empty() {
+        return div().pt(px(2.)).text_color(rgb(t().muted)).child(none).into_any_element();
+    }
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(logins.iter().map(|login| {
+            div()
+                .flex_none()
+                .pl_0p5()
+                .pr_2()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(t().border))
+                .text_color(rgb(t().text))
+                .child(ui::avatar(login, login, crate::avatars::Avatar::None, 16.))
+                .child(SharedString::from(login.clone()))
+        }))
+        .into_any_element()
+}
+
+/// The labels as chips, or a word for none.
+fn labels(list: &[Label]) -> AnyElement {
+    if list.is_empty() {
+        return div().pt(px(2.)).text_color(rgb(t().muted)).child("None").into_any_element();
+    }
+    div().flex().flex_wrap().gap_1().children(list.iter().map(label_chip)).into_any_element()
+}
+
+/// A few people as overlapping initials at the end of a list row, with how many more there are.
+fn assignee_stack(logins: &[String]) -> Option<AnyElement> {
+    if logins.is_empty() {
+        return None;
+    }
+    let shown = logins.iter().take(2);
+    let more = logins.len().saturating_sub(2);
+    Some(
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .children(shown.map(|login| ui::avatar(login, login, crate::avatars::Avatar::None, 18.)))
+            .children((more > 0).then(|| div().text_size(px(11.)).text_color(rgb(t().muted)).child(format!("+{more}"))),)
+            .into_any_element(),
+    )
 }

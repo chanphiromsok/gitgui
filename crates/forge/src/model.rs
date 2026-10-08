@@ -4,6 +4,14 @@ use serde_json::Value;
 
 use crate::Error;
 
+/// A label on a pull request or issue, with the color its repository gave it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Label {
+    pub name: String,
+    /// `0xRRGGBB`.
+    pub color: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PullState {
     Open,
@@ -27,9 +35,12 @@ pub struct Pull {
     pub updated: u64,
     pub url: String,
     pub body: String,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
+    /// People it is assigned to.
+    pub assignees: Vec<String>,
     /// People whose review is asked for.
     pub reviewers: Vec<String>,
+    pub comments: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +52,7 @@ pub struct Issue {
     pub updated: u64,
     pub url: String,
     pub body: String,
-    pub labels: Vec<String>,
+    pub labels: Vec<Label>,
     pub assignees: Vec<String>,
     pub comments: u32,
 }
@@ -79,6 +90,22 @@ fn text(v: &Value, key: &str) -> String {
 
 fn names(v: &Value, key: &str, field: &str) -> Vec<String> {
     v.get(key).and_then(Value::as_array).map(|list| list.iter().filter_map(|item| item.get(field).and_then(Value::as_str)).map(str::to_owned).collect()).unwrap_or_default()
+}
+
+/// The labels of an item: each name with its color (a gray when the color is missing or not hex).
+fn labels(v: &Value) -> Vec<Label> {
+    v.get("labels")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| {
+                    let name = item.get("name")?.as_str()?.to_owned();
+                    let color = item.get("color").and_then(Value::as_str).and_then(|hex| u32::from_str_radix(hex.trim_start_matches('#'), 16).ok());
+                    Some(Label { name, color: color.unwrap_or(0x8b949e) })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn login(v: &Value, key: &str) -> String {
@@ -122,8 +149,10 @@ pub fn parse_pulls(body: &str, repo: &str) -> Result<Vec<Pull>, Error> {
                 updated: item.get("updated_at").and_then(Value::as_str).and_then(iso_to_unix).unwrap_or(0),
                 url: text(item, "html_url"),
                 body: text(item, "body"),
-                labels: names(item, "labels", "name"),
+                labels: labels(item),
+                assignees: names(item, "assignees", "login"),
                 reviewers: names(item, "requested_reviewers", "login"),
+                comments: item.get("comments").and_then(Value::as_u64).unwrap_or(0) as u32,
             })
         })
         .collect())
@@ -143,7 +172,7 @@ pub fn parse_issues(body: &str) -> Result<Vec<Issue>, Error> {
                 updated: item.get("updated_at").and_then(Value::as_str).and_then(iso_to_unix).unwrap_or(0),
                 url: text(item, "html_url"),
                 body: text(item, "body"),
-                labels: names(item, "labels", "name"),
+                labels: labels(item),
                 assignees: names(item, "assignees", "login"),
                 comments: item.get("comments").and_then(Value::as_u64).unwrap_or(0) as u32,
             })
@@ -185,7 +214,7 @@ mod tests {
     const PULLS: &str = r#"[
       {"number":58,"state":"open","draft":false,"title":"chore: remove unused libs","user":{"login":"rom"},"html_url":"https://github.com/o/r/pull/58",
        "head":{"ref":"chore/remove-unused-libs","repo":{"full_name":"o/r"}},"base":{"ref":"release/1.0.0"},"updated_at":"2026-10-08T01:00:00Z",
-       "body":"Drops three libraries.","labels":[{"name":"cleanup"}],"requested_reviewers":[{"login":"kim"}],"merged_at":null},
+       "body":"Drops three libraries.","labels":[{"name":"cleanup","color":"0e8a16"}],"assignees":[{"login":"rom"}],"requested_reviewers":[{"login":"kim"}],"merged_at":null},
       {"number":49,"state":"open","draft":true,"title":"feat: pick-up hooks","user":{"login":"kim"},"html_url":"u",
        "head":{"ref":"feat/pickup","repo":{"full_name":"someone/r"}},"base":{"ref":"main"},"updated_at":"2026-10-04T10:00:00Z","merged_at":null},
       {"number":40,"state":"closed","draft":false,"title":"done","user":null,"html_url":"u","head":{"ref":"x","repo":null},"base":{"ref":"main"},
@@ -198,6 +227,9 @@ mod tests {
         assert_eq!(pulls.len(), 3);
         assert_eq!((pulls[0].state, pulls[0].same_repo, pulls[0].reviewers.as_slice()), (PullState::Open, true, ["kim".to_owned()].as_slice()));
         assert_eq!((pulls[1].state, pulls[1].same_repo), (PullState::Draft, false), "a fork's branch");
+        assert_eq!(pulls[0].labels, [Label { name: "cleanup".into(), color: 0x0e8a16 }]);
+        assert_eq!(pulls[0].assignees, ["rom".to_owned()]);
+        assert!(pulls[1].assignees.is_empty());
         assert_eq!((pulls[2].state, pulls[2].author.as_str(), pulls[2].same_repo), (PullState::Merged, "ghost", false), "a deleted user and fork");
         assert!(parse_pulls("{\"message\":\"Not Found\"}", "o/r").is_err());
     }

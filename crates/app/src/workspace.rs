@@ -617,6 +617,8 @@ pub enum Splitter {
     Files,
     /// Between the graph and the file pane below it.
     PaneHeight,
+    /// Between a list of pull requests or issues and the panel that shows one.
+    GithubDetail,
 }
 
 /// A panel that can be hidden and still reached: pointing at its edge slides it back over the content.
@@ -1089,6 +1091,12 @@ impl Workspace {
             }
             Splitter::Files => {
                 self.files_width = (x - self.files_left.get()).clamp(FILES_MIN, FILES_MAX);
+            }
+            Splitter::GithubDetail => {
+                // The panel runs from the pointer to the right edge of the lists; the list keeps room to be read.
+                let (left, right) = self.github.edges.get();
+                let most = (right - left - crate::github_ui::LIST_MIN).clamp(crate::github_ui::DETAIL_MIN, crate::github_ui::DETAIL_MAX);
+                self.github.detail_width = (right - x).clamp(crate::github_ui::DETAIL_MIN, most);
             }
             Splitter::PaneHeight => {
                 // The pane runs from the pointer down to the bottom of the area (above the banner, if showing).
@@ -2644,6 +2652,7 @@ impl Workspace {
         }
         div()
             .id(id)
+            .debug_selector(move || id.to_owned())
             .w(px(5.))
             .h_full()
             .flex_none()
