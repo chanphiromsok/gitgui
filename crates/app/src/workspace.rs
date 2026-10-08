@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gitgui_core::{
     Backend, Blame, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
-    MergeClue, OperationState, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, Upstream, WebRemote, Gap, fetch_due, filter_commits, matches_text, reveal,
+    MergeClue, OperationState, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, Upstream, WebRemote, Gap, fetch_due, filter_with_focus, matches_text, reveal,
     scan_inputs, stash_count, visible_rows, people, web_remote,
 };
 use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
@@ -55,6 +55,10 @@ pub struct RepoView {
     pub changed: usize,
     pub entries: Vec<Entry>,
     pub graph_width: f32,
+    /// How many merges only bring a trunk into a branch, and so can be left out of the graph.
+    pub sync_count: usize,
+    /// How many lanes of the widest row are folded into the last one drawn; 0 when none are.
+    pub folded_lanes: usize,
     pub current_branch: Option<SharedString>,
     pub timing: SharedString,
     read: Duration,
@@ -119,17 +123,65 @@ impl RepoView {
             .collect()
     }
 
-    /// Makes the rows again from the commits, narrowed by `filter`.
-    fn rebuild(&mut self, settings: &Settings, collapsed: &HashSet<String>, filter: &GraphFilter) {
+    /// The branches the Focus view shows besides HEAD's: its upstream, and the branch it was cut from (the one the
+    /// project says new work starts from, else the one its line forks off in the whole history), by local name.
+    fn focus_names(&self, workflow_base: Option<&str>, whole: Option<&graph::Base>) -> Vec<String> {
+        let tail = |name: &str| name.split_once('/').map_or(name.to_owned(), |(_, rest)| rest.to_owned());
+        let mut names: Vec<String> = Vec::new();
+        if let Some(branch) = self.current_branch.as_ref().map(|branch| branch.to_string()) {
+            names.push(branch.clone());
+            if let Some(upstream) = self.upstreams.get(&branch).and_then(Upstream::name) {
+                names.push(tail(upstream));
+            }
+        }
+        let base = workflow_base.map(str::to_owned).or_else(|| whole.map(|base| base.name.clone()));
+        names.extend(base);
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Makes the rows again from the commits, narrowed by `filter`. `workflow_base` is the branch the project
+    /// says new work starts from, if it says.
+    fn rebuild(&mut self, settings: &Settings, collapsed: &HashSet<String>, filter: &GraphFilter, workflow_base: Option<&str>) {
         let started = Instant::now();
         let squashed = self.squashed();
+        // Merges that only bring a trunk into a branch: marked, and left out unless asked for (one that a branch,
+        // tag or HEAD is on stays: it is where that branch is).
+        let sync: HashSet<String> = gitgui_core::sync_merges(&self.commits);
+        let folded_sync: HashSet<String> = self
+            .commits
+            .iter()
+            .filter(|commit| sync.contains(&commit.id) && commit.refs.is_empty())
+            .map(|commit| commit.id.clone())
+            .collect();
+        self.sync_count = folded_sync.len();
+        let folded_sync = if filter.show_sync { HashSet::new() } else { folded_sync };
+        // Which commits a merge commit brought in as its second parent: a branch tip among them was merged, not just reached.
+        let merged_in: HashSet<String> =
+            self.commits.iter().filter(|c| c.is_merge()).flat_map(|c| c.parents.iter().skip(1).cloned()).collect();
         let hidden: HashSet<String> =
             if filter.hide_merged { self.clues.iter().map(|clue| clue.branch.clone()).collect() } else { HashSet::new() };
         // `author:` and `date:` in the search limit the graph itself, joining what is left (see `narrow`).
         let constraints = self.with_every_identity(filter.parsed().0);
-        let narrowed = filter.scope != Scope::All || !hidden.is_empty() || filter.hide_stashes || !constraints.is_empty();
+        let narrowed =
+            filter.scope != Scope::All || !hidden.is_empty() || filter.hide_stashes || !constraints.is_empty() || !folded_sync.is_empty();
+        // Where the current branch stands against its base is counted over the whole history, not what is shown;
+        // the Focus view also needs it to know which branch the base is.
+        let whole_base = narrowed.then(|| {
+            let none = HashSet::new();
+            let options =
+                graph::Options { changed: 0, group: false, squashed: &squashed, collapsed: &none, web: None, people: None, sync: &sync };
+            graph::build_entries(&self.commits, &options).base
+        });
         let shown = if narrowed {
-            let base = filter_commits(&self.commits, filter.scope, &hidden, !filter.hide_stashes);
+            let focus = if filter.scope == Scope::Focus {
+                self.focus_names(workflow_base, whole_base.as_ref().and_then(Option::as_ref))
+            } else {
+                Vec::new()
+            };
+            let base = filter_with_focus(&self.commits, filter.scope, &hidden, !filter.hide_stashes, &focus);
+            let base = gitgui_core::without_commits(&base, &folded_sync);
             if constraints.is_empty() { base } else { gitgui_core::narrow(&base, |commit| constraints.matches(commit)) }
         } else {
             Vec::new()
@@ -145,21 +197,18 @@ impl RepoView {
                 collapsed,
                 web: self.web.as_ref(),
                 people: Some(&self.people),
+                sync: &sync,
             },
         );
         // Ahead and behind count against the whole history, not just what is shown.
-        let base = if narrowed {
-            let none = HashSet::new();
-            let options =
-                graph::Options { changed: 0, group: false, squashed: &squashed, collapsed: &none, web: None, people: None };
-            graph::build_entries(&self.commits, &options).base
-        } else {
-            built.base.clone()
-        };
+        let base = whole_base.unwrap_or_else(|| built.base.clone());
         self.shown = commits.len();
         self.entries = built.entries;
-        graph::apply_clues(&mut self.entries, &self.clues);
-        self.graph_width = graph::graph_width(built.widest, graph::Density::of(settings.compact_graph, settings.graph_factor()));
+        graph::apply_clues(&mut self.entries, &self.clues, &self.tips, &merged_in);
+        let density = graph::Density::from_settings(settings);
+        self.graph_width = graph::graph_width(built.widest, density);
+        // Counted as if they were all drawn: the button that unfolds them says how many there are either way.
+        self.folded_lanes = graph::folded_lanes(built.widest, graph::LANE_CAP);
         self.lineages = built.lineages;
         self.names = built.names;
         self.base = base;
@@ -230,6 +279,8 @@ pub struct GraphFilter {
     pub hide_merged: bool,
     /// Leave out stashes.
     pub hide_stashes: bool,
+    /// Show the merges that only bring a trunk into a branch; left out by default.
+    pub show_sync: bool,
     /// The search box's text.
     pub search: String,
     /// Today, for `date:today` and `date:7d` in the search; set when the repository is read.
@@ -469,7 +520,7 @@ impl RepoState {
     pub(crate) fn rebuild(&mut self, settings: &Settings) {
         let selected = self.selected_id();
         if let Phase::Ready(view) = &mut self.phase {
-            view.rebuild(settings, &self.collapsed, &self.graph_filter);
+            view.rebuild(settings, &self.collapsed, &self.graph_filter, self.project.workflow.as_ref().and_then(|w| w.base.as_deref()));
             self.selected = selected.and_then(|id| view.entries.iter().position(|e| e.commit.as_deref() == Some(id.as_str())));
         }
     }
@@ -583,6 +634,8 @@ pub struct Workspace {
     pub(crate) branch_pick_reveal: std::cell::Cell<bool>,
     /// What is being done right now, while a git operation runs.
     pub busy: Option<SharedString>,
+    /// The key to the graph's marks is open.
+    pub legend_open: bool,
     /// How many folders are being looked at to be added as projects.
     opening: usize,
     loads: u64,
@@ -879,6 +932,7 @@ impl Workspace {
             menu: None,
             dialog: None,
             busy: None,
+            legend_open: false,
             opening: 0,
             loads: 0,
             graph_scroll: UniformListScrollHandle::new(),
@@ -1199,6 +1253,8 @@ impl Workspace {
                             changed: data.changed,
                             entries: Vec::new(),
                             graph_width: 0.,
+                            folded_lanes: 0,
+                            sync_count: 0,
                             current_branch: data.current_branch.map(SharedString::from),
                             timing: SharedString::default(),
                             read: data.read,
@@ -1229,7 +1285,7 @@ impl Workspace {
                             view.clues = known.clues;
                         }
                         view.scanning = scan;
-                        view.rebuild(&settings, &repo.collapsed, &repo.graph_filter);
+                        view.rebuild(&settings, &repo.collapsed, &repo.graph_filter, repo.project.workflow.as_ref().and_then(|w| w.base.as_deref()));
                         let inputs = view.scan_inputs.clone();
                         // Read again in the background (after a fetch), the selected commit stays selected wherever its row went.
                         let selected = repo.selected_id();
@@ -2023,6 +2079,10 @@ impl Workspace {
         self.change_filter(cx, |filter| filter.hide_stashes = !filter.hide_stashes);
     }
 
+    pub fn toggle_sync_merges(&mut self, cx: &mut Context<Self>) {
+        self.change_filter(cx, |filter| filter.show_sync = !filter.show_sync);
+    }
+
     /// The search box changed: a plain search dims what it misses right away; `path:` and `code:`
     /// wait for Enter, since they ask git.
     pub fn set_search(&mut self, text: String, cx: &mut Context<Self>) {
@@ -2105,6 +2165,17 @@ impl Workspace {
     /// Switches between the roomy graph and the compact one, keeps the choice, and redraws.
     pub fn toggle_compact_graph(&mut self, cx: &mut Context<Self>) {
         self.settings.compact_graph = !self.settings.compact_graph;
+        self.save_settings();
+        let settings = self.settings.clone();
+        if let Some(repo) = self.repo.as_mut() {
+            repo.rebuild(&settings);
+        }
+        cx.notify();
+    }
+
+    /// Folds the lanes past the sixth into one, or draws them all. Kept for the next launch.
+    pub fn toggle_all_lanes(&mut self, cx: &mut Context<Self>) {
+        self.settings.all_lanes = !self.settings.all_lanes;
         self.save_settings();
         let settings = self.settings.clone();
         if let Some(repo) = self.repo.as_mut() {
@@ -2776,6 +2847,7 @@ impl Workspace {
             .child(button("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 
         div()
+            .relative()
             .flex_1()
             .min_w_0()
             .h_full()
@@ -2784,6 +2856,7 @@ impl Workspace {
             .child(header)
             .child(self.render_filter_bar(repo, view, area < 640., cx))
             .child(self.render_graph(area, cx))
+            .when(self.legend_open, |center| center.child(self.render_legend(cx)))
             .into_any_element()
     }
 
@@ -2802,7 +2875,8 @@ impl Workspace {
             .flex_none()
             .rounded_sm()
             .overflow_hidden()
-            .child(segment("scope-current", if narrow { "Current" } else { "Current branch" }, Scope::Current))
+            .child(segment("scope-focus", if narrow { "Focus" } else { "Branch + base" }, Scope::Focus))
+            .child(segment("scope-current", if narrow { "Branch" } else { "Branch only" }, Scope::Current))
             .child(segment("scope-local", "Local", Scope::Local))
             .child(segment("scope-all", "All", Scope::All));
 
@@ -2892,10 +2966,87 @@ impl Workspace {
             .child(scopes)
             .child(hide_merged)
             .child(stashes)
+            .children((view.sync_count > 0).then(|| {
+                bar_checkbox(
+                    "show-sync",
+                    filter.show_sync,
+                    if narrow { format!("Sync ({})", view.sync_count) } else { format!("Sync merges ({})", view.sync_count) },
+                    cx.listener(|this, _, _, cx| this.toggle_sync_merges(cx)),
+                )
+            }))
             .child(author_chip)
             .child(date_chip)
             .child(search)
             .children(status.map(|text| div().flex_none().text_xs().text_color(rgb(t().muted)).child(text)))
+            .child(
+                ui::ghost("legend", "?")
+                    .debug_selector(|| "legend".to_owned())
+                    .when(self.legend_open, |button| button.bg(rgb(t().element_hover)).text_color(rgb(t().text_strong)))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_legend(cx))),
+            )
+            .into_any_element()
+    }
+
+    pub fn toggle_legend(&mut self, cx: &mut Context<Self>) {
+        self.legend_open = !self.legend_open;
+        cx.notify();
+    }
+
+    /// The key to the graph's marks, over the top right of the graph. A click anywhere on it closes it.
+    fn render_legend(&self, cx: &mut Context<Self>) -> AnyElement {
+        use gitgui_core::CommitKind;
+        let entry = |icon: AnyElement, title: &'static str, says: &'static str| {
+            div()
+                .flex()
+                .items_start()
+                .gap_2()
+                .child(div().flex_none().w(px(14.)).h(px(18.)).flex().items_center().child(icon))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().text_color(rgb(t().text_strong)).font_weight(FontWeight::SEMIBOLD).child(title))
+                        .child(div().text_color(rgb(t().muted)).child(says)),
+                )
+        };
+        div()
+            .id("legend-panel")
+            .debug_selector(|| "legend-panel".to_owned())
+            .absolute()
+            .top(px(80.))
+            .right(px(12.))
+            .w(px(340.))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_md()
+            .bg(rgb(t().panel))
+            .border_1()
+            .border_color(rgb(t().border))
+            .shadow_lg()
+            .text_xs()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_legend(cx)))
+            .child(div().text_sm().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child("What the marks mean"))
+            .child(entry(ui::kind_icon(CommitKind::PullRequest).into_any_element(), "Pull request", "Merged with a merge commit."))
+            .child(entry(ui::kind_icon(CommitKind::Squash).into_any_element(), "Squashed pull request", "All of a branch's changes in one commit, its title ending in (#N)."))
+            .child(entry(ui::kind_icon(CommitKind::Merge).into_any_element(), "Merge", "One branch merged into another."))
+            .child(entry(
+                ui::kind_icon(CommitKind::Sync).into_any_element(),
+                "Sync merge",
+                "The trunk merged into a branch to keep it current. Left out of the graph unless Sync merges is ticked.",
+            ))
+            .child(entry(
+                div().text_color(rgb(t().added)).child("✓").into_any_element(),
+                "merged into / already in",
+                "The branch's commits are part of another branch. \"already in\" means no merge commit brought them: it was fast-forwarded.",
+            ))
+            .child(entry(
+                div().text_color(rgb(t().muted)).child("+N").into_any_element(),
+                "Folded lanes",
+                "More lines than fit beside the messages are drawn as one gray lane. Press +N above the graph to open them.",
+            ))
             .into_any_element()
     }
 
@@ -2946,13 +3097,33 @@ impl Workspace {
         let count = view.entries.len();
         let width = view.graph_width;
         let cols = layout::Columns::fit(area, width);
+        // More lanes than fit beside the messages: a button after "Graph" folds the far ones into one, or unfolds them.
+        let lanes_button = (view.folded_lanes > 0).then(|| {
+            let open = self.settings.all_lanes;
+            let label = if open { "fold".to_owned() } else { format!("+{}", view.folded_lanes) };
+            div()
+                .id("lanes")
+                .debug_selector(|| "lanes".to_owned())
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(t().border))
+                .text_xs()
+                .text_color(rgb(t().muted))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(t().hover)))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_all_lanes(cx)))
+                .child(label)
+                .into_any_element()
+        });
 
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .child(graph::columns(width, cols))
+            .child(graph::columns(width, cols, lanes_button))
             .child(
                 uniform_list(
                     "commits",
@@ -2980,7 +3151,7 @@ impl Workspace {
                         let Some(repo) = this.repo.as_ref() else { return Vec::new() };
                         let Phase::Ready(view) = &repo.phase else { return Vec::new() };
                         let selected = repo.selected;
-                        let density = graph::Density::of(this.settings.compact_graph, this.settings.graph_factor());
+                        let density = graph::Density::from_settings(&this.settings);
                         // The selected commit's branch line comes forward; the others step back.
                         let highlight = selected.and_then(|ix| view.entries.get(ix)).map(|entry| entry.row.lineage);
                         range

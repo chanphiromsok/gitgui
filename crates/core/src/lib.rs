@@ -32,7 +32,7 @@ pub use lineage::{
     CommitKind, branch_rank, commit_branches, commit_kind, commit_rank, conventional_prefix, lineage_names, merged_branch_name,
 };
 pub use filter::{
-    Constraints, Day, Query, Scope, add_days, commit_day, day_of, filter_commits, matches_text, narrow, parse_constraints, stash_count,
+    Constraints, Day, Query, Scope, add_days, commit_day, day_of, filter_commits, filter_with_focus, matches_text, narrow, sync_merges, without_commits, parse_constraints, stash_count,
     term, with_term,
 };
 pub use diff::{DiffLine, FileDiff, Gap, Hunk, LineKind, Pair, REVEAL_STEP, Reveal, Revealed, reveal};

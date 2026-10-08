@@ -611,6 +611,8 @@ async fn a_squash_merged_branch_is_noted_and_goes_under_its_squash_commit(cx: &m
     let fx = squashed_pr("squash-ui");
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     open_project(&ws, cx, &fx.repo()); // the scan finishes in the background too
+    // The squashed branch is not HEAD's, nor its base: the default view leaves it out, All shows it.
+    ws.update(cx, |ws, cx| ws.set_scope(gitgui_core::Scope::All, cx));
     draw(cx, &ws);
 
     // The branch's commits are nested under the commit that carries them.
@@ -635,7 +637,7 @@ async fn a_squash_merged_branch_is_noted_and_goes_under_its_squash_commit(cx: &m
     assert_eq!(ws.read_with(cx, |ws, _| match &ws.repo.as_ref().unwrap().phase {
         Phase::Ready(view) => view.entries[0].kind,
         _ => CommitKind::Commit,
-    }), CommitKind::PullRequest);
+    }), CommitKind::Squash);
 
     // Turning grouping off keeps the notes but lists the commits flat.
     ws.update(cx, |ws, cx| ws.toggle_group_by_parent(cx));
@@ -1101,6 +1103,9 @@ async fn the_filter_bar_narrows_the_graph_and_the_search_finds_commits(cx: &mut 
 
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     open_project(&ws, cx, &fx.repo());
+    // The default view is the branch, the one it was cut from, and their remote copies: not the other branch.
+    assert_eq!(summaries(&ws, cx), ["feat work", "change", "base"]);
+    ws.update(cx, |ws, cx| ws.set_scope(Scope::All, cx));
     assert_eq!(summaries(&ws, cx), ["feat work", "other work", "change", "base"]);
     draw(cx, &ws);
 
@@ -1868,7 +1873,8 @@ async fn refreshing_when_no_branch_moved_runs_no_new_merge_scan(cx: &mut TestApp
     assert_eq!(count(&ws, cx, |c| &c.scans), 1, "50 refreshes with no branch moved ran no merge scan");
     assert!(!ws.read_with(cx, |ws, _| ws.scan_running()), "nothing is left running");
 
-    assert!(notes.iter().any(|n| n == "✓ merged into main"), "feat/open sits on main's history: {notes:?}");
+    // No merge commit brought it in: git cannot say it was merged, only that it is already there.
+    assert!(notes.iter().any(|n| n == "✓ already in main"), "feat/open sits on main's history: {notes:?}");
 
     // A branch that moves is scanned again: it has work of its own now, so it is not merged any more.
     fx.git(&["checkout", "-q", "feat/open"]);
@@ -3428,4 +3434,89 @@ async fn a_long_conflicted_file_folds_its_unchanged_lines_and_draws_quickly(cx: 
     if !cfg!(debug_assertions) {
         assert!(folded < 8. && unfolded < 8., "{folded:.2} / {unfolded:.2} ms per frame");
     }
+}
+
+/// base ← m1 on main; feat starts at base, then brings main in with a plain merge (a sync merge), then adds f2.
+fn synced_branch(name: &str) -> Fixture {
+    let fx = bare_fixture(name);
+    commit_file(&fx, "a.txt", "base\n", "base");
+    fx.git(&["checkout", "-q", "-b", "feat"]);
+    commit_file(&fx, "f.txt", "1\n", "feat: f1");
+    fx.git(&["checkout", "-q", "main"]);
+    commit_file(&fx, "b.txt", "m1\n", "chore: m1");
+    fx.git(&["checkout", "-q", "feat"]);
+    fx.git(&["merge", "-q", "--no-ff", "-m", "Merge branch 'main' into feat", "main"]);
+    commit_file(&fx, "f.txt", "2\n", "feat: f2");
+    fx
+}
+
+#[gpui::test]
+async fn a_merge_that_only_brings_main_in_is_left_out_until_asked_for(cx: &mut TestAppContext) {
+    let fx = synced_branch("sync-merge");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let merge = "Merge branch 'main' into feat";
+    let count = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| match ws.repo.as_ref().map(|r| &r.phase) {
+            Some(Phase::Ready(view)) => view.sync_count,
+            _ => 0,
+        })
+    };
+    // The default view: the sync merge is not a row, and f2 follows f1 as if it were not there.
+    let rows = summaries(&ws, cx);
+    assert!(!rows.iter().any(|s| s == merge), "{rows:?}");
+    assert!(["feat: f2", "feat: f1", "chore: m1", "base"].iter().all(|want| rows.iter().any(|s| s == want)), "{rows:?}");
+    assert_eq!(count(&ws, cx), 1);
+    draw(cx, &ws);
+
+    // Asked for, it is a row with its own mark.
+    ws.update(cx, |ws, cx| ws.toggle_sync_merges(cx));
+    let rows = summaries(&ws, cx);
+    assert!(rows.iter().any(|s| s == merge), "{rows:?}");
+    let kind = ws.read_with(cx, |ws, _| match ws.repo.as_ref().map(|r| &r.phase) {
+        Some(Phase::Ready(view)) => view.entries.iter().find(|e| e.summary == merge).map(|e| e.kind),
+        _ => None,
+    });
+    assert_eq!(kind, Some(CommitKind::Sync));
+    draw(cx, &ws);
+    // The key to the marks opens and closes.
+    ws.update(cx, |ws, cx| ws.toggle_legend(cx));
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.toggle_legend(cx));
+}
+
+/// `count` branches cut from base, each with one commit of its own, all still open (nothing merged): one lane each.
+fn many_lanes(name: &str, count: usize) -> Fixture {
+    let fx = bare_fixture(name);
+    commit_file(&fx, "a.txt", "base\n", "base");
+    for n in 0..count {
+        fx.git(&["checkout", "-q", "-b", &format!("feat/{n}"), "main"]);
+        commit_file(&fx, &format!("f{n}.txt"), "1\n", &format!("feat: work {n}"));
+    }
+    fx.git(&["checkout", "-q", "main"]);
+    fx
+}
+
+#[gpui::test]
+async fn lanes_past_the_sixth_fold_into_one_until_asked_to_open(cx: &mut TestAppContext) {
+    let fx = many_lanes("many-lanes", 10);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| ws.set_scope(gitgui_core::Scope::All, cx));
+    let measure = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| match ws.repo.as_ref().map(|r| &r.phase) {
+            Some(Phase::Ready(view)) => (view.folded_lanes, view.graph_width),
+            _ => (0, 0.),
+        })
+    };
+    let (folded, narrow) = measure(&ws, cx);
+    assert!(folded >= 2, "ten open branches are more lanes than fit: {folded} folded");
+    draw(cx, &ws);
+
+    ws.update(cx, |ws, cx| ws.toggle_all_lanes(cx));
+    let (folded_open, wide) = measure(&ws, cx);
+    assert_eq!(folded_open, folded, "the button says how many either way");
+    assert!(wide > narrow, "every lane is drawn: {wide} against {narrow}");
+    assert!(Store::at(fx.data()).settings().unwrap().all_lanes, "the choice is kept");
+    draw(cx, &ws);
 }

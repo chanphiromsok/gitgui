@@ -10,13 +10,18 @@ pub enum CommitKind {
     Commit,
     /// A merge of branches that is not a pull request.
     Merge,
-    /// A pull request landing on a branch: a `Merge pull request #N` commit, or a squash commit titled `... (#N)`.
+    /// A pull request landing on a branch with a merge commit: `Merge pull request #N from …`.
     PullRequest,
+    /// A pull request landing as one commit that holds all its changes: a subject ending `(#N)`, not a merge.
+    Squash,
+    /// A merge that only brings a trunk into a feature branch, to keep it up to date. `commit_kind` cannot tell
+    /// (it needs the history around the commit), so it never answers this; see `sync_merges`.
+    Sync,
 }
 
 pub fn commit_kind(commit: &Commit) -> CommitKind {
     if subject_pr(&commit.summary).is_some() {
-        CommitKind::PullRequest
+        if commit.is_merge() { CommitKind::PullRequest } else { CommitKind::Squash }
     } else if commit.is_merge() {
         CommitKind::Merge
     } else {
@@ -247,8 +252,10 @@ mod tests {
     fn pull_requests_merges_and_plain_commits_are_told_apart() {
         let plain = commit("fix: something", &[]);
         assert_eq!(commit_kind(&plain), CommitKind::Commit);
-        assert_eq!(commit_kind(&commit("Merge pull request #42 from bstnt/feat/x", &[])), CommitKind::PullRequest);
-        assert_eq!(commit_kind(&commit("feat: redesign booking (#36)", &[])), CommitKind::PullRequest, "a squash commit");
+        let mut pr = commit("Merge pull request #42 from bstnt/feat/x", &[]);
+        pr.parents = vec!["a".into(), "b".into()];
+        assert_eq!(commit_kind(&pr), CommitKind::PullRequest);
+        assert_eq!(commit_kind(&commit("feat: redesign booking (#36)", &[])), CommitKind::Squash, "a squash commit");
         assert_eq!(commit_kind(&commit("fix: mentions #36 in the middle", &[])), CommitKind::Commit);
         let mut merge = commit("Merge branch 'release/1.0.0' into feat/x", &[]);
         merge.parents = vec!["a".into(), "b".into()];

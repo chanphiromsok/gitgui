@@ -96,6 +96,9 @@ pub struct Settings {
     pub sidebar_hidden: bool,
     /// Draw the graph with narrow lanes and thin lines.
     pub compact_graph: bool,
+    /// Draw every lane of the graph. Off, a history with more than a few lanes folds the rest into one,
+    /// marked "+N" above the graph.
+    pub all_lanes: bool,
     /// Fetch authors' pictures from GitHub and Gravatar; off draws their initials only.
     pub fetch_avatars: bool,
     /// Changed files as a tree or a flat list. Remembered from one launch to the next.
@@ -138,6 +141,7 @@ impl Default for Settings {
             icon_theme: None,
             sidebar_hidden: false,
             compact_graph: false,
+            all_lanes: false,
             fetch_avatars: true,
             file_layout: FileLayout::Tree,
             diff_mode: DiffMode::Split,

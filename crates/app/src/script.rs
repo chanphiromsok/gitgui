@@ -12,6 +12,7 @@
 //! file 0                  open the commit's nth changed file
 //! mode split|unified      layout tree|flat      expand      back      more
 //! search <text>   fill the search box (author:… date:… words)      menu authors|dates X Y   open that chip's menu
+//! scope focus|current|local|all   which branches the graph shows      lanes   fold or unfold the lanes past the sixth      sync   show or hide sync merges      legend   the key to the marks
 //! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light      style <id>   graph style, e.g. style neon
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
@@ -113,6 +114,18 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         ),
         "theme" => workspace.set_theme(rest, cx),
         "style" => workspace.set_graph_style(rest, cx),
+        "scope" => workspace.set_scope(
+            match rest {
+                "focus" => gitgui_core::Scope::Focus,
+                "current" => gitgui_core::Scope::Current,
+                "local" => gitgui_core::Scope::Local,
+                _ => gitgui_core::Scope::All,
+            },
+            cx,
+        ),
+        "lanes" => workspace.toggle_all_lanes(cx),
+        "sync" => workspace.toggle_sync_merges(cx),
+        "legend" => workspace.toggle_legend(cx),
         "hover" => workspace.script_hover(rest, cx),
         "newbranch" => {
             workspace.open_new_branch(window, cx);

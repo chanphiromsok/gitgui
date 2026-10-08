@@ -41,12 +41,14 @@ pub struct Density {
     pub row_h: f32,
     /// The scale everything above was multiplied by (the Graph size setting).
     pub scale: f32,
+    /// The last lane drawn in its own place: lanes beyond it are folded into it.
+    pub cap: usize,
 }
 
 impl Density {
-    const ROOMY: Density = Density { lane_w: 20., dot_r: 4.5, line: 2., node: 17., row_h: ROW_H, scale: 1. };
+    const ROOMY: Density = Density { lane_w: 20., dot_r: 4.5, line: 2., node: 17., row_h: ROW_H, scale: 1., cap: MAX_DRAWN_LANES };
     /// Narrow lanes and thin lines, so a busy history leaves room for the messages.
-    const COMPACT: Density = Density { lane_w: 14., dot_r: 3.2, line: 1.5, node: 13., row_h: ROW_H, scale: 1. };
+    const COMPACT: Density = Density { lane_w: 14., dot_r: 3.2, line: 1.5, node: 13., row_h: ROW_H, scale: 1., cap: MAX_DRAWN_LANES };
 
     /// `scale` is the Graph size setting as a factor: 1.0 is the default, 1.5 draws everything half as large again.
     pub fn of(compact: bool, scale: f32) -> Self {
@@ -58,15 +60,34 @@ impl Density {
             node: base.node * scale,
             row_h: base.row_h * scale,
             scale,
+            cap: base.cap,
         }
+    }
+
+    /// How the settings ask the graph to be drawn: its size, and whether lanes past `LANE_CAP` are folded.
+    pub fn from_settings(settings: &gitgui_store::Settings) -> Self {
+        let mut density = Self::of(settings.compact_graph, settings.graph_factor());
+        if !settings.all_lanes {
+            density.cap = LANE_CAP;
+        }
+        density
     }
 
     /// Where a lane's center is, from the graph's left edge.
     fn x(&self, lane: usize) -> f32 {
-        lane.min(MAX_DRAWN_LANES) as f32 * self.lane_w + self.lane_w / 2.
+        lane.min(self.cap) as f32 * self.lane_w + self.lane_w / 2.
     }
 }
 pub const MAX_DRAWN_LANES: usize = 14;
+/// Lanes past this one are folded into it (unless the setting says to draw them all): a history with a dozen
+/// lanes has no room left for its messages, and the far ones are old branches.
+pub const LANE_CAP: usize = 6;
+
+/// How many lanes are folded into the last one when the widest row has `widest` lanes, and `cap` is the last lane
+/// drawn in its place; 0 when nothing would be folded (one lane alone in the last column is just drawn there).
+pub fn folded_lanes(widest: usize, cap: usize) -> usize {
+    if widest > cap + 1 { widest - cap } else { 0 }
+}
 /// How much of a branch line's color remains when another line is in front.
 const DIMMED: f32 = 0.22;
 /// How much remains of a commit, and a line, that is not part of the current branch's history.
@@ -163,6 +184,8 @@ pub struct Options<'a> {
     pub web: Option<&'a WebRemote>,
     /// Who is who among the authors.
     pub people: Option<&'a People>,
+    /// The merges that only bring a trunk into a branch (`sync_merges`): drawn with their own mark.
+    pub sync: &'a HashSet<String>,
 }
 
 pub struct Built {
@@ -274,7 +297,9 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             merge: commit.is_merge(),
             labels: labels(&commit.refs),
             summary: SharedString::from(commit.summary.clone()),
+            // A stash's message quotes the commit it was made on, which may name a pull request: it is not one.
             pr: subject_pr(&commit.summary)
+                .filter(|_| commit.stash.is_none())
                 .and_then(|n| Some((n, SharedString::from(options.web?.pull_request(n))))),
             prefix: conventional_prefix(&commit.summary).unwrap_or(0),
             date: SharedString::from(commit.date.clone()),
@@ -288,7 +313,13 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             commit: Some(commit.id.clone()),
             notes: Vec::new(),
             depth: placed.depth,
-            kind: commit_kind(commit),
+            kind: if commit.stash.is_some() {
+                CommitKind::Commit
+            } else if options.sync.contains(&commit.id) {
+                CommitKind::Sync
+            } else {
+                commit_kind(commit)
+            },
             group_size: *size,
             collapsed: *size > 0 && options.collapsed.contains(&commit.id),
             off_branch: head_history.as_ref().is_some_and(|seen| !seen.contains(commit.id.as_str())),
@@ -341,15 +372,22 @@ fn fork_names(row: &Row, names: &[Option<String>]) -> Vec<String> {
 
 /// Puts what the merge scan found next to the commits it is about: on the branch's tip, "merged into
 /// release/1.0.0", and on the commit that carries the branch's changes, "squash of branch feat/x".
-pub fn apply_clues(entries: &mut [Entry], clues: &[MergeClue]) {
+pub fn apply_clues(entries: &mut [Entry], clues: &[MergeClue], tips: &HashMap<String, String>, merged_in: &HashSet<String>) {
     for entry in entries.iter_mut() {
         entry.notes.clear();
     }
     for clue in clues {
         let short = |id: &str| id.chars().take(7).collect::<String>();
         let pr = clue.pr.map(|n| format!(" (#{n})")).unwrap_or_default();
+        // A branch whose tip is part of another's history, with no merge commit that brings it in, was fast-forwarded
+        // into it (or never had a commit of its own): git left no merge to point at, so it is not called merged.
+        let by_merge = tips.get(&clue.branch).is_none_or(|tip| merged_in.contains(tip));
         let (verb, how) = match clue.evidence {
-            Evidence::Contained => ("merged into", "Its commits are already part of that branch's history."),
+            Evidence::Contained if by_merge => ("merged into", "Its commits are already part of that branch's history."),
+            Evidence::Contained => (
+                "already in",
+                "Its commits are part of that branch's history, but no merge commit brought them in: it was fast-forwarded, or never had a commit of its own.",
+            ),
             Evidence::SamePatch => ("squash-merged into", "A commit there makes exactly the same changes as this whole branch."),
             Evidence::PullRequest => ("probably squash-merged into", "A commit there names the same pull request as this branch's commits."),
             Evidence::Messages => ("probably squash-merged into", "A commit there repeats this branch's commit messages."),
@@ -396,11 +434,12 @@ fn short_name(name: &str) -> String {
 }
 
 pub fn graph_width(widest_lanes: usize, density: Density) -> f32 {
-    widest_lanes.min(MAX_DRAWN_LANES + 1) as f32 * density.lane_w + 8.
+    widest_lanes.min(density.cap + 1) as f32 * density.lane_w + 8.
 }
 
 /// The column titles; `cols` says which of the columns after Description fit.
-pub fn columns(graph_width: f32, cols: Columns) -> impl IntoElement {
+/// `lanes` is the small button after "Graph" that folds or unfolds the lanes past the cap, when there are any.
+pub fn columns(graph_width: f32, cols: Columns, lanes: Option<gpui::AnyElement>) -> impl IntoElement {
     let cell = |text: &'static str| div().font_weight(FontWeight::SEMIBOLD).child(text);
     div()
         .h(px(28.))
@@ -413,7 +452,18 @@ pub fn columns(graph_width: f32, cols: Columns) -> impl IntoElement {
         .border_b_1()
         .border_color(rgb(t().border))
         // The title is dropped when the drawing is too narrow for it, instead of wrapping letter by letter.
-        .child(cell(if graph_width >= 56. { "Graph" } else { "" }).w(px(graph_width)).flex_none().overflow_hidden().whitespace_nowrap())
+        .child(
+            div()
+                .w(px(graph_width))
+                .flex_none()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(cell(if graph_width >= 56. { "Graph" } else { "" }))
+                .children(lanes),
+        )
         .child(cell("Description").flex_1().min_w_0())
         .when(cols.date != DateStyle::Hidden, |row| row.child(cell("Date").w(px(cols.date_width()))))
         .when(cols.author, |row| row.child(cell("Author").w(px(Columns::AUTHOR_W))))
@@ -613,7 +663,8 @@ pub fn render_entry(
     // A commit with commits listed under it folds them with a chevron drawn on its dot.
     let fold = (entry.group_size > 0).then_some(entry.collapsed);
     // Any other commit is drawn as its author's initials; it steps back like its line does.
-    let face = shows_face(faces, entry, highlight);
+    // A commit in the folded lane is a plain dot: a dozen faces on top of each other say nothing.
+    let face = shows_face(faces, entry, highlight) && lane < density.cap;
     let plain = fold.is_none() && dot != Dot::Uncommitted && !face;
     let node = (fold.is_none() && dot != Dot::Uncommitted && face).then(|| {
         let alpha = match highlight {
@@ -903,13 +954,25 @@ fn paint_lanes(
         let onto_line = stroke.from != stroke.to
             && strokes.iter().any(|s| s.half == Half::Through && s.from == stroke.to && s.lineage == stroke.lineage);
         let piece = graph_style::Piece { half: stroke.half, from, to, onto_line, commit_gap };
+        // Lines in the folded lane are one gray bundle: which line is which is told by unfolding them.
+        let color = if stroke.from >= density.cap && stroke.to >= density.cap && highlight != Some(stroke.lineage) {
+            faded(rgb(t().muted), 0.6)
+        } else {
+            tone(stroke.lineage)
+        };
         if let Some(path) = graph_style::stroke(style.shape, piece, corner, width) {
-            window.paint_path(path, tone(stroke.lineage));
+            window.paint_path(path, color);
         }
     }
 
     let center = point(x(lane, width_of(lineage)), mid);
-    let color = if off_branch && highlight.is_none() { faded(tone(lineage), OFF_BRANCH) } else { tone(lineage) };
+    let color = if lane >= density.cap && highlight != Some(lineage) {
+        faded(rgb(t().muted), 0.8)
+    } else if off_branch && highlight.is_none() {
+        faded(tone(lineage), OFF_BRANCH)
+    } else {
+        tone(lineage)
+    };
     let mut circle = |radius: f32, fill: Rgba, border: f32, border_color: Rgba| {
         window.paint_quad(quad(
             Bounds { origin: point(center.x - px(radius), center.y - px(radius)), size: size(px(radius * 2.), px(radius * 2.)) },
@@ -1016,7 +1079,7 @@ mod tests {
         ];
         let built = build_entries(
             &commits,
-            &Options { changed: 0, group: false, squashed: &HashMap::new(), collapsed: &HashSet::new(), web: None, people: None },
+            &Options { changed: 0, group: false, squashed: &HashMap::new(), collapsed: &HashSet::new(), web: None, people: None, sync: &HashSet::new() },
         );
         let off: Vec<bool> = built.entries.iter().map(|e| e.off_branch).collect();
         assert_eq!(off, [true, false, false, false]);

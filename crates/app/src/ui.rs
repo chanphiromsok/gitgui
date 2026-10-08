@@ -55,7 +55,7 @@ pub const PR_COLOR: u32 = 0xa371f7;
 pub const MERGE_COLOR: u32 = 0x8b7bb8;
 pub const COMMIT_COLOR: u32 = 0x7d8590;
 
-/// The small icon beside a commit: a pull request, a merge, or a plain commit.
+/// The small icon beside a commit: a pull request, a squashed one, a merge, a merge that only syncs, or a plain commit.
 pub fn kind_icon(kind: CommitKind) -> impl IntoElement + use<> {
     canvas(|_, _, _| (), move |bounds, _, window, _| paint_icon(kind, bounds, window)).w(px(14.)).h(px(14.)).flex_none()
 }
@@ -95,6 +95,21 @@ fn paint_icon(kind: CommitKind, bounds: Bounds<Pixels>, window: &mut Window) {
             ring(window, color, at(3., 3.), 2.2);
             ring(window, color, at(3., 11.), 2.2);
             ring(window, color, at(11., 7.), 2.2);
+        }
+        CommitKind::Squash => {
+            // Several commits narrowing into one.
+            let color = rgb(PR_COLOR);
+            line(window, color, &[at(2., 3.), at(6., 7.)]);
+            line(window, color, &[at(2., 11.), at(6., 7.)]);
+            line(window, color, &[at(6., 7.), at(9., 7.)]);
+            ring(window, color, at(11., 7.), 2.4);
+        }
+        CommitKind::Sync => {
+            // The trunk's changes coming into the branch: an arrow pointing at the ring it enters.
+            let color = rgb(COMMIT_COLOR);
+            line(window, color, &[at(5.4, 7.), at(13., 7.)]);
+            line(window, color, &[at(8., 4.6), at(5.4, 7.), at(8., 9.4)]);
+            ring(window, color, at(3., 7.), 2.2);
         }
         CommitKind::PullRequest => {
             let color = rgb(PR_COLOR);

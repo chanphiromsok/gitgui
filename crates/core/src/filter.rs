@@ -11,8 +11,11 @@ use crate::model::{Commit, RefKind};
 /// Which branches the graph shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
-    /// Every branch, remote ones included, with tags and stashes.
+    /// The branch HEAD is on, the branch it was cut from, and their remote copies: where the work stands
+    /// against the trunk and the remote, without the other branches around it.
     #[default]
+    Focus,
+    /// Every branch, remote ones included, with tags and stashes.
     All,
     /// Local branches, and the remote copies that point where they do.
     Local,
@@ -73,6 +76,12 @@ fn contains(text: &str, word: &str) -> bool {
 /// go with them. The branch HEAD is on is always shown. With `stashes`, a stash shows when the
 /// commit it was made on does; without, none do.
 pub fn filter_commits(commits: &[Commit], scope: Scope, hidden: &HashSet<String>, stashes: bool) -> Vec<Commit> {
+    filter_with_focus(commits, scope, hidden, stashes, &[])
+}
+
+/// `filter_commits`, where `Scope::Focus` also shows the branches named in `focus` (`release/1.0.0`: the local
+/// branch and any remote copy of it, `origin/release/1.0.0`) along with the branch HEAD is on.
+pub fn filter_with_focus(commits: &[Commit], scope: Scope, hidden: &HashSet<String>, stashes: bool, focus: &[String]) -> Vec<Commit> {
     if scope == Scope::All && hidden.is_empty() && stashes {
         return commits.to_vec();
     }
@@ -106,8 +115,14 @@ pub fn filter_commits(commits: &[Commit], scope: Scope, hidden: &HashSet<String>
         })
         .collect();
 
+    let in_focus = |r: &crate::model::Ref| match r.kind {
+        RefKind::LocalBranch => focus.contains(&r.name),
+        RefKind::RemoteBranch => focus.contains(&r.name) || focus.contains(&tail(&r.name)),
+        _ => false,
+    };
     let is_tip = |commit: &Commit| {
         commit.refs.iter().any(|r| match scope {
+            Scope::Focus => r.kind == RefKind::Head || in_focus(r),
             Scope::All => r.kind != RefKind::Stash,
             Scope::Local => matches!(r.kind, RefKind::LocalBranch | RefKind::Head),
             Scope::Current => r.kind == RefKind::Head,
@@ -380,6 +395,63 @@ pub fn narrow(commits: &[Commit], keep: impl Fn(&Commit) -> bool) -> Vec<Commit>
         .collect()
 }
 
+/// The merge commits that only bring a trunk into a feature branch to keep it current ("Merge branch 'release/1.0.0'
+/// into feat/x"): the merge itself is not on a trunk's own line, but the commit it merges in is. A pull request
+/// merge is the other way round (it lands on the trunk's line) and a pull of a feature branch merges another
+/// feature line, so neither counts. A trunk is a branch ranked like `main`, `develop`, `release/…` or `staging`.
+pub fn sync_merges(commits: &[Commit]) -> HashSet<String> {
+    let by_id: std::collections::HashMap<&str, &Commit> = commits.iter().map(|c| (c.id.as_str(), c)).collect();
+    // Every commit on the first-parent line of a trunk: the line the trunk's own commits and merges are on.
+    let mut line: HashSet<&str> = HashSet::new();
+    for tip in commits.iter().filter(|c| crate::lineage::commit_rank(c) >= 50) {
+        let mut at = Some(tip);
+        while let Some(commit) = at {
+            if !line.insert(commit.id.as_str()) {
+                break;
+            }
+            at = commit.parents.first().and_then(|p| by_id.get(p.as_str()).copied());
+        }
+    }
+    commits
+        .iter()
+        .filter(|c| c.is_merge() && crate::squash::subject_pr(&c.summary).is_none())
+        .filter(|c| !line.contains(c.id.as_str()) && c.parents.get(1).is_some_and(|merged| line.contains(merged.as_str())))
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+/// `commits` without those in `drop`: whoever had one as a parent has its first parent instead (what the merge
+/// only brought in is on the trunk's line anyway). Meant for merges that are not worth a row; the branches and
+/// tags a dropped commit carries are the caller's to keep it for.
+pub fn without_commits(commits: &[Commit], drop: &HashSet<String>) -> Vec<Commit> {
+    if drop.is_empty() {
+        return commits.to_vec();
+    }
+    let by_id: std::collections::HashMap<&str, &Commit> = commits.iter().map(|c| (c.id.as_str(), c)).collect();
+    let past = |id: &str| -> Option<String> {
+        let mut at = id.to_owned();
+        while drop.contains(&at) {
+            at = by_id.get(at.as_str())?.parents.first()?.clone();
+        }
+        Some(at)
+    };
+    commits
+        .iter()
+        .filter(|c| !drop.contains(&c.id))
+        .map(|commit| {
+            let mut commit = commit.clone();
+            let mut parents: Vec<String> = Vec::new();
+            for parent in commit.parents.iter().filter_map(|p| past(p)) {
+                if !parents.contains(&parent) {
+                    parents.push(parent);
+                }
+            }
+            commit.parents = parents;
+            commit
+        })
+        .collect()
+}
+
 /// How many stashes there are.
 pub fn stash_count(commits: &[Commit]) -> usize {
     commits.iter().filter(|c| c.refs.iter().any(|r| r.kind == RefKind::Stash)).count()
@@ -425,6 +497,59 @@ mod tests {
     #[test]
     fn all_with_nothing_hidden_is_everything() {
         assert_eq!(ids(&filter_commits(&history(), Scope::All, &HashSet::new(), true)), ["d1", "f1", "s1", "m1", "r1", "r0"]);
+    }
+
+    /// release: t2 (and origin/release); feat (HEAD): f1 -> t1, its remote copy a commit ahead at f2; other: o1 -> t1.
+    fn moved_on() -> Vec<Commit> {
+        vec![
+            commit("t2", &["t1"], &[("release", RefKind::LocalBranch), ("origin/release", RefKind::RemoteBranch)]),
+            commit("o1", &["t1"], &[("other", RefKind::LocalBranch)]),
+            commit("f2", &["f1"], &[("origin/feat", RefKind::RemoteBranch)]),
+            commit("f1", &["t1"], &[("HEAD", RefKind::Head), ("feat", RefKind::LocalBranch)]),
+            commit("t1", &["t0"], &[]),
+            commit("t0", &[], &[]),
+        ]
+    }
+
+    #[test]
+    fn focus_is_the_branch_its_base_and_their_remote_copies_and_nothing_else() {
+        let focus = ["release".to_owned(), "feat".to_owned()];
+        let shown = filter_with_focus(&moved_on(), Scope::Focus, &HashSet::new(), true, &focus);
+        assert_eq!(ids(&shown), ["t2", "f2", "f1", "t1", "t0"], "the base moved on, the remote is ahead, the other branch is left out");
+        // Without a base named, it is the branch HEAD is on and what it comes from.
+        let alone = filter_with_focus(&moved_on(), Scope::Focus, &HashSet::new(), true, &[]);
+        assert_eq!(ids(&alone), ["f1", "t1", "t0"]);
+    }
+
+    /// release/1.0.0: rel2 (a PR merge of feat) -> rel1 -> rel0. feat: f3 -> s1 (merges rel1 in) -> f2 -> f1 -> rel0.
+    fn with_a_sync_merge() -> Vec<Commit> {
+        let mut commits = vec![
+            commit("rel2", &["rel1", "f3"], &[("release/1.0.0", RefKind::LocalBranch)]),
+            commit("f3", &["s1"], &[("feat", RefKind::LocalBranch)]),
+            commit("s1", &["f2", "rel1"], &[]),
+            commit("f2", &["f1"], &[]),
+            commit("rel1", &["rel0"], &[]),
+            commit("f1", &["rel0"], &[]),
+            commit("rel0", &[], &[]),
+        ];
+        commits[0].summary = "Merge pull request #5 from o/feat".into();
+        commits[2].summary = "Merge branch 'release/1.0.0' into feat".into();
+        commits
+    }
+
+    #[test]
+    fn a_merge_that_only_brings_the_trunk_in_is_a_sync_merge_and_a_pull_request_merge_is_not() {
+        let found = sync_merges(&with_a_sync_merge());
+        assert_eq!(found, HashSet::from(["s1".to_owned()]));
+    }
+
+    #[test]
+    fn dropping_a_sync_merge_joins_its_children_to_its_first_parent() {
+        let commits = with_a_sync_merge();
+        let shown = without_commits(&commits, &sync_merges(&commits));
+        assert_eq!(ids(&shown), ["rel2", "f3", "f2", "rel1", "f1", "rel0"]);
+        assert_eq!(shown[1].parents, ["f2"], "f3 now comes straight after f2, not after the merge");
+        assert_eq!(shown[0].parents, ["rel1", "f3"], "the pull request merge is untouched");
     }
 
     #[test]

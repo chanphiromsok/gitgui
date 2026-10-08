@@ -271,6 +271,12 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_compact_graph(cx))),
                             ),
                             row(
+                                "Draw every lane",
+                                "Off, a history with more than six lanes folds the far ones into one gray lane, with a +N button above the graph to open them.",
+                                switch("setting-all-lanes", s.all_lanes)
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_all_lanes(cx))),
+                            ),
+                            row(
                                 "Graph size",
                                 "How large the commit circles, lanes and rows are. Larger reads better on a big screen.",
                                 segmented(scale.into_iter().collect()),
