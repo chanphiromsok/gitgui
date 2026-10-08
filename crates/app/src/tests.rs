@@ -3520,3 +3520,76 @@ async fn lanes_past_the_sixth_fold_into_one_until_asked_to_open(cx: &mut TestApp
     assert!(Store::at(fx.data()).settings().unwrap().all_lanes, "the choice is kept");
     draw(cx, &ws);
 }
+
+#[gpui::test]
+async fn commits_only_here_or_only_on_the_remote_are_marked_and_a_label_click_isolates_its_branch(cx: &mut TestAppContext) {
+    use crate::graph::Mark;
+    let fx = bare_fixture("divergence-marks");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    let remote = fx.0.join("remote.git");
+    fx.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    fx.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fx.git(&["push", "-q", "-u", "origin", "main"]);
+    // A colleague's commit lands on the remote and is fetched; ours is not pushed.
+    let other = fx.0.join("other");
+    let run = |dir: &Path, args: &[&str]| {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Bo")
+            .env("GIT_AUTHOR_EMAIL", "bo@example.com")
+            .env("GIT_COMMITTER_NAME", "Bo")
+            .env("GIT_COMMITTER_EMAIL", "bo@example.com")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    run(&fx.0, &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+    std::fs::write(other.join("theirs.txt"), "t\n").unwrap();
+    run(&other, &["add", "."]);
+    run(&other, &["commit", "-q", "-m", "theirs"]);
+    run(&other, &["push", "-q", "origin", "main"]);
+    fx.git(&["fetch", "-q"]);
+    commit_file(&fx, "mine.txt", "m\n", "mine");
+    // Another branch, to pick out later.
+    fx.git(&["checkout", "-q", "-b", "side", "main~1"]);
+    commit_file(&fx, "side.txt", "s\n", "side work");
+    fx.git(&["checkout", "-q", "main"]);
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    let marks = |ws: &Entity<Workspace>, cx: &VisualTestContext| -> Vec<(String, Option<Mark>)> {
+        ws.read_with(cx, |ws, _| match ws.repo.as_ref().map(|r| &r.phase) {
+            Some(Phase::Ready(view)) => view.entries.iter().map(|e| (e.summary.to_string(), e.mark)).collect(),
+            _ => Vec::new(),
+        })
+    };
+    let found = marks(&ws, cx);
+    assert!(found.contains(&("mine".into(), Some(Mark::Unpushed))), "{found:?}");
+    assert!(found.contains(&("theirs".into(), Some(Mark::Unpulled))), "{found:?}");
+    assert!(found.contains(&("base".into(), None)), "{found:?}");
+    assert!(!found.iter().any(|(summary, _)| summary == "side work"), "the default view leaves the other branch out: {found:?}");
+    draw(cx, &ws);
+
+    // Pointing at a row brings its line forward, and leaving puts it back.
+    ws.update(cx, |ws, cx| ws.script_graph_hover(Some(0), cx));
+    assert!(ws.read_with(cx, |ws, _| ws.graph_hover.is_some()));
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.hover_graph_line(None, cx));
+    assert!(ws.read_with(cx, |ws, _| ws.graph_hover.is_none()));
+
+    // A click on a branch label picks that branch out; Escape puts it back.
+    ws.update(cx, |ws, cx| ws.isolate_branch("side", false, cx));
+    // The branch, and the one it was cut from with its remote copy: nothing else is left.
+    let mut alone: Vec<String> = summaries(&ws, cx);
+    alone.sort();
+    assert_eq!(alone, ["base", "mine", "side work", "theirs"].map(String::from));
+    draw(cx, &ws);
+    ws.update(cx, |ws, cx| ws.back(cx));
+    assert!(summaries(&ws, cx).iter().any(|s| s == "mine"), "back to the view the filter bar says");
+}

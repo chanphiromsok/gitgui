@@ -107,6 +107,15 @@ pub enum Dot {
     Uncommitted,
 }
 
+/// Where a commit stands against the remote, for a branch that tracks one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// Only here: a push would send it.
+    Unpushed,
+    /// Only on the remote: a pull would bring it.
+    Unpulled,
+}
+
 /// A line of text beside a commit about a merge: "squash-merged into release/1.0.0", "squash of branch feat/x".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Note {
@@ -156,6 +165,8 @@ pub struct Entry {
     pub off_lines: Vec<usize>,
     /// A search is on and did not find this commit.
     pub search_miss: bool,
+    /// Not pushed yet, or not pulled yet.
+    pub mark: Option<Mark>,
 }
 
 /// Where the current branch stands against the branch it was cut from.
@@ -286,6 +297,7 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             off_branch: false,
             off_lines: Vec::new(),
             search_miss: false,
+            mark: None,
         });
     }
     for ((commit, row), (placed, size)) in ordered.iter().zip(rows).zip(&shown) {
@@ -325,6 +337,7 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             off_branch: head_history.as_ref().is_some_and(|seen| !seen.contains(commit.id.as_str())),
             off_lines: Vec::new(),
             search_miss: false,
+            mark: None,
         });
     }
 
@@ -362,12 +375,44 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
     Built { entries, widest, lineages, names, base }
 }
 
+/// `branch` (a local name, `feat/x`) and the branch its line was cut from, found in the whole history `whole`, by
+/// local name: a line named after a remote branch (`origin/main`) is the local `main` too. `remotes` are the
+/// repository's remotes, to tell `origin/main` from a local branch with a slash in its name.
+pub fn with_its_base(branch: &str, whole: &Built, remotes: &[String]) -> Vec<String> {
+    let local = |name: &str| -> String {
+        match name.split_once('/') {
+            Some((remote, rest)) if remotes.iter().any(|r| r == remote) => rest.to_owned(),
+            _ => name.to_owned(),
+        }
+    };
+    let mut names = vec![branch.to_owned()];
+    let line = whole.names.iter().position(|name| name.as_deref().map(local).as_deref() == Some(branch));
+    let base = line.and_then(|line| whole.lineages[line].base).and_then(|base| whole.names[base].as_deref().map(local));
+    names.extend(base);
+    names
+}
+
 /// The names of the branch lines that end at this row because they were branched from its commit.
 fn fork_names(row: &Row, names: &[Option<String>]) -> Vec<String> {
     let mut found: Vec<String> = row.joins.iter().filter_map(|line| names.get(*line).cloned().flatten()).collect();
     found.sort();
     found.dedup();
     found
+}
+
+/// Marks the commits only here (↑) and only on the remote (↓).
+pub fn apply_divergence(entries: &mut [Entry], found: &gitgui_core::Divergence) {
+    for entry in entries.iter_mut() {
+        entry.mark = entry.commit.as_ref().and_then(|id| {
+            if found.unpushed.contains(id) {
+                Some(Mark::Unpushed)
+            } else if found.unpulled.contains(id) {
+                Some(Mark::Unpulled)
+            } else {
+                None
+            }
+        });
+    }
 }
 
 /// Puts what the merge scan found next to the commits it is about: on the branch's tip, "merged into
@@ -490,6 +535,7 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
     // A cloud says the branch is on a remote too (or only there), the way other clients mark it,
     // instead of a separate `origin` tag beside it.
     let on_remote = label.kind == LabelKind::RemoteBranch || !label.remotes.is_empty();
+    let is_tag = label.kind == LabelKind::Tag;
     let name = div()
         .px_1p5()
         .flex()
@@ -499,6 +545,7 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
         .text_color(ink)
         .when(look.bold, |name| name.font_weight(FontWeight::BOLD))
         .when_some(look.dot, |name, color| name.child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(color))))
+        .when(is_tag, |name| name.child(gpui::img(icons::flag(look.ink)).flex_none().size(px(11.))))
         .when(on_remote, |name| {
             name.child(gpui::img(icons::remote(look.ink)).flex_none().size(px(11.)))
                 .when(label.remotes.len() > 1, |name| name.child(format!("{}", label.remotes.len())))
@@ -510,6 +557,10 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
     let target = MenuTarget::Label(label.clone());
     // A detached HEAD is not a branch; right-clicking it gives the commit's menu, so let the row have it.
     let own_menu = label.name != "HEAD";
+    // A click on a branch's label picks that branch (and the one it was cut from) out of the graph.
+    let isolate = matches!(label.kind, LabelKind::Branch | LabelKind::RemoteBranch) && own_menu;
+    let picked = label.name.clone();
+    let picked_remote = label.kind == LabelKind::RemoteBranch;
     let tag = format!("badge-{}", label.name);
     div()
         .id(SharedString::from(tag.clone()))
@@ -529,6 +580,12 @@ fn badge(label: &Label, lineage: usize, cx: &mut Context<Workspace>) -> impl Int
         .when_some(look.border, |badge, (width, color)| {
             let badge = if width >= 2. { badge.border_2() } else { badge.border_1() };
             badge.border_color(rgb(color))
+        })
+        .when(isolate, |badge| {
+            badge.on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.isolate_branch(&picked, picked_remote, cx);
+            }))
         })
         // The menu for this badge only; the row's own menu must not also open.
         .on_mouse_down(
@@ -629,11 +686,17 @@ pub fn render_entry(
     graph_width: f32,
     selected: bool,
     highlight: Option<usize>,
+    hover: Option<usize>,
     cols: Columns,
     faces: GraphFaces,
     density: Density,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement + use<> {
+    // The line the pointer is on comes forward like the selected commit's, but only in the lines: the words of the
+    // other rows keep their color, so sweeping the pointer down the list does not make the text flicker.
+    let lines_focus = hover.or(highlight);
+    let unpulled = entry.mark == Some(Mark::Unpulled);
+    let mark = entry.mark;
     let strokes = entry.row.strokes.clone();
     let lane = entry.row.lane;
     let lineage = entry.row.lineage;
@@ -667,7 +730,7 @@ pub fn render_entry(
     let face = shows_face(faces, entry, highlight) && lane < density.cap;
     let plain = fold.is_none() && dot != Dot::Uncommitted && !face;
     let node = (fold.is_none() && dot != Dot::Uncommitted && face).then(|| {
-        let alpha = match highlight {
+        let alpha = match lines_focus {
             Some(h) if h != lineage => DIMMED,
             Some(_) => 1.,
             None if off_branch => OFF_BRANCH,
@@ -707,6 +770,12 @@ pub fn render_entry(
         .when(current, |row| row.bg(rgb(t().head_row)))
         .when(selected, |row| row.bg(rgb(t().selected)))
         .hover(|style| style.bg(if selected { rgb(t().selected) } else { rgb(t().hover) }))
+        // Its branch line comes forward while the pointer is on the row (the list lets go when the pointer leaves it).
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            if *hovered && !uncommitted {
+                this.hover_graph_line(Some(lineage), cx);
+            }
+        }))
         .on_click(cx.listener(move |this, _event, _window, cx| this.select_entry(ix, cx)))
         .when(commit, |row| {
             row.on_mouse_down(
@@ -729,7 +798,7 @@ pub fn render_entry(
                     canvas(
                         |_, _, _| (),
                         move |bounds, _, window, _| {
-                            let lines = Lines { lineage, fork_line, off_lines: &off_lines, off_branch, highlight };
+                            let lines = Lines { lineage, fork_line, off_lines: &off_lines, off_branch, highlight: lines_focus, unpulled };
                             paint_lanes(bounds, &strokes, lane, &lines, dot, fold, plain, density, window)
                         },
                     )
@@ -802,6 +871,13 @@ pub fn render_entry(
                 // Every row is a commit and the graph says so; only a merge or a pull request earns a mark here.
                 .child(if kind == CommitKind::Commit { div().flex_none().w(px(14.)).into_any_element() } else { ui::kind_icon(kind).into_any_element() })
                 .children(badges)
+                .children(mark.map(|mark| {
+                    let (glyph, color, says) = match mark {
+                        Mark::Unpushed => ("↑", t().added, "not pushed yet"),
+                        Mark::Unpulled => ("↓", t().modified, "on the remote, not pulled yet"),
+                    };
+                    div().flex_none().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color)).debug_selector(move || format!("mark-{ix}-{says}")).child(glyph)
+                }))
                 .child(
                     div()
                         .min_w_0()
@@ -871,8 +947,10 @@ struct Lines<'a> {
     off_lines: &'a [usize],
     /// The commit itself is not part of it.
     off_branch: bool,
-    /// The selected commit's line.
+    /// The line the pointer is on, or the selected commit's.
     highlight: Option<usize>,
+    /// The commit is only on the remote: a hollow dot.
+    unpulled: bool,
 }
 
 /// `fold` is set for a commit that has commits listed under it: whether they are folded away.
@@ -888,7 +966,7 @@ fn paint_lanes(
     density: Density,
     window: &mut Window,
 ) {
-    let Lines { lineage, fork_line, off_lines, off_branch, highlight } = *lines;
+    let Lines { lineage, fork_line, off_lines, off_branch, highlight, unpulled } = *lines;
     let style = graph_style::active();
     let corner = graph_style::corner(density.row_h, density.lane_w);
     let dot_r = density.dot_r;
@@ -1015,6 +1093,9 @@ fn paint_lanes(
     match dot {
         // A commit's node, with its author's picture, is drawn over the lines by the row; a commit that
         // does not show one is a plain dot.
+        Dot::Filled | Dot::Current if plain && unpulled => {
+            circle(dot_r + 0.6, hollow, (density.line * style.weight + 0.4).max(1.5), color);
+        }
         Dot::Filled | Dot::Current if plain => match style.node {
             graph_style::Node::Dot => circle(dot_r, color, 0., color),
             // Hollow: the background shows through, in a line as thick as the lines.

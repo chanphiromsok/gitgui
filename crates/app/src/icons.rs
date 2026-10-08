@@ -200,6 +200,17 @@ pub fn remote(color: u32) -> Arc<RenderImage> {
     .unwrap_or_else(|| Arc::new(RenderImage::new(Vec::new())))
 }
 
+/// A small flag in `color`: a tag.
+pub fn flag(color: u32) -> Arc<RenderImage> {
+    let c = format!("#{color:06x}");
+    cached(format!("flag:{color:06x}"), || {
+        Some(format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.6 14.2V2" stroke="{c}" stroke-width="1.6" stroke-linecap="round" fill="none"/><path d="M4.2 2.6H13L10.7 5.9L13 9.2H4.2Z" fill="{c}"/></svg>"#
+        ))
+    })
+    .unwrap_or_else(|| Arc::new(RenderImage::new(Vec::new())))
+}
+
 /// The show/hide sidebar button: a window outline, its left panel filled in while the sidebar shows.
 pub fn sidebar(shown: bool) -> Option<Arc<RenderImage>> {
     let color = theme::t().muted;

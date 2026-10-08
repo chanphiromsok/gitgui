@@ -39,7 +39,7 @@ pub use diff::{DiffLine, FileDiff, Gap, Hunk, LineKind, Pair, REVEAL_STEP, Revea
 pub use people::{People, Person, people};
 pub use model::{Commit, CommitDetail, FileChange, FileStatus, Label, LabelKind, Ref, RefKind, labels};
 pub use squash::{BranchTip, Evidence, MergeClue, MergeScan, scan_inputs, subject_pr};
-pub use sync::{BranchSync, Upstream, default_remote, fetch_due, nothing_to_pull};
+pub use sync::{BranchSync, Divergence, Upstream, divergence, default_remote, fetch_due, nothing_to_pull};
 pub use worktree::WorkFile;
 pub use workflow::{Detected, MergeStyle, Shape, branch_name, detect, name_problem, slugify};
 pub use tree::{Layout, TreeRow, file_tree, flat_list, visible_rows};

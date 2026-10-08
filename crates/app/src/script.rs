@@ -12,7 +12,7 @@
 //! file 0                  open the commit's nth changed file
 //! mode split|unified      layout tree|flat      expand      back      more
 //! search <text>   fill the search box (author:… date:… words)      menu authors|dates X Y   open that chip's menu
-//! scope focus|current|local|all   which branches the graph shows      lanes   fold or unfold the lanes past the sixth      sync   show or hide sync merges      legend   the key to the marks
+//! scope focus|current|local|all   which branches the graph shows      lanes   fold or unfold the lanes past the sixth      sync   show or hide sync merges      isolate <branch>   pick that branch out of the graph (clear   put it back)      pointer <row>   as if the pointer were on that graph row      legend   the key to the marks
 //! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light      style <id>   graph style, e.g. style neon
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
@@ -125,6 +125,9 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         ),
         "lanes" => workspace.toggle_all_lanes(cx),
         "sync" => workspace.toggle_sync_merges(cx),
+        "isolate" => workspace.isolate_branch(rest, false, cx),
+        "clear" => workspace.clear_isolate(cx),
+        "pointer" => workspace.script_graph_hover(rest.parse().ok(), cx),
         "legend" => workspace.toggle_legend(cx),
         "hover" => workspace.script_hover(rest, cx),
         "newbranch" => {

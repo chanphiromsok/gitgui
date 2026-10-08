@@ -141,6 +141,25 @@ impl RepoView {
         names
     }
 
+    /// Which commits are only here and which only on the remote, for the branches that track one that moved apart
+    /// from them, and for the branch HEAD is on when it is not on a remote yet.
+    fn divergence(&self) -> gitgui_core::Divergence {
+        let tracked: Vec<(String, String)> = self
+            .upstreams
+            .iter()
+            .filter_map(|(branch, upstream)| match upstream {
+                Upstream::Tracking { name, ahead, behind, .. } if ahead + behind > 0 => Some((branch.clone(), name.clone())),
+                _ => None,
+            })
+            .collect();
+        let unpublished = self
+            .current_branch
+            .as_ref()
+            .map(|branch| branch.to_string())
+            .filter(|branch| !matches!(self.upstreams.get(branch), Some(Upstream::Tracking { .. })) && !self.remotes.is_empty());
+        gitgui_core::divergence(&self.commits, &tracked, unpublished.as_deref())
+    }
+
     /// Makes the rows again from the commits, narrowed by `filter`. `workflow_base` is the branch the project
     /// says new work starts from, if it says.
     fn rebuild(&mut self, settings: &Settings, collapsed: &HashSet<String>, filter: &GraphFilter, workflow_base: Option<&str>) {
@@ -165,22 +184,30 @@ impl RepoView {
         // `author:` and `date:` in the search limit the graph itself, joining what is left (see `narrow`).
         let constraints = self.with_every_identity(filter.parsed().0);
         let narrowed =
-            filter.scope != Scope::All || !hidden.is_empty() || filter.hide_stashes || !constraints.is_empty() || !folded_sync.is_empty();
+            filter.scope != Scope::All
+                || !hidden.is_empty()
+                || filter.hide_stashes
+                || !constraints.is_empty()
+                || !folded_sync.is_empty()
+                || filter.isolate.is_some();
         // Where the current branch stands against its base is counted over the whole history, not what is shown;
         // the Focus view also needs it to know which branch the base is.
-        let whole_base = narrowed.then(|| {
+        let whole = narrowed.then(|| {
             let none = HashSet::new();
             let options =
                 graph::Options { changed: 0, group: false, squashed: &squashed, collapsed: &none, web: None, people: None, sync: &sync };
-            graph::build_entries(&self.commits, &options).base
+            graph::build_entries(&self.commits, &options)
         });
+        let whole_base = whole.as_ref().map(|built| built.base.clone());
         let shown = if narrowed {
-            let focus = if filter.scope == Scope::Focus {
-                self.focus_names(workflow_base, whole_base.as_ref().and_then(Option::as_ref))
-            } else {
-                Vec::new()
+            let (scope, focus) = match (&filter.isolate, &whole) {
+                (Some(branch), Some(whole)) => (Scope::Only, graph::with_its_base(branch, whole, &self.remotes)),
+                _ if filter.scope == Scope::Focus => {
+                    (Scope::Focus, self.focus_names(workflow_base, whole_base.as_ref().and_then(Option::as_ref)))
+                }
+                _ => (filter.scope, Vec::new()),
             };
-            let base = filter_with_focus(&self.commits, filter.scope, &hidden, !filter.hide_stashes, &focus);
+            let base = filter_with_focus(&self.commits, scope, &hidden, !filter.hide_stashes, &focus);
             let base = gitgui_core::without_commits(&base, &folded_sync);
             if constraints.is_empty() { base } else { gitgui_core::narrow(&base, |commit| constraints.matches(commit)) }
         } else {
@@ -205,6 +232,8 @@ impl RepoView {
         self.shown = commits.len();
         self.entries = built.entries;
         graph::apply_clues(&mut self.entries, &self.clues, &self.tips, &merged_in);
+        let divergence = self.divergence();
+        graph::apply_divergence(&mut self.entries, &divergence);
         let density = graph::Density::from_settings(settings);
         self.graph_width = graph::graph_width(built.widest, density);
         // Counted as if they were all drawn: the button that unfolds them says how many there are either way.
@@ -281,6 +310,8 @@ pub struct GraphFilter {
     pub hide_stashes: bool,
     /// Show the merges that only bring a trunk into a branch; left out by default.
     pub show_sync: bool,
+    /// One branch picked out of the graph (by the name on its label), shown with the branch it was cut from.
+    pub isolate: Option<String>,
     /// The search box's text.
     pub search: String,
     /// Today, for `date:today` and `date:7d` in the search; set when the repository is read.
@@ -636,6 +667,8 @@ pub struct Workspace {
     pub busy: Option<SharedString>,
     /// The key to the graph's marks is open.
     pub legend_open: bool,
+    /// The branch line the pointer is on in the graph.
+    pub graph_hover: Option<usize>,
     /// How many folders are being looked at to be added as projects.
     opening: usize,
     loads: u64,
@@ -933,6 +966,7 @@ impl Workspace {
             dialog: None,
             busy: None,
             legend_open: false,
+            graph_hover: None,
             opening: 0,
             loads: 0,
             graph_scroll: UniformListScrollHandle::new(),
@@ -1765,10 +1799,16 @@ impl Workspace {
         if self.settings_open {
             return self.close_settings(cx);
         }
+        if self.legend_open {
+            return self.toggle_legend(cx);
+        }
         let Some(repo) = self.repo.as_mut() else { return };
         if repo.expanded {
             repo.expanded = false;
             cx.notify();
+        } else if repo.file.is_none() && repo.graph_filter.isolate.is_some() {
+            // Nothing open: the branch picked out of the graph goes back among the others.
+            self.clear_isolate(cx);
         } else {
             self.close_file(cx);
         }
@@ -2077,6 +2117,35 @@ impl Workspace {
 
     pub fn toggle_stashes(&mut self, cx: &mut Context<Self>) {
         self.change_filter(cx, |filter| filter.hide_stashes = !filter.hide_stashes);
+    }
+
+    /// Picks one branch out of the graph: it and the branch it was cut from, nothing else. `name` is what its label
+    /// says; a remote branch's is `origin/feat/x`, and it is the branch `feat/x` that is picked.
+    pub fn isolate_branch(&mut self, name: &str, remote: bool, cx: &mut Context<Self>) {
+        let branch = if remote { name.split_once('/').map_or(name, |(_, rest)| rest) } else { name }.to_owned();
+        self.change_filter(cx, |filter| filter.isolate = Some(branch));
+    }
+
+    /// Back to the view the filter bar says.
+    pub fn clear_isolate(&mut self, cx: &mut Context<Self>) {
+        self.change_filter(cx, |filter| filter.isolate = None);
+    }
+
+    /// The pointer is on a row of this branch line (or, with `None`, has left the graph): its line comes forward.
+    pub fn hover_graph_line(&mut self, line: Option<usize>, cx: &mut Context<Self>) {
+        if self.graph_hover != line {
+            self.graph_hover = line;
+            cx.notify();
+        }
+    }
+
+    /// For the screenshot script: the pointer is on graph row `row` (none: it has left).
+    pub fn script_graph_hover(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        let line = row.and_then(|row| match self.repo.as_ref().map(|repo| &repo.phase) {
+            Some(Phase::Ready(view)) => view.entries.get(row).map(|entry| entry.row.lineage),
+            _ => None,
+        });
+        self.hover_graph_line(line, cx);
     }
 
     pub fn toggle_sync_merges(&mut self, cx: &mut Context<Self>) {
@@ -2964,6 +3033,11 @@ impl Workspace {
             .border_b_1()
             .border_color(rgb(t().border))
             .child(scopes)
+            .children(filter.isolate.clone().map(|branch| {
+                ui::toggle("isolated", format!("Only {branch} ✕"), true)
+                    .debug_selector(|| "isolated".to_owned())
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_isolate(cx)))
+            }))
             .child(hide_merged)
             .child(stashes)
             .children((view.sync_count > 0).then(|| {
@@ -3043,6 +3117,21 @@ impl Workspace {
                 "The branch's commits are part of another branch. \"already in\" means no merge commit brought them: it was fast-forwarded.",
             ))
             .child(entry(
+                div().text_color(rgb(t().added)).font_weight(FontWeight::BOLD).child("↑").into_any_element(),
+                "Not pushed yet",
+                "A commit only here. A push would send it.",
+            ))
+            .child(entry(
+                div().text_color(rgb(t().modified)).font_weight(FontWeight::BOLD).child("↓").into_any_element(),
+                "Not pulled yet",
+                "A commit only on the remote, drawn as a hollow dot. As of the last fetch.",
+            ))
+            .child(entry(
+                gpui::img(crate::icons::flag(t().muted)).size(px(11.)).into_any_element(),
+                "Tag",
+                "A release or version mark on a commit.",
+            ))
+            .child(entry(
                 div().text_color(rgb(t().muted)).child("+N").into_any_element(),
                 "Folded lanes",
                 "More lines than fit beside the messages are drawn as one gray lane. Press +N above the graph to open them.",
@@ -3119,10 +3208,17 @@ impl Workspace {
         });
 
         div()
+            .id("graph")
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
+            // The line the pointer was on goes back when the pointer leaves the list.
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.hover_graph_line(None, cx);
+                }
+            }))
             .child(graph::columns(width, cols, lanes_button))
             .child(
                 uniform_list(
@@ -3165,6 +3261,7 @@ impl Workspace {
                                     view.graph_width,
                                     selected == Some(ix),
                                     highlight,
+                                    this.graph_hover,
                                     cols,
                                     faces,
                                     density,

@@ -4,9 +4,11 @@
 //! The counts are as of the last fetch: git compares with the remote-tracking branches it has, not with the
 //! remote itself, so nothing here touches the network.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::backend::{Error, GitCli};
+use crate::model::{Commit, RefKind};
 
 /// Where a local branch stands against its upstream, the remote branch it pushes to and pulls from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +39,67 @@ impl Upstream {
     pub fn behind(&self) -> usize {
         if let Upstream::Tracking { behind, .. } = self { *behind } else { 0 }
     }
+}
+
+/// Which commits are only here and which only there, for the branches that track a remote one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Divergence {
+    /// Commits a push would send: on a local branch and not on its upstream.
+    pub unpushed: HashSet<String>,
+    /// Commits a pull would bring: on an upstream and not on its local branch.
+    pub unpulled: HashSet<String>,
+}
+
+/// Every commit among `by_id` that `start` can reach, itself included.
+fn reach<'a>(start: &str, by_id: &HashMap<&'a str, &'a Commit>) -> HashSet<&'a str> {
+    let mut seen = HashSet::new();
+    let mut todo = vec![start];
+    while let Some(id) = todo.pop() {
+        let Some(commit) = by_id.get(id) else { continue };
+        if seen.insert(commit.id.as_str()) {
+            todo.extend(commit.parents.iter().map(String::as_str));
+        }
+    }
+    seen
+}
+
+/// The commits that differ between each local branch and the remote one it tracks, among `commits` (as of the last
+/// fetch). `tracked` is `(branch, upstream)` by the names the refs have (`feat/x`, `origin/feat/x`); only branches that
+/// have moved apart need to be given. `unpublished` is the branch HEAD is on when it tracks nothing: its commits that
+/// no remote branch has are unpushed too, so a branch not on a remote yet shows what a first push would send.
+pub fn divergence(commits: &[Commit], tracked: &[(String, String)], unpublished: Option<&str>) -> Divergence {
+    let by_id: HashMap<&str, &Commit> = commits.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut tips: HashMap<&str, &str> = HashMap::new();
+    for commit in commits {
+        for r in &commit.refs {
+            if matches!(r.kind, RefKind::LocalBranch | RefKind::RemoteBranch) {
+                tips.insert(r.name.as_str(), commit.id.as_str());
+            }
+        }
+    }
+    let mut found = Divergence::default();
+    for (branch, upstream) in tracked {
+        let (Some(local), Some(remote)) = (tips.get(branch.as_str()), tips.get(upstream.as_str())) else { continue };
+        if local == remote {
+            continue;
+        }
+        let (here, there) = (reach(local, &by_id), reach(remote, &by_id));
+        found.unpushed.extend(here.difference(&there).map(|id| (*id).to_owned()));
+        found.unpulled.extend(there.difference(&here).map(|id| (*id).to_owned()));
+    }
+    if let Some(head) = unpublished.and_then(|branch| tips.get(branch)) {
+        let mut on_remote: HashSet<&str> = HashSet::new();
+        for commit in commits {
+            if commit.refs.iter().any(|r| r.kind == RefKind::RemoteBranch) {
+                on_remote.extend(reach(&commit.id, &by_id));
+            }
+        }
+        // Only when some remote branch exists at all: with none, every commit would be "unpushed" and say nothing.
+        if !on_remote.is_empty() {
+            found.unpushed.extend(reach(head, &by_id).difference(&on_remote).map(|id| (*id).to_owned()));
+        }
+    }
+    found
 }
 
 /// One local branch and its upstream.
@@ -136,6 +199,55 @@ impl GitCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn commit(id: &str, parents: &[&str], refs: &[(&str, RefKind)]) -> Commit {
+        Commit {
+            id: id.into(),
+            parents: parents.iter().map(|p| (*p).into()).collect(),
+            author: String::new(),
+            email: String::new(),
+            time: 0,
+            date: String::new(),
+            summary: String::new(),
+            refs: refs.iter().map(|(name, kind)| crate::model::Ref { name: (*name).into(), kind: *kind }).collect(),
+            stash: None,
+            committer: String::new(),
+            committer_email: String::new(),
+        }
+    }
+
+    /// feat: l2 -> l1 -> b; origin/feat: r1 -> b (one commit each side).
+    fn diverged() -> Vec<Commit> {
+        vec![
+            commit("l2", &["l1"], &[("feat", RefKind::LocalBranch)]),
+            commit("r1", &["b"], &[("origin/feat", RefKind::RemoteBranch)]),
+            commit("l1", &["b"], &[]),
+            commit("b", &[], &[]),
+        ]
+    }
+
+    #[test]
+    fn each_side_of_a_diverged_branch_has_its_own_commits() {
+        let found = divergence(&diverged(), &[("feat".into(), "origin/feat".into())], None);
+        assert_eq!(found.unpushed, HashSet::from(["l2".to_owned(), "l1".to_owned()]));
+        assert_eq!(found.unpulled, HashSet::from(["r1".to_owned()]));
+    }
+
+    #[test]
+    fn a_branch_not_on_a_remote_yet_shows_what_a_first_push_would_send() {
+        let mut commits = diverged();
+        commits[1].refs = vec![crate::model::Ref { name: "origin/main".into(), kind: RefKind::RemoteBranch }];
+        // feat tracks nothing; origin/main is at r1, so r1 and b are on a remote and l2 and l1 are not.
+        let found = divergence(&commits, &[], Some("feat"));
+        assert_eq!(found.unpushed, HashSet::from(["l2".to_owned(), "l1".to_owned()]));
+        assert!(found.unpulled.is_empty());
+    }
+
+    #[test]
+    fn with_no_remote_branch_at_all_nothing_is_unpushed() {
+        let commits = vec![commit("c2", &["c1"], &[("main", RefKind::LocalBranch)]), commit("c1", &[], &[])];
+        assert_eq!(divergence(&commits, &[], Some("main")), Divergence::default());
+    }
 
     fn tracking(name: &str, ahead: usize, behind: usize) -> Upstream {
         Upstream::Tracking { name: name.into(), remote: "origin".into(), ahead, behind }

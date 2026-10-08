@@ -21,6 +21,9 @@ pub enum Scope {
     Local,
     /// Only the history of the commit HEAD is on.
     Current,
+    /// Only the branches named in the focus, whether or not HEAD is on one: one branch picked out of the graph
+    /// with the branch it was cut from. Not a choice of the filter bar; the graph asks for it.
+    Only,
 }
 
 /// What a search box query asks for.
@@ -123,6 +126,7 @@ pub fn filter_with_focus(commits: &[Commit], scope: Scope, hidden: &HashSet<Stri
     let is_tip = |commit: &Commit| {
         commit.refs.iter().any(|r| match scope {
             Scope::Focus => r.kind == RefKind::Head || in_focus(r),
+            Scope::Only => in_focus(r),
             Scope::All => r.kind != RefKind::Stash,
             Scope::Local => matches!(r.kind, RefKind::LocalBranch | RefKind::Head),
             Scope::Current => r.kind == RefKind::Head,
