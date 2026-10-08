@@ -1,0 +1,23 @@
+size 1000x640
+open @DEMO@
+wait 9000
+sidebar
+style neon
+wait 600
+shot s_neon
+style soft
+wait 600
+shot s_soft
+style circuit
+wait 600
+shot s_circuit
+style graphite
+wait 600
+shot s_graphite
+style tokyo
+wait 600
+shot s_tokyo
+style gruvbox
+wait 600
+shot s_gruvbox
+quit

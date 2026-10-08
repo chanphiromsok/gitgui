@@ -1,0 +1,20 @@
+size 1280x800
+open @DEMO@
+wait 9000
+shot hero
+select weekly driver summary
+wait 2000
+file 0
+wait 2000
+hover week: string
+wait 3500
+shot review
+theme One Light
+wait 1200
+shot light
+theme gitgui Dark
+wait 800
+newbranch feature 101 Driver reporting v2
+wait 1000
+shot wizard
+quit
