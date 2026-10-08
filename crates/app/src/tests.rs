@@ -611,8 +611,7 @@ async fn a_squash_merged_branch_is_noted_and_goes_under_its_squash_commit(cx: &m
     let fx = squashed_pr("squash-ui");
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     open_project(&ws, cx, &fx.repo()); // the scan finishes in the background too
-    // The squashed branch is not HEAD's, nor its base: the default view leaves it out, All shows it.
-    ws.update(cx, |ws, cx| ws.set_scope(gitgui_core::Scope::All, cx));
+    // The default view shows every branch, so the squashed one is there.
     draw(cx, &ws);
 
     // The branch's commits are nested under the commit that carries them.
@@ -1103,7 +1102,9 @@ async fn the_filter_bar_narrows_the_graph_and_the_search_finds_commits(cx: &mut 
 
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     open_project(&ws, cx, &fx.repo());
-    // The default view is the branch, the one it was cut from, and their remote copies: not the other branch.
+    // The default view is every branch; Branch + base is the branch, the one it was cut from, and their remote copies.
+    assert_eq!(summaries(&ws, cx), ["feat work", "other work", "change", "base"]);
+    ws.update(cx, |ws, cx| ws.set_scope(Scope::Focus, cx));
     assert_eq!(summaries(&ws, cx), ["feat work", "change", "base"]);
     ws.update(cx, |ws, cx| ws.set_scope(Scope::All, cx));
     assert_eq!(summaries(&ws, cx), ["feat work", "other work", "change", "base"]);
@@ -3573,7 +3574,11 @@ async fn commits_only_here_or_only_on_the_remote_are_marked_and_a_label_click_is
     assert!(found.contains(&("mine".into(), Some(Mark::Unpushed))), "{found:?}");
     assert!(found.contains(&("theirs".into(), Some(Mark::Unpulled))), "{found:?}");
     assert!(found.contains(&("base".into(), None)), "{found:?}");
-    assert!(!found.iter().any(|(summary, _)| summary == "side work"), "the default view leaves the other branch out: {found:?}");
+    assert!(found.iter().any(|(summary, _)| summary == "side work"), "the default view shows every branch: {found:?}");
+    // Branch + base leaves the other branch out.
+    ws.update(cx, |ws, cx| ws.set_scope(gitgui_core::Scope::Focus, cx));
+    assert!(!marks(&ws, cx).iter().any(|(summary, _)| summary == "side work"));
+    ws.update(cx, |ws, cx| ws.set_scope(gitgui_core::Scope::All, cx));
     draw(cx, &ws);
 
     // Pointing at a row brings its line forward, and leaving puts it back.

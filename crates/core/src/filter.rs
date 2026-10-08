@@ -13,9 +13,9 @@ use crate::model::{Commit, RefKind};
 pub enum Scope {
     /// The branch HEAD is on, the branch it was cut from, and their remote copies: where the work stands
     /// against the trunk and the remote, without the other branches around it.
-    #[default]
     Focus,
     /// Every branch, remote ones included, with tags and stashes.
+    #[default]
     All,
     /// Local branches, and the remote copies that point where they do.
     Local,
