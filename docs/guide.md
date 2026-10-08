@@ -47,7 +47,7 @@ This writes `dist/gitgui.app` and `dist/gitgui-<version>-macos-<arch>.dmg`. Drag
 cargo run -p gitgui-app --example app_icon -- /tmp/AppIcon.iconset && iconutil -c icns /tmp/AppIcon.iconset -o crates/app/assets/app-icon/AppIcon.icns
 ```
 
-**Signing.** The script signs ad hoc, which is enough to run on the Mac that built it. On another Mac, Gatekeeper blocks it: right-click the app and choose Open once, or run `xattr -dr com.apple.quarantine gitgui.app`.
+**Signing.** The script signs ad hoc, which is enough to run on the Mac that built it. On another Mac, Gatekeeper blocks a downloaded copy (notarizing needs a paid Apple account). Run `xattr -dr com.apple.quarantine gitgui.app` once; or on macOS 15 and newer open it, press Done, and use System Settings → Privacy & Security → Open Anyway; or on macOS 14 and older right-click the app and choose Open. A copy fetched with `curl` carries no quarantine mark, so it opens without any of this.
 To distribute properly you need an Apple Developer ID: sign with `codesign --force --deep --options runtime --sign "Developer ID Application: NAME (TEAMID)" dist/gitgui.app`, then notarize with `xcrun notarytool submit dist/gitgui-<version>-macos-<arch>.dmg --keychain-profile PROFILE --wait` and `xcrun stapler staple dist/gitgui-<version>-macos-<arch>.dmg`.
 
 ## Publishing a release on GitHub
