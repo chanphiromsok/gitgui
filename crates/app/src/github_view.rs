@@ -39,6 +39,17 @@ fn failure_text(error: &Error, owner: &str, name: &str) -> String {
     }
 }
 
+/// The same, for the middle of the window, where there is room to say what to do about it.
+fn failure_detail(error: &Error, owner: &str, name: &str) -> String {
+    match error {
+        Error::NoAccess => format!(
+            "gitgui can't see {owner}/{name} yet. Signing in only says who you are: the GitHub app also has to be installed on \
+             {owner}, with this repository chosen. If {owner} is an organization, one of its owners has to approve it."
+        ),
+        other => other.to_string(),
+    }
+}
+
 impl Workspace {
     fn now(&self) -> u64 {
         forge::now()
@@ -73,7 +84,7 @@ impl Workspace {
 
         if !self.github.signed_in() {
             section = section.child(quiet("Sign in to see this repository's pull requests and issues.".to_owned())).child(
-                div().pl(px(14.)).child(
+                div().pl(px(14.)).flex().child(
                     ghost("github-side-sign-in", "Sign in with GitHub")
                         .debug_selector(|| "github-side-sign-in".to_owned())
                         .on_click(cx.listener(|this, _, _, cx| this.github_sign_in(cx))),
@@ -85,7 +96,7 @@ impl Workspace {
             None | Some(Lists::Loading) => section = section.child(quiet("Reading GitHub…".to_owned())),
             Some(Lists::Failed(error)) => {
                 section = section.child(quiet(failure_text(error, &owner, &name))).child(
-                    div().pl(px(14.)).child(match error {
+                    div().pl(px(14.)).flex().child(match error {
                         Error::NoAccess => ghost("github-side-install", "Install on GitHub")
                             .debug_selector(|| "github-side-install".to_owned())
                             .on_click(cx.listener(|this, _, _, cx| this.github_open_url(&forge::install_url(), cx)))
@@ -265,7 +276,7 @@ impl Workspace {
                         .flex_col()
                         .items_center()
                         .gap_3()
-                        .child(div().text_center().text_color(rgb(t().muted)).child(failure_text(error, &owner, &name)))
+                        .child(div().text_center().text_color(rgb(t().muted)).child(failure_detail(error, &owner, &name)))
                         .child(action)
                         .into_any_element(),
                 );
