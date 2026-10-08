@@ -18,6 +18,10 @@
 //! hover <text>   rest the pointer on the first diff line whose text has the text (nopeek-style: `hover` alone leaves)
 //! settings [graph|style|files|appearance|projects]
 //! fetch | pull | push     the header's buttons (pull and push open their question)      autofetch 5   fetch on its own every 5 min
+//! merge <branch> | rebase <onto> | cherrypick <text>   open that question (with its test merge)      confirm   answer yes
+//! conflict [n|text]   open the nth file with conflicts (or the first whose path has the text) in the resolver
+//! choose <n> current|incoming|both|both2|base|none   a choice for conflict n      key 1 n 2 …   the resolver's keys
+//! safe   resolve the safe ones      useresult      continue   the bar's Continue      base   show or hide the base
 //! shot name               save <folder>/name.png
 //! quit
 //! ```
@@ -148,6 +152,57 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
                 workspace.open_menu(gpui::point(px(x), px(y)), target, cx);
             }
         }
+        "merge" => workspace.choose(crate::menu::Action::Merge(rest.to_owned()), window, cx),
+        "rebase" => workspace.choose(crate::menu::Action::Rebase(rest.to_owned()), window, cx),
+        "cherrypick" => {
+            let found = match workspace.repo.as_ref().map(|repo| &repo.phase) {
+                Some(Phase::Ready(view)) => view.entries.iter().find(|e| e.commit.is_some() && e.summary.contains(rest)).and_then(|e| e.commit.clone()),
+                _ => None,
+            };
+            match found {
+                Some(id) => workspace.choose(crate::menu::Action::CherryPick(id), window, cx),
+                None => eprintln!("gitgui: no commit matches {rest:?}"),
+            }
+        }
+        "confirm" => workspace.confirm_dialog(cx),
+        // conflict alone: the bar's "Resolve next file".
+        "conflict" if rest.is_empty() => workspace.open_first_conflict(cx),
+        "conflict" => {
+            let found = workspace.repo.as_ref().and_then(|repo| {
+                let conflicted = repo.work.iter().enumerate().filter(|(_, f)| f.conflicted);
+                match rest.parse::<usize>() {
+                    Ok(n) => conflicted.map(|(i, _)| i).nth(n),
+                    Err(_) => conflicted.filter(|(_, f)| f.change.path.contains(rest)).map(|(i, _)| i).next(),
+                }
+            });
+            match found {
+                Some(index) => workspace.open_work_file(index, cx),
+                None => eprintln!("gitgui: no file with conflicts matches {rest:?}"),
+            }
+        }
+        "choose" => {
+            let (block, which) = rest.split_once(' ').unwrap_or((rest, ""));
+            let choice = match which {
+                "current" => Some(gitgui_core::Resolution::Current),
+                "incoming" => Some(gitgui_core::Resolution::Incoming),
+                "both" => Some(gitgui_core::Resolution::CurrentThenIncoming),
+                "both2" => Some(gitgui_core::Resolution::IncomingThenCurrent),
+                "base" => Some(gitgui_core::Resolution::Base),
+                _ => None,
+            };
+            workspace.choose_block(block.parse().unwrap_or(0), choice, false, cx);
+        }
+        "key" => {
+            for key in rest.split_whitespace() {
+                if let Ok(keystroke) = gpui::Keystroke::parse(key) {
+                    workspace.resolver_key(&gpui::KeyDownEvent { keystroke, is_held: false }, window, cx);
+                }
+            }
+        }
+        "safe" => workspace.resolve_safe(cx),
+        "useresult" => workspace.use_result(cx),
+        "continue" => workspace.continue_operation(cx),
+        "base" => workspace.toggle_conflict_base(cx),
         "sidebar" => workspace.toggle_sidebar(cx),
         "graph" => workspace.toggle_graph_hidden(cx),
         "files" => workspace.toggle_files_visible(cx),

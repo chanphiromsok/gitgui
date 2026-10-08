@@ -54,6 +54,9 @@ impl Workspace {
     }
 
     pub fn render_diff(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.resolver().is_some() {
+            return self.render_resolver(cx);
+        }
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Some(file) = repo.file.as_ref() else { return div().into_any_element() };
         let Some(view) = self.commit_view() else { return div().into_any_element() };

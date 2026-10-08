@@ -3,10 +3,16 @@
 //!
 //! Anything that changes history or touches a remote asks first, in words that say what will happen.
 //! The work runs off the UI thread; when it ends the repository is read again and the result is shown
-//! in the banner at the bottom: what was done, why git refused, or (for a merge, rebase or cherry-pick
-//! that hit conflicts) a button that puts everything back.
+//! in the banner at the bottom: what was done or why git refused. A merge, rebase or cherry-pick that hits
+//! conflicts opens its first file in the resolver, and the bar over the main area finishes or aborts it.
+//!
+//! The question before a merge, rebase, pull or cherry-pick also says what a test merge found (`git merge-tree`,
+//! which touches nothing): whether it would conflict, and in which files. It is read in the background, and the
+//! question works the same without it.
 
-use gitgui_core::{CheckoutTarget, Error, Evidence, GitCli, Label, LabelKind, Operation, Outcome, Upstream, default_remote, nothing_to_pull};
+use gitgui_core::{
+    CheckoutTarget, Error, Evidence, GitCli, Label, LabelKind, Operation, Outcome, Preflight, Upstream, default_remote, nothing_to_pull,
+};
 use gpui::{
     AnyElement, ClipboardItem, Context, FontWeight, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px,
     rgb, rgba,
@@ -60,6 +66,21 @@ pub enum Action {
     Copy { text: String, what: &'static str },
     /// Open a page (a pull request, a commit) in the browser.
     OpenUrl(String),
+    /// Give up the merge, rebase or cherry-pick in progress (the bar's Abort).
+    AbortOperation(Operation),
+    /// Leave out the commit a rebase or cherry-pick stopped on.
+    SkipCommit(Operation),
+    /// Put a conflicted file back as git made the conflict, over what is in it now.
+    StartOver(String),
+    /// Resolve a conflicted file by deleting it.
+    DeleteConflicted(String),
+}
+
+/// What the test merge behind a question has found so far.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Check {
+    Running,
+    Found(Preflight),
 }
 
 pub struct MenuState {
@@ -86,14 +107,14 @@ pub struct Dialog {
     pub prompt: Option<String>,
     /// A folder shown under the text field, with a button to change it (where a clone goes).
     pub folder: Option<std::path::PathBuf>,
+    /// What a test merge says about it, for a merge, rebase, pull or cherry-pick; none when git cannot say.
+    pub check: Option<Check>,
     pub action: Action,
 }
 
 /// What the banner's button does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NoticeAction {
-    /// Give up a merge, rebase or cherry-pick that stopped on conflicts.
-    Abort(Operation),
     /// Delete a branch git says is not merged, now that the user has seen that.
     ForceDelete(String),
 }
@@ -331,7 +352,7 @@ impl Workspace {
 
     // ---- the questions ------------------------------------------------------------------------
 
-    fn open_dialog(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_dialog(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.current_branch_name().unwrap_or_else(|| "the current branch".to_owned());
         let (title, body, confirm, danger, prompt): (String, String, &str, bool, Option<String>) = match &action {
             Action::DeleteBranch(name) => {
@@ -359,7 +380,7 @@ impl Workspace {
                 format!("Merge {branch} into {current}?"),
                 format!(
                     "Brings the commits of `{branch}` into `{current}`: a merge commit, or a fast-forward when possible. \
-                     If there are conflicts the merge stops and you can abort it to put everything back."
+                     If there are conflicts the merge stops: resolve them here, or abort to put everything back."
                 ),
                 "Merge",
                 false,
@@ -370,7 +391,7 @@ impl Workspace {
                 format!(
                     "Replays the commits of `{current}` on top of `{onto}`, which rewrites them. If `{current}` is already pushed, \
                      pushing it again would need a force-push, and this app never force-pushes. \
-                     If there are conflicts you can abort and nothing changes."
+                     If there are conflicts it stops at each commit that has them: resolve them here, or abort and nothing changes."
                 ),
                 "Rebase",
                 true,
@@ -389,7 +410,7 @@ impl Workspace {
                         "{}Fetches the upstream of `{current}` and replays the commits that are only on your side on top of it \
                          (`git pull --rebase`), so history stays a straight line with no merge commit. Your unpushed commits are \
                          rewritten, which is safe because they are not shared yet. Nothing is forced. If there are conflicts it \
-                         stops and you can abort to put everything back. Git refuses if you have uncommitted changes.",
+                         stops: resolve them here, or abort to put everything back. Git refuses if you have uncommitted changes.",
                         pull_lead(&current, &upstream)
                     ),
                     "Pull",
@@ -403,7 +424,7 @@ impl Workspace {
                     format!("Cherry-pick onto {current}?"),
                     format!(
                         "Applies the changes of {} `{summary}` as a new commit on `{current}`. \
-                         If there are conflicts it stops and you can abort.",
+                         If there are conflicts it stops: resolve them here, or abort.",
                         id.chars().take(7).collect::<String>()
                     ),
                     "Cherry-pick",
@@ -432,6 +453,55 @@ impl Workspace {
                 false,
                 Some(String::new()),
             ),
+            Action::AbortOperation(operation) => {
+                let word = operation.name();
+                (
+                    format!("Abort the {word}?"),
+                    format!(
+                        "Puts the repository back exactly as it was before the {word} started. Whatever you resolved so far is thrown \
+                         away; the {word} can be started again."
+                    ),
+                    match operation {
+                        Operation::Merge => "Abort Merge",
+                        Operation::Rebase => "Abort Rebase",
+                        Operation::CherryPick => "Abort Cherry-pick",
+                    },
+                    true,
+                    None,
+                )
+            }
+            Action::SkipCommit(operation) => {
+                let commit = self.side_names().1.title;
+                (
+                    "Skip this commit?".to_owned(),
+                    format!(
+                        "Leaves {commit} out of the {}, with anything you resolved in it, and goes on. Its changes stay in its \
+                         original commit; nothing else is lost.",
+                        operation.name()
+                    ),
+                    "Skip Commit",
+                    true,
+                    None,
+                )
+            }
+            Action::StartOver(path) => (
+                format!("Start over with {}?", path.rsplit('/').next().unwrap_or(path)),
+                "Puts back the conflict as git made it, with what both sides started from in each block, over what is in the file \
+                 now. Edits made to it since are replaced."
+                    .to_owned(),
+                "Start Over",
+                true,
+                None,
+            ),
+            Action::DeleteConflicted(path) => (
+                format!("Delete {}?", path.rsplit('/').next().unwrap_or(path)),
+                "Resolves the conflict by deleting the file, here and in the next commit. Its versions stay in the history of each \
+                 side."
+                    .to_owned(),
+                "Delete File",
+                true,
+                None,
+            ),
             Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => return,
         };
         if let Some(initial) = &prompt {
@@ -441,8 +511,38 @@ impl Workspace {
                 input.focus(window);
             });
         }
-        self.dialog = Some(Dialog { title: title.into(), body: body.into(), confirm: confirm.into(), danger, prompt, folder: None, action });
+        let check = matches!(action, Action::Merge(_) | Action::Rebase(_) | Action::PullRebase | Action::CherryPick(_)).then_some(Check::Running);
+        if check.is_some() {
+            self.start_check(action.clone(), cx);
+        }
+        self.dialog = Some(Dialog { title: title.into(), body: body.into(), confirm: confirm.into(), danger, prompt, folder: None, check, action });
         cx.notify();
+    }
+
+    /// Runs the test merge for the question about `action` in the background; its answer is shown if the question is
+    /// still open, and the line goes away when git cannot say.
+    fn start_check(&mut self, action: Action, cx: &mut Context<Self>) {
+        let Some(path) = self.repo.as_ref().map(|repo| repo.project.path.clone()) else { return };
+        let asked = action.clone();
+        self.spawn_load(
+            cx,
+            move || {
+                let git = GitCli::new(path);
+                match &asked {
+                    Action::Merge(branch) => git.preflight_merge(branch),
+                    Action::Rebase(onto) => git.preflight_rebase(onto),
+                    Action::PullRebase => git.preflight_pull(),
+                    Action::CherryPick(id) => git.preflight_cherry_pick(id),
+                    _ => None,
+                }
+            },
+            move |this, found, cx| {
+                if let Some(dialog) = this.dialog.as_mut().filter(|dialog| dialog.action == action) {
+                    dialog.check = found.map(Check::Found);
+                    cx.notify();
+                }
+            },
+        );
     }
 
     pub fn cancel_dialog(&mut self, cx: &mut Context<Self>) {
@@ -503,6 +603,22 @@ impl Workspace {
                 let shown = short(&at);
                 self.run(format!("Tagging {shown}…"), format!("Tagged {shown} as {typed}."), None, move |git| git.create_tag(&typed, &at).map(Outcome::Done), cx);
             }
+            Action::AbortOperation(operation) => self.run(
+                format!("Aborting the {}…", operation.name()),
+                format!("Aborted the {}. Everything is as it was.", operation.name()),
+                None,
+                move |git| git.abort(operation).map(Outcome::Done),
+                cx,
+            ),
+            Action::SkipCommit(operation) => self.run(
+                "Skipping the commit…".to_owned(),
+                format!("Skipped the commit and finished the {}.", operation.name()),
+                None,
+                move |git| git.skip_commit(operation),
+                cx,
+            ),
+            Action::StartOver(path) => self.restart_conflict(path, cx),
+            Action::DeleteConflicted(path) => self.delete_conflicted(path, cx),
             Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => {}
             Action::Clone => {
                 let folder = dialog.folder.unwrap_or_else(|| self.clone_folder());
@@ -559,6 +675,7 @@ impl Workspace {
             danger: false,
             prompt: Some(pasted),
             folder: Some(self.clone_folder()),
+            check: None,
             action: Action::Clone,
         });
         cx.notify();
@@ -649,19 +766,18 @@ impl Workspace {
                 this.busy = None;
                 this.notice = Some(match result {
                     Ok(Outcome::Done(_)) => Notice::info(done),
-                    Ok(Outcome::Conflicts { operation, files }) => Notice {
-                        text: format!(
-                            "The {} stopped: {files} file{} ha{} conflicts. Resolve them in your editor and finish the {} there, \
-                             or abort to put everything back as it was.",
+                    Ok(Outcome::Conflicts { operation, files }) => {
+                        // The first file opens in the resolver once the repository has been read again.
+                        this.open_next_conflict = true;
+                        Notice::warn(format!(
+                            "The {} stopped: {files} file{} ha{} conflicts. Choose what to keep in each, then Continue {}; or abort \
+                             to put everything back.",
                             operation.name(),
                             if files == 1 { "" } else { "s" },
                             if files == 1 { "s" } else { "ve" },
                             operation.name()
-                        )
-                        .into(),
-                        warn: true,
-                        action: Some((format!("Abort {}", operation.name()).into(), NoticeAction::Abort(operation))),
-                    },
+                        ))
+                    }
                     Err(error) => {
                         let text = explain(&error);
                         let force = if_unmerged.filter(|_| text.contains("not fully merged"));
@@ -703,13 +819,6 @@ impl Workspace {
             return;
         }
         match action {
-            NoticeAction::Abort(operation) => self.run(
-                format!("Aborting the {}…", operation.name()),
-                format!("Aborted the {}. Everything is as it was.", operation.name()),
-                None,
-                move |git| git.abort(operation).map(Outcome::Done),
-                cx,
-            ),
             NoticeAction::ForceDelete(name) => self.run(
                 format!("Deleting {name}…"),
                 format!("Deleted {name}."),
@@ -829,6 +938,19 @@ impl Workspace {
                 .gap_3()
                 .child(div().text_base().font_weight(FontWeight::BOLD).text_color(rgb(t().text_strong)).child(dialog.title.clone()))
                 .child(div().text_color(rgb(t().text)).child(dialog.body.clone()))
+                .when_some(dialog.check.as_ref().map(|check| check_line(&dialog.action, check)), |panel, (text, tone)| {
+                    panel.child(
+                        div()
+                            .debug_selector(|| "dialog-check".to_owned())
+                            .px_2()
+                            .py_1p5()
+                            .rounded_md()
+                            .bg(rgb(crate::theme::mix(t().panel, tone, 0.12)))
+                            .text_xs()
+                            .text_color(rgb(if tone == t().muted { t().muted } else { t().text_strong }))
+                            .child(text),
+                    )
+                })
                 .when(dialog.prompt.is_some(), |panel| panel.child(self.dialog_input.clone()))
                 // A branch name that is not how this team names them, said while it is typed.
                 .when_some(
@@ -923,6 +1045,38 @@ fn pull_lead(branch: &str, upstream: &Upstream) -> String {
             format!("`{name}` has {} that `{branch}` does not, and your {} go on top of them. ", commits(*behind), commits(*ahead))
         }
         Upstream::None | Upstream::Gone { .. } => String::new(),
+    }
+}
+
+/// What the question says about its test merge, and the color to say it in. A merge and a cherry-pick are tested as
+/// git will run them, so their answer is certain; a rebase or pull replays commits one by one, so the test of the two
+/// tips is only a hint, and says so.
+pub(crate) fn check_line(action: &Action, check: &Check) -> (String, u32) {
+    let files = |paths: &[String]| {
+        let named: Vec<&str> = paths.iter().take(3).map(|p| p.rsplit('/').next().unwrap_or(p)).collect();
+        let more = paths.len().saturating_sub(3);
+        let list = named.join(", ");
+        let count = if paths.len() == 1 { "1 file".to_owned() } else { format!("{} files", paths.len()) };
+        if more > 0 { format!("{count}: {list} and {more} more") } else { format!("{count}: {list}") }
+    };
+    let exact = matches!(action, Action::Merge(_) | Action::CherryPick(_));
+    let lead = if *action == Action::PullRebase { "As of the last fetch, a" } else { "A" };
+    match check {
+        Check::Running => ("Checking for conflicts with a test merge…".to_owned(), t().muted),
+        Check::Found(Preflight::Clean) if exact => (
+            format!("✓ {} cleanly: a test merge found no conflicts.", if matches!(action, Action::Merge(_)) { "Merges" } else { "Applies" }),
+            t().added,
+        ),
+        Check::Found(Preflight::Clean) => (
+            format!("{lead} test merge of the two tips is clean, so this will probably go through; replaying commit by commit can still stop."),
+            t().added,
+        ),
+        Check::Found(Preflight::Conflicts(paths)) if exact => {
+            (format!("Would conflict in {}. You can resolve them here, file by file.", files(paths)), t().warning)
+        }
+        Check::Found(Preflight::Conflicts(paths)) => {
+            (format!("May conflict in {} ({} test merge of the two tips conflicts there).", files(paths), lead.to_lowercase()), t().warning)
+        }
     }
 }
 

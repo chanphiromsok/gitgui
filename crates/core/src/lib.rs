@@ -2,6 +2,7 @@ pub mod actions;
 pub mod blame;
 pub mod backend;
 pub mod clone;
+pub mod conflict;
 pub mod diff;
 pub mod filter;
 pub mod graph;
@@ -16,8 +17,12 @@ pub mod tree;
 pub mod workflow;
 pub mod worktree;
 
-pub use actions::{CheckoutTarget, Operation, Outcome};
+pub use actions::{CheckoutTarget, Operation, OperationState, Outcome, Preflight, SideName};
 pub use blame::{Blame, BlameInfo};
+pub use conflict::{
+    Assembled, Block, BlockChanges, Conflict, ConflictKind, Histories, Labels, LastChange, Reason, Resolution, Segment, Side, SideCommit,
+    TextConflict, Unmerged, Verdict, assemble, classify, indentation_matters,
+};
 pub use backend::{Backend, Error, GitCli, LogOptions, ScanCache};
 pub use graph::{Half, LaneLayout, Lineage, Row, Stroke};
 pub use hosting::{Host, WebRemote, web_remote};

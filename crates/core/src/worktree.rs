@@ -84,8 +84,8 @@ fn parse_counts(out: &[u8]) -> HashMap<String, (Option<u32>, Option<u32>)> {
 }
 
 impl GitCli {
-    /// Every uncommitted change: staged files first, then the rest (untracked ones included), each
-    /// group by path, each file with its line counts.
+    /// Every uncommitted change: files left in conflict first, then staged files, then the rest (untracked ones
+    /// included), each group by path, each file with its line counts.
     pub fn work_status(&self) -> Result<Vec<WorkFile>, Error> {
         let out = self.run(&["status", "--porcelain=v1", "--untracked-files=all", "-z"])?;
         let mut files = parse_status(&out);
@@ -105,8 +105,9 @@ impl GitCli {
             };
             (file.change.additions, file.change.deletions) = counts.unwrap_or((None, None));
         }
-        // Staged first, then the rest; by path within each, as a file tree would list them.
-        files.sort_by_cached_key(|file| (!file.staged, file.change.path.to_lowercase()));
+        // Conflicts first (they block everything else), then staged, then the rest; by path within each, as a file tree
+        // would list them.
+        files.sort_by_cached_key(|file| (!file.conflicted, !file.staged, file.change.path.to_lowercase()));
         Ok(files)
     }
 

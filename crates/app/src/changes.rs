@@ -16,6 +16,14 @@ use crate::workspace::{CommitState, CommitView, Phase, Workspace};
 /// The id the working tree goes by when it is open in the file pane.
 pub const WORKTREE: &str = "WORKTREE";
 
+/// What opens once the working tree has been read again.
+pub(crate) enum AfterWork {
+    /// The file that was open, where it has moved to.
+    Reopen,
+    /// The next file with conflicts after the one just resolved (by path).
+    NextConflict(String),
+}
+
 const ROW_H: f32 = 22.;
 
 /// The letter git uses for a change, and its color.
@@ -114,6 +122,11 @@ impl Workspace {
 
     /// Reads what has changed again, keeping the open file open (its diff read again).
     pub fn refresh_work(&mut self, cx: &mut Context<Self>) {
+        self.reload_work(AfterWork::Reopen, cx);
+    }
+
+    /// Reads what has changed again, then opens what `after` says.
+    pub(crate) fn reload_work(&mut self, after: AfterWork, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.as_ref() else { return };
         let (path, generation) = (repo.project.path.clone(), repo.generation);
         self.spawn_load(
@@ -153,11 +166,20 @@ impl Workspace {
                 let Some(repo) = this.repo.as_mut() else { return };
                 repo.commit = Some(CommitState { id: WORKTREE.to_owned(), phase: Phase::Ready(work_view(&repo.work)) });
                 repo.refresh_file_rows();
-                let reopen = open.and_then(|(path, staged)| {
-                    // Staged or not, the same file is still the one to show.
-                    let same = |f: &WorkFile| f.change.path == path;
-                    repo.work.iter().position(|f| same(f) && f.staged == staged).or_else(|| repo.work.iter().position(same))
-                });
+                let reopen = match after {
+                    AfterWork::Reopen => open.and_then(|(path, staged)| {
+                        // Staged or not, the same file is still the one to show.
+                        let same = |f: &WorkFile| f.change.path == path;
+                        repo.work.iter().position(|f| same(f) && f.staged == staged).or_else(|| repo.work.iter().position(same))
+                    }),
+                    // The next file with conflicts in the list's order, going round; none when all are resolved.
+                    AfterWork::NextConflict(done) => {
+                        let conflicted = |f: &&WorkFile| f.conflicted;
+                        let done = done.to_lowercase();
+                        let after = repo.work.iter().position(|f| f.conflicted && f.change.path.to_lowercase() > done);
+                        after.or_else(|| repo.work.iter().position(|f| conflicted(&f)))
+                    }
+                };
                 match reopen {
                     Some(index) => this.open_file(index, cx),
                     None => {
@@ -197,6 +219,10 @@ impl Workspace {
         }
         if repo.work.is_empty() {
             return self.say(Notice::warn("There is nothing to commit."), cx);
+        }
+        // Committing a file with conflict markers in it would mark it resolved as it is.
+        if repo.work.iter().any(|f| f.conflicted) {
+            return self.say(Notice::warn("Resolve the files with conflicts first: they would be committed with their conflict markers."), cx);
         }
         if self.busy.is_some() {
             return self.say(Notice::warn("Another operation is still running."), cx);
@@ -241,10 +267,11 @@ impl Workspace {
             return None;
         }
         let open = self.work_open().then(|| repo.file.as_ref().map(|f| f.index)).flatten();
+        let conflicted: Vec<usize> = (0..repo.work.len()).filter(|&i| repo.work[i].conflicted).collect();
         let staged: Vec<usize> = (0..repo.work.len()).filter(|&i| repo.work[i].staged).collect();
-        let unstaged: Vec<usize> = (0..repo.work.len()).filter(|&i| !repo.work[i].staged).collect();
+        let unstaged: Vec<usize> = (0..repo.work.len()).filter(|&i| !repo.work[i].staged && !repo.work[i].conflicted).collect();
 
-        let section = |title: &'static str, rows: &[usize], stage: bool, cx: &mut Context<Self>| -> Option<AnyElement> {
+        let section = |title: &'static str, rows: &[usize], stage: Option<bool>, cx: &mut Context<Self>| -> Option<AnyElement> {
             if rows.is_empty() {
                 return None;
             }
@@ -260,9 +287,10 @@ impl Workspace {
                 .gap_2()
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
-                .text_color(rgb(t().muted))
+                .text_color(rgb(if stage.is_none() { t().warning } else { t().muted }))
                 .child(div().flex_1().child(format!("{title}  {}", rows.len())))
-                .child(
+                // A file with conflicts is staged by resolving it, never as it is.
+                .children(stage.map(|stage| {
                     div()
                         .id(SharedString::from(format!("all-{title}")))
                         .px_1()
@@ -272,8 +300,8 @@ impl Workspace {
                         .hover(|style| style.bg(rgb(t().hover)).text_color(rgb(t().text_strong)))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| this.stage_paths(paths.clone(), stage, cx)))
-                        .child(if stage { "+ all" } else { "− all" }),
-                );
+                        .child(if stage { "+ all" } else { "− all" })
+                }));
             let files = rows.iter().map(|&i| self.render_change_row(i, &repo.work[i], open == Some(i), cx));
             Some(div().flex().flex_col().child(header).children(files).into_any_element())
         };
@@ -283,8 +311,9 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .pb_1()
-                .children(section("STAGED", &staged, false, cx))
-                .children(section("CHANGES", &unstaged, true, cx))
+                .children(section("CONFLICTS", &conflicted, None, cx))
+                .children(section("STAGED", &staged, Some(false), cx))
+                .children(section("CHANGES", &unstaged, Some(true), cx))
                 .into_any_element(),
         )
     }
@@ -295,6 +324,7 @@ impl Workspace {
         let (mark, mark_color) = letter(file);
         let deleted = file.change.status == FileStatus::Deleted;
         let staged = file.staged;
+        let conflicted = file.conflicted;
         let toggle_path = path.clone();
         let group = SharedString::from(format!("change-{index}"));
         div()
@@ -344,12 +374,16 @@ impl Workspace {
                     .rounded_sm()
                     .text_color(rgb(t().muted))
                     .opacity(0.)
-                    .group_hover(group, |style| style.opacity(1.))
-                    .hover(|style| style.bg(rgb(t().element_hover)).text_color(rgb(t().text_strong)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.stage_paths(vec![toggle_path.clone()], !staged, cx);
-                    }))
+                    // A file with conflicts is staged by resolving it, never as it is.
+                    .when(!conflicted, |toggle| {
+                        toggle
+                            .group_hover(group, |style| style.opacity(1.))
+                            .hover(|style| style.bg(rgb(t().element_hover)).text_color(rgb(t().text_strong)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.stage_paths(vec![toggle_path.clone()], !staged, cx);
+                            }))
+                    })
                     .child(if staged { "−" } else { "+" }),
             )
             .child(div().flex_none().w(px(10.)).font_weight(FontWeight::BOLD).text_color(rgb(mark_color)).child(mark))

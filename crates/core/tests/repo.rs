@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use gitgui_core::{
-    Backend, BranchTip, CheckoutTarget, Error, Evidence, GitCli, LaneLayout, LogOptions, Operation, Outcome, Query, RefKind, Upstream,
+    Backend, BranchTip, CheckoutTarget, ConflictKind, Error, Evidence, GitCli, Labels, LaneLayout, LogOptions, Operation, Outcome, Preflight,
+    Query, Reason, RefKind, Resolution, Side, Upstream, assemble, classify,
 };
 
 struct TempRepo(PathBuf);
@@ -1273,4 +1274,326 @@ fn each_branch_says_where_it_stands_against_its_remote_branch_from_one_read() {
     assert_eq!(git.branch_sync().unwrap().len(), 3);
 
     let _ = std::fs::remove_dir_all(&remote);
+}
+
+// ---- resolving conflicts ----------------------------------------------------------------------------
+
+fn read(repo: &TempRepo, file: &str) -> String {
+    std::fs::read_to_string(repo.path().join(file)).unwrap()
+}
+
+fn log_of(repo: &TempRepo, args: &[&str]) -> String {
+    let out = Command::new("git").arg("-C").arg(repo.path()).args(["log", "--format=%s"]).args(args).output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn labels() -> Labels {
+    Labels { current: "On main".into(), base: "base".into(), incoming: "Coming in from feature".into() }
+}
+
+/// The text conflict of `path`, read now.
+fn text_conflict(git: &GitCli, path: &str) -> (gitgui_core::Conflict, gitgui_core::TextConflict) {
+    let conflict = git.conflict(path).unwrap();
+    let ConflictKind::Text(text) = conflict.kind.clone() else { panic!("{path} is not a text conflict: {:?}", conflict.kind) };
+    (conflict, text)
+}
+
+const CONFIG: &str = "fn timeout() -> u32 {\n    30\n}\n\nfn retries() -> u32 {\n    3\n}\n\nfn host() -> &'static str {\n    \"localhost\"\n}\n";
+
+/// `main` and `feature` both change `config.rs` in three places, and `feature` only re-indents `style.css` where `main`
+/// changes it.
+fn three_blocks() -> TempRepo {
+    let repo = TempRepo::new(&format!("conflict-{}", std::thread::current().name().unwrap_or("t").replace("::", "-")));
+    write(&repo, "config.rs", CONFIG);
+    write(&repo, "style.css", "body {\n  color: black;\n}\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "base"]);
+    repo.git(&["checkout", "-q", "-b", "feature"]);
+    write(&repo, "config.rs", &CONFIG.replace("30", "60").replace("    3\n", "    5\n").replace("localhost", "example.com"));
+    write(&repo, "style.css", "body {\n    color: black;\n}\n");
+    repo.git(&["commit", "-q", "-am", "feat: slower and further"]);
+    repo.git(&["checkout", "-q", "main"]);
+    write(&repo, "config.rs", &CONFIG.replace("30", "10").replace("    3\n", "    1\n").replace("localhost", "127.0.0.1"));
+    write(&repo, "style.css", "body {\n  color: navy;\n}\n");
+    repo.git(&["commit", "-q", "-am", "fix: faster and local"]);
+    repo
+}
+
+#[test]
+fn a_merge_conflict_is_read_from_the_index_resolved_in_code_and_continued_into_a_merge_commit() {
+    let repo = three_blocks();
+    let git = GitCli::new(repo.path());
+    assert_eq!(git.preflight_merge("feature"), Some(Preflight::Conflicts(vec!["config.rs".into(), "style.css".into()])));
+    assert_eq!(git.merge("feature").unwrap(), Outcome::Conflicts { operation: Operation::Merge, files: 2 });
+
+    // The sides are named by meaning, from git's own files.
+    let state = git.operation_state().unwrap();
+    assert_eq!((state.current.title.as_str(), state.incoming.title.as_str()), ("On main", "Coming in from feature"));
+    assert_eq!(state.headline(), "Merging feature into main");
+    assert_eq!(git.unmerged().unwrap().len(), 2);
+
+    // Untouched since git wrote it: the blocks come from the index, each with its base.
+    let (conflict, config) = text_conflict(&git, "config.rs");
+    assert!(config.pristine);
+    let blocks: Vec<_> = gitgui_core::conflict::blocks(&config.segments).collect();
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0].current, ["    10\n"]);
+    assert_eq!(blocks[0].base.as_deref(), Some(&["    30\n".to_owned()][..]));
+    assert_eq!(blocks[0].incoming, ["    60\n"]);
+    assert!(blocks.iter().all(|b| classify(b, false).is_none()), "real conflicts are left to a person");
+
+    // Who changed each side, and each block.
+    let incoming = state.incoming_commit.clone().unwrap();
+    let histories = git.conflict_histories("config.rs", &incoming).unwrap();
+    assert_eq!(histories.current.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(), ["fix: faster and local"]);
+    assert_eq!(histories.incoming.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(), ["feat: slower and further"]);
+    assert_eq!(histories.current[0].author, "Ada");
+    let changes = git.block_changes(&conflict, &incoming).unwrap();
+    assert_eq!(changes.len(), 3);
+    assert!(changes.iter().all(|[current, incoming]| {
+        current.as_ref().is_some_and(|c| c.summary == "fix: faster and local") && incoming.as_ref().is_some_and(|c| c.summary == "feat: slower and further")
+    }), "{changes:?}");
+
+    // Choose: their timeout, our retries, both hosts.
+    let choices = [Some(Resolution::Incoming), Some(Resolution::Current), Some(Resolution::CurrentThenIncoming)];
+    let done = assemble(&config.segments, &choices, &labels(), config.marker_size);
+    assert!(done.unresolved.is_empty());
+    git.write_resolution("config.rs", &done.text, conflict.disk.as_deref(), true).unwrap();
+
+    // style.css: feature only re-indented; the classifier takes main's real change, safely.
+    let (css_conflict, css) = text_conflict(&git, "style.css");
+    let block = gitgui_core::conflict::blocks(&css.segments).next().unwrap();
+    let verdict = classify(block, false).unwrap();
+    assert_eq!((verdict.reason, verdict.certain), (Reason::OnlySpacing(Side::Incoming), true));
+    let css_text = assemble(&css.segments, &[Some(verdict.resolution)], &labels(), css.marker_size).text;
+    git.write_resolution("style.css", &css_text, css_conflict.disk.as_deref(), true).unwrap();
+
+    assert!(git.unmerged().unwrap().is_empty());
+    assert!(matches!(git.continue_operation(Operation::Merge).unwrap(), Outcome::Done(_)));
+    assert_eq!(git.in_progress(), None);
+    let parents = Command::new("git").arg("-C").arg(repo.path()).args(["rev-list", "--parents", "-n", "1", "HEAD"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&parents.stdout).split_whitespace().count(), 3, "a merge commit with two parents");
+    assert!(log_of(&repo, &["-1"]).starts_with("Merge branch 'feature'"));
+    assert_eq!(read(&repo, "config.rs"), CONFIG.replace("30", "60").replace("    3\n", "    1\n").replace("    \"localhost\"\n", "    \"127.0.0.1\"\n    \"example.com\"\n"));
+    assert_eq!(read(&repo, "style.css"), "body {\n  color: navy;\n}\n");
+    assert!(status_is_clean(&repo));
+}
+
+#[test]
+fn continuing_with_a_file_left_in_conflict_is_refused_and_aborting_puts_everything_back() {
+    let repo = three_blocks();
+    let git = GitCli::new(repo.path());
+    git.merge("feature").unwrap();
+    let (conflict, config) = text_conflict(&git, "config.rs");
+    let done = assemble(&config.segments, &[Some(Resolution::Current); 3], &labels(), config.marker_size);
+    git.write_resolution("config.rs", &done.text, conflict.disk.as_deref(), true).unwrap();
+    assert!(matches!(git.continue_operation(Operation::Merge), Err(Error::Parse(ref m)) if m.contains("1 file still has conflicts")));
+    git.abort(Operation::Merge).unwrap();
+    assert_eq!(git.in_progress(), None);
+    assert!(status_is_clean(&repo));
+    assert_eq!(read(&repo, "config.rs"), CONFIG.replace("30", "10").replace("    3\n", "    1\n").replace("localhost", "127.0.0.1"));
+}
+
+#[test]
+fn a_file_is_never_written_over_once_it_changed_on_disk_and_hand_edits_are_read_as_they_are() {
+    let repo = three_blocks();
+    let git = GitCli::new(repo.path());
+    git.merge("feature").unwrap();
+    let (conflict, config) = text_conflict(&git, "config.rs");
+    let done = assemble(&config.segments, &[Some(Resolution::Current); 3], &labels(), config.marker_size);
+
+    // Edited in an editor after it was read: the write is refused and the edit stays.
+    let edited = read(&repo, "config.rs").replacen("<<<<<<< HEAD\n    10\n", "<<<<<<< HEAD\n    45\n", 1);
+    assert_ne!(edited, read(&repo, "config.rs"), "a line in the first block was changed by hand");
+    write(&repo, "config.rs", &edited);
+    let refused = git.write_resolution("config.rs", &done.text, conflict.disk.as_deref(), true);
+    assert!(matches!(refused, Err(Error::Parse(ref m)) if m.contains("changed on disk")), "{refused:?}");
+    assert_eq!(read(&repo, "config.rs"), edited);
+
+    // Read again: what is on disk is what is shown, as git grouped it (the three changes are close enough to make one
+    // block there), with the hand edit in it, and no longer from the index.
+    let (_, again) = text_conflict(&git, "config.rs");
+    assert!(!again.pristine);
+    let blocks: Vec<_> = gitgui_core::conflict::blocks(&again.segments).collect();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].current[0], "    45\n");
+    assert!(git.mark_resolved("config.rs").is_err(), "markers are left");
+
+    // Start over: the conflict as the index has it, with bases and labels that say what each side is.
+    git.restart_conflict("config.rs", &labels()).unwrap();
+    let restarted = read(&repo, "config.rs");
+    assert!(restarted.contains("<<<<<<< On main\n") && restarted.contains("||||||| base\n") && restarted.contains(">>>>>>> Coming in from feature\n"));
+    let (_, fresh) = text_conflict(&git, "config.rs");
+    assert!(fresh.pristine, "the same conflict as the index's");
+    assert_eq!(gitgui_core::conflict::block_count(&fresh.segments), 3);
+
+    // Resolved by hand completely: no blocks to choose, and it can be marked resolved as it is.
+    write(&repo, "config.rs", CONFIG);
+    let (_, by_hand) = text_conflict(&git, "config.rs");
+    assert_eq!(gitgui_core::conflict::block_count(&by_hand.segments), 0);
+    git.mark_resolved("config.rs").unwrap();
+    assert_eq!(git.unmerged().unwrap().len(), 1, "only style.css is left");
+}
+
+/// `feature` has two commits that each conflict with `main`: the first changes line one, the second line three, and
+/// `main` changed both.
+fn two_step_rebase() -> TempRepo {
+    let repo = TempRepo::new("conflict-rebase");
+    write(&repo, "f.txt", "one\ntwo\nthree\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "base"]);
+    repo.git(&["checkout", "-q", "-b", "feature"]);
+    write(&repo, "f.txt", "one F\ntwo\nthree\n");
+    repo.git(&["commit", "-q", "-am", "feat: first"]);
+    write(&repo, "f.txt", "one F\ntwo\nthree F\n");
+    repo.git(&["commit", "-q", "-am", "feat: second"]);
+    repo.git(&["checkout", "-q", "main"]);
+    write(&repo, "f.txt", "one M\ntwo\nthree M\n");
+    repo.git(&["commit", "-q", "-am", "main: both lines"]);
+    repo.git(&["checkout", "-q", "feature"]);
+    repo
+}
+
+#[test]
+fn a_rebase_that_stops_twice_is_resolved_commit_by_commit_and_finishes() {
+    let repo = two_step_rebase();
+    let git = GitCli::new(repo.path());
+    assert_eq!(git.preflight_rebase("main"), Some(Preflight::Conflicts(vec!["f.txt".into()])));
+    assert_eq!(git.rebase("main").unwrap(), Outcome::Conflicts { operation: Operation::Rebase, files: 1 });
+
+    let state = git.operation_state().unwrap();
+    assert_eq!((state.current.title.as_str(), state.incoming.title.as_str()), ("Already on main", "Your commit: feat: first"));
+    assert_eq!((state.branch.as_deref(), state.other.as_str(), state.step), (Some("feature"), "main", Some((1, 2))));
+    assert_eq!(state.headline(), "Rebasing feature onto main · commit 1 of 2");
+
+    // This commit's first line wins; main's third line stays.
+    let (conflict, text) = text_conflict(&git, "f.txt");
+    let block = gitgui_core::conflict::blocks(&text.segments).next().unwrap();
+    assert_eq!(block.current, ["one M\n"], "Current is what the new base has, in a rebase too");
+    let done = assemble(&text.segments, &[Some(Resolution::Incoming)], &labels(), text.marker_size);
+    git.write_resolution("f.txt", &done.text, conflict.disk.as_deref(), true).unwrap();
+
+    // The next commit conflicts too: the rebase stops again, and says where it is.
+    assert_eq!(git.continue_operation(Operation::Rebase).unwrap(), Outcome::Conflicts { operation: Operation::Rebase, files: 1 });
+    let state = git.operation_state().unwrap();
+    assert_eq!((state.incoming.title.as_str(), state.step), ("Your commit: feat: second", Some((2, 2))));
+    let (conflict, text) = text_conflict(&git, "f.txt");
+    let done = assemble(&text.segments, &vec![Some(Resolution::Incoming); gitgui_core::conflict::block_count(&text.segments)], &labels(), text.marker_size);
+    git.write_resolution("f.txt", &done.text, conflict.disk.as_deref(), true).unwrap();
+    assert!(matches!(git.continue_operation(Operation::Rebase).unwrap(), Outcome::Done(_)));
+
+    assert_eq!(git.in_progress(), None);
+    assert_eq!(git.current_branch().unwrap().as_deref(), Some("feature"));
+    assert_eq!(log_of(&repo, &[]), "feat: second\nfeat: first\nmain: both lines\nbase\n");
+    assert_eq!(read(&repo, "f.txt"), "one F\ntwo\nthree F\n");
+}
+
+#[test]
+fn a_cherry_pick_conflict_names_the_picked_commit_and_an_emptied_pick_is_skipped() {
+    let repo = three_blocks();
+    let git = GitCli::new(repo.path());
+    let pick = rev(&repo, "feature");
+    assert_eq!(git.preflight_cherry_pick(&pick), Some(Preflight::Conflicts(vec!["config.rs".into(), "style.css".into()])));
+    assert_eq!(git.cherry_pick(&pick).unwrap(), Outcome::Conflicts { operation: Operation::CherryPick, files: 2 });
+    let state = git.operation_state().unwrap();
+    assert_eq!((state.current.title.as_str(), state.incoming.title.as_str()), ("On main", "The picked commit: feat: slower and further"));
+    assert_eq!(state.headline(), format!("Cherry-picking {} onto main", &pick[..7]));
+
+    // Keep main's version of everything: the pick is left empty, git will not commit it, and skipping finishes.
+    for path in ["config.rs", "style.css"] {
+        let (conflict, text) = text_conflict(&git, path);
+        let all = vec![Some(Resolution::Current); gitgui_core::conflict::block_count(&text.segments)];
+        git.write_resolution(path, &assemble(&text.segments, &all, &labels(), 7).text, conflict.disk.as_deref(), true).unwrap();
+    }
+    assert!(matches!(git.continue_operation(Operation::CherryPick), Err(Error::Git { .. })), "an empty pick is not committed");
+    assert_eq!(git.in_progress(), Some(Operation::CherryPick));
+    assert!(matches!(git.skip_commit(Operation::CherryPick).unwrap(), Outcome::Done(_)));
+    assert_eq!(git.in_progress(), None);
+    assert_eq!(log_of(&repo, &["-1"]), "fix: faster and local\n");
+}
+
+/// Both sides add `both.txt`, delete-or-change `mod.txt` and `mod2.txt`, and change the binary `img.bin`.
+fn kinds_repo() -> TempRepo {
+    let repo = TempRepo::new("conflict-kinds");
+    write(&repo, "mod.txt", "m\n");
+    write(&repo, "mod2.txt", "m\n");
+    std::fs::write(repo.path().join("img.bin"), b"\x00\x01base").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "base"]);
+    repo.git(&["checkout", "-q", "-b", "other"]);
+    write(&repo, "both.txt", "shared\nfrom other\n");
+    repo.git(&["rm", "-q", "mod.txt"]);
+    write(&repo, "mod2.txt", "m changed on other\n");
+    std::fs::write(repo.path().join("img.bin"), b"\x00\x02other").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "other"]);
+    repo.git(&["checkout", "-q", "main"]);
+    write(&repo, "both.txt", "shared\nfrom main\n");
+    write(&repo, "mod.txt", "m changed on main\n");
+    repo.git(&["rm", "-q", "mod2.txt"]);
+    std::fs::write(repo.path().join("img.bin"), b"\x00\x03main").unwrap();
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "main"]);
+    repo
+}
+
+#[test]
+fn added_on_both_sides_deleted_on_one_and_binary_files_each_get_their_own_kind_of_choice() {
+    let repo = kinds_repo();
+    let git = GitCli::new(repo.path());
+    assert_eq!(git.merge("other").unwrap(), Outcome::Conflicts { operation: Operation::Merge, files: 4 });
+
+    // Added on both sides: text with no base; the shared first line is not part of the conflict.
+    let (conflict, both) = text_conflict(&git, "both.txt");
+    assert!(conflict.stages.base.is_none());
+    let blocks: Vec<_> = gitgui_core::conflict::blocks(&both.segments).collect();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!((blocks[0].current.as_slice(), blocks[0].base.is_none()), (&["from main\n".to_owned()][..], true));
+    let text = assemble(&both.segments, &[Some(Resolution::IncomingThenCurrent)], &labels(), 7).text;
+    git.write_resolution("both.txt", &text, conflict.disk.as_deref(), true).unwrap();
+    assert_eq!(read(&repo, "both.txt"), "shared\nfrom other\nfrom main\n");
+
+    // Deleted by one side and changed by the other, each way round.
+    let kept = git.conflict("mod.txt").unwrap();
+    assert_eq!(kept.kind, ConflictKind::Deleted { by: Side::Incoming });
+    git.take_side("mod.txt", Side::Current, kept.disk.as_deref()).unwrap();
+    assert_eq!(read(&repo, "mod.txt"), "m changed on main\n");
+    let dropped = git.conflict("mod2.txt").unwrap();
+    assert_eq!(dropped.kind, ConflictKind::Deleted { by: Side::Current });
+    git.delete_conflicted("mod2.txt", dropped.disk.as_deref()).unwrap();
+    assert!(!repo.path().join("mod2.txt").exists());
+
+    // Binary: a whole version is chosen.
+    let image = git.conflict("img.bin").unwrap();
+    assert_eq!(image.kind, ConflictKind::Whole);
+    git.take_side("img.bin", Side::Incoming, image.disk.as_deref()).unwrap();
+    assert_eq!(std::fs::read(repo.path().join("img.bin")).unwrap(), b"\x00\x02other");
+
+    assert!(git.unmerged().unwrap().is_empty());
+    assert!(matches!(git.continue_operation(Operation::Merge).unwrap(), Outcome::Done(_)));
+    assert!(status_is_clean(&repo));
+    let files = Command::new("git").arg("-C").arg(repo.path()).args(["ls-files"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&files.stdout), "both.txt\nimg.bin\nmod.txt\n");
+}
+
+#[test]
+fn a_test_merge_says_clean_without_touching_anything_and_an_unknown_branch_says_nothing() {
+    let repo = trunk();
+    repo.git(&["checkout", "-q", "-b", "feature"]);
+    write(&repo, "new.txt", "new\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-q", "-m", "feat: new"]);
+    repo.git(&["checkout", "-q", "main"]);
+    edit_line(&repo, 2, "TWO");
+    repo.git(&["commit", "-q", "-am", "main: two"]);
+    let git = GitCli::new(repo.path());
+    let head = rev(&repo, "HEAD");
+    assert_eq!(git.preflight_merge("feature"), Some(Preflight::Clean));
+    assert_eq!(git.preflight_rebase("feature"), Some(Preflight::Clean));
+    assert_eq!(git.preflight_cherry_pick(&rev(&repo, "feature")), Some(Preflight::Clean));
+    assert_eq!(git.preflight_merge("no-such-branch"), None);
+    assert_eq!(git.preflight_merge("--output=x"), None, "option-like names never reach git");
+    assert_eq!(git.preflight_pull(), None, "no upstream to test against");
+    assert_eq!(rev(&repo, "HEAD"), head);
+    assert!(status_is_clean(&repo), "nothing changed here");
 }

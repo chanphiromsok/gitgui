@@ -460,7 +460,7 @@ async fn a_very_large_diff_costs_no_more_per_frame_than_a_small_one(cx: &mut Tes
 
 use gitgui_core::{Backend, CheckoutTarget, CommitKind, GitCli, Label, LabelKind, Operation};
 
-use crate::menu::{Action, MenuTarget, NoticeAction};
+use crate::menu::{Action, MenuTarget};
 
 /// A bare repository with only the data folder; the repo is built by the caller.
 fn bare_fixture(name: &str) -> Fixture {
@@ -750,23 +750,22 @@ async fn merge_asks_first_and_a_conflict_offers_to_put_everything_back(cx: &mut 
     assert!(ws.read_with(cx, |ws, _| ws.dialog.is_none()));
     assert_eq!(GitCli::new(fx.repo()).in_progress(), None);
 
-    // Confirming runs it, and the conflict is offered back as an abort.
+    // Confirming runs it: the merge stops, its first file opens in the resolver, and the bar offers Abort, which asks.
     with_window(&ws, cx, |ws, window, cx| ws.choose(Action::Merge("other".into()), window, cx));
     ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
     cx.run_until_parked();
     assert_eq!(GitCli::new(fx.repo()).in_progress(), Some(Operation::Merge));
-    let (text, action) = ws.read_with(cx, |ws, _| {
-        let n = ws.notice.as_ref().unwrap();
-        (n.text.to_string(), n.action.clone().map(|(_, a)| a))
-    });
+    let text = ws.read_with(cx, |ws, _| ws.notice.as_ref().unwrap().text.to_string());
     assert!(text.contains("stopped") && text.contains("conflicts"), "{text}");
-    assert_eq!(action, Some(NoticeAction::Abort(Operation::Merge)));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.resolver().map(|r| r.path.clone())).as_deref(), Some("app.txt"));
     draw(cx, &ws);
 
-    ws.update(cx, |ws, cx| ws.run_notice_action(NoticeAction::Abort(Operation::Merge), cx));
+    with_window(&ws, cx, |ws, window, cx| ws.open_dialog(Action::AbortOperation(Operation::Merge), window, cx));
+    assert_eq!(dialog_text(&ws, cx).0, "Abort the merge?");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
     cx.run_until_parked();
     assert_eq!(GitCli::new(fx.repo()).in_progress(), None);
-    assert_eq!(std::fs::read_to_string(fx.repo().join("app.txt")).unwrap(), "one\ntwo\nTHREE main\nfour\nfive\n");
+    assert_eq!(std::fs::read_to_string(fx.repo().join("app.txt")).unwrap(), "one\ntwo\nthree main\nfour\nfive\n".replace("three main", "THREE main"));
 }
 
 #[gpui::test]
@@ -3114,4 +3113,317 @@ fn the_push_question_names_where_the_push_goes() {
     // Not on a remote: published to origin, else the first remote; with none, it says so.
     assert_eq!(push_question("feat", &Upstream::None, &["fork".to_owned()]).0, "Publish feat to fork?");
     assert!(push_question("feat", &Upstream::None, &[]).1.contains("no remote"));
+}
+
+
+// ---- resolving conflicts ---------------------------------------------------------------------------
+
+/// `main` and `other` both change `config.txt` in three places (the middle one only spaced differently), and `other`
+/// only re-indents `style.txt` where `main` changes it.
+fn conflicting_branches(name: &str) -> Fixture {
+    let fx = bare_fixture(name);
+    fx.write("config.txt", "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n");
+    fx.write("style.txt", "a {\n  color: black;\n}\n");
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "base"]);
+    fx.git(&["checkout", "-q", "-b", "other"]);
+    fx.write("config.txt", "one\ntwo other\nthree\nfour\nFIVE   \nsix\nseven\neight other\nnine\n");
+    fx.write("style.txt", "a {\n    color: black;\n}\n");
+    fx.git(&["commit", "-q", "-am", "feat: other's way"]);
+    fx.git(&["checkout", "-q", "main"]);
+    fx.write("config.txt", "one\ntwo main\nthree\nfour\nFIVE\nsix\nseven\neight main\nnine\n");
+    fx.write("style.txt", "a {\n  color: navy;\n}\n");
+    fx.git(&["commit", "-q", "-am", "feat: main's way"]);
+    fx
+}
+
+fn resolver_state(ws: &Entity<Workspace>, cx: &VisualTestContext) -> Option<(String, Vec<Option<gitgui_core::Resolution>>, bool)> {
+    ws.read_with(cx, |ws, _| {
+        let r = ws.resolver()?;
+        Some((r.path.clone(), r.choices.clone(), r.text().is_some_and(|t| t.pristine)))
+    })
+}
+
+fn click_on(cx: &mut VisualTestContext, ws: &Entity<Workspace>, name: &str) {
+    draw(cx, ws);
+    let at = center_of(cx, name.to_owned());
+    click(cx, MouseButton::Left, at);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn a_merge_conflict_is_resolved_in_the_app_with_clicks_and_keys_and_continued(cx: &mut TestAppContext) {
+    use gitgui_core::Resolution;
+    let fx = conflicting_branches("resolve-merge");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+
+    // The question says, from a test merge, which files would conflict.
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::Merge("other".into()), window, cx));
+    let check = ws.read_with(cx, |ws, _| ws.dialog.as_ref().and_then(|d| d.check.clone()));
+    assert_eq!(check, Some(crate::menu::Check::Running), "the question opens before the test merge is done");
+    cx.run_until_parked();
+    let check = ws.read_with(cx, |ws, _| ws.dialog.as_ref().and_then(|d| d.check.clone())).unwrap();
+    assert_eq!(check, crate::menu::Check::Found(gitgui_core::Preflight::Conflicts(vec!["config.txt".into(), "style.txt".into()])));
+    let said = crate::menu::check_line(&Action::Merge("other".into()), &check).0;
+    assert!(said.starts_with("Would conflict in 2 files: config.txt, style.txt"), "{said}");
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("dialog-check").is_some());
+    assert_eq!(GitCli::new(fx.repo()).in_progress(), None, "the test merge touched nothing");
+
+    // Merging stops on the conflicts: the first file opens in the resolver, with the graph out of the way and the bar
+    // over the main area.
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    let (path, choices, pristine) = resolver_state(&ws, cx).expect("the resolver opened");
+    assert_eq!((path.as_str(), choices.len(), pristine), ("config.txt", 3, true));
+    assert!(ws.read_with(cx, |ws, _| ws.graph_hidden));
+    let headline = ws.read_with(cx, |ws, _| ws.operation().map(|op| (op.headline(), op.current.title.clone(), op.incoming.title.clone())));
+    assert_eq!(headline, Some(("Merging other into main".into(), "On main".into(), "Coming in from other".into())));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("operation-bar").is_some() && cx.debug_bounds("conflict-story").is_some());
+
+    // A click on a side; the safe one with its button; the keys for the last.
+    click_on(cx, &ws, "choose-0-incoming");
+    assert_eq!(resolver_state(&ws, cx).unwrap().1, [Some(Resolution::Incoming), None, None]);
+    click_on(cx, &ws, "conflict-safe");
+    assert_eq!(resolver_state(&ws, cx).unwrap().1, [Some(Resolution::Incoming), Some(Resolution::Current), None]);
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("conflict-why-1").is_some(), "the safe one says why");
+    cx.simulate_keystrokes("n n 1");
+    assert_eq!(resolver_state(&ws, cx).unwrap().1[2], Some(Resolution::Current));
+    cx.simulate_keystrokes("backspace");
+    assert_eq!(resolver_state(&ws, cx).unwrap().1[2], None, "Backspace takes the choice back");
+    cx.simulate_keystrokes("1");
+    assert!(std::fs::read_to_string(fx.repo().join("config.txt")).unwrap().contains("<<<<<<<"), "nothing is written until asked");
+
+    // Use this result: written, marked resolved, and the next file opens.
+    click_on(cx, &ws, "conflict-use");
+    assert_eq!(std::fs::read_to_string(fx.repo().join("config.txt")).unwrap(), "one\ntwo other\nthree\nfour\nFIVE\nsix\nseven\neight main\nnine\n");
+    assert_eq!(GitCli::new(fx.repo()).unmerged().unwrap().len(), 1);
+    assert_eq!(resolver_state(&ws, cx).map(|r| r.0).as_deref(), Some("style.txt"));
+
+    // style.txt: other only re-indented; the safe resolution takes main's change.
+    click_on(cx, &ws, "conflict-safe");
+    click_on(cx, &ws, "conflict-use");
+    assert_eq!(std::fs::read_to_string(fx.repo().join("style.txt")).unwrap(), "a {\n  color: navy;\n}\n");
+    assert!(resolver_state(&ws, cx).is_none(), "nothing is left to resolve");
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("work-overview").is_some());
+
+    // Continue finishes the merge; the bar goes and the graph comes back.
+    click_on(cx, &ws, "operation-continue");
+    assert_eq!(GitCli::new(fx.repo()).in_progress(), None);
+    let log = git_as_bo(&fx.repo(), &["log", "-1", "--format=%s %p"]);
+    assert!(log.starts_with("Merge branch 'other'") && log.split_whitespace().count() >= 5, "a merge commit: {log}");
+    assert!(ws.read_with(cx, |ws, _| ws.operation().is_none() && !ws.graph_hidden));
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.text.contains("Finished the merge"))));
+    draw(cx, &ws);
+}
+
+#[gpui::test]
+async fn a_file_edited_by_hand_is_never_written_over_and_start_over_puts_back_the_conflict(cx: &mut TestAppContext) {
+    let fx = conflicting_branches("resolve-edited");
+    let _ = GitCli::new(fx.repo()).merge("other").unwrap();
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    click_on(cx, &ws, "operation-resolve");
+    click_on(cx, &ws, "choose-0-current");
+
+    // Edited in an editor meanwhile: Use this result refuses and says why; the edit stays.
+    let edited = std::fs::read_to_string(fx.repo().join("config.txt")).unwrap().replace("two main", "two by hand");
+    std::fs::write(fx.repo().join("config.txt"), &edited).unwrap();
+    click_on(cx, &ws, "conflict-use");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.warn && n.text.contains("changed on disk"))));
+    assert_eq!(std::fs::read_to_string(fx.repo().join("config.txt")).unwrap(), edited);
+
+    // Re-read shows the file as it is, no longer git's own conflict.
+    click_on(cx, &ws, "conflict-reread");
+    let (_, _, pristine) = resolver_state(&ws, cx).unwrap();
+    assert!(!pristine);
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("conflict-note").is_some());
+
+    // Start over asks, since it replaces the edit, then puts back the conflict from the index.
+    click_on(cx, &ws, "conflict-start-over");
+    assert_eq!(dialog_text(&ws, cx).0, "Start over with config.txt?");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    let (_, choices, pristine) = resolver_state(&ws, cx).unwrap();
+    assert!(pristine && choices.iter().all(Option::is_none) && choices.len() == 3);
+    let text = std::fs::read_to_string(fx.repo().join("config.txt")).unwrap();
+    assert!(text.contains("<<<<<<< On main\n") && text.contains(">>>>>>> Coming in from other\n") && !text.contains("by hand"), "{text}");
+
+    // Finished by hand in an editor: Re-read finds no markers left and offers to mark it resolved as it is.
+    click_on(cx, &ws, "conflict-edit");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.text.contains("Opened config.txt in your editor"))));
+    std::fs::write(fx.repo().join("config.txt"), "resolved by hand\n").unwrap();
+    click_on(cx, &ws, "conflict-reread");
+    assert_eq!(resolver_state(&ws, cx).map(|r| r.1.len()), Some(0), "no conflicts left to choose in");
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("conflict-note").is_some());
+    click_on(cx, &ws, "conflict-use");
+    assert_eq!(GitCli::new(fx.repo()).unmerged().unwrap().len(), 1, "config.txt is resolved; style.txt is left");
+    assert_eq!(std::fs::read_to_string(fx.repo().join("config.txt")).unwrap(), "resolved by hand\n");
+}
+
+#[gpui::test]
+async fn a_rebase_that_stops_twice_is_resolved_and_finished_from_the_bar(cx: &mut TestAppContext) {
+    let fx = bare_fixture("resolve-rebase");
+    commit_file(&fx, "f.txt", "one\ntwo\nthree\n", "base");
+    fx.git(&["checkout", "-q", "-b", "feature"]);
+    commit_file(&fx, "f.txt", "one F\ntwo\nthree\n", "feat: first");
+    commit_file(&fx, "f.txt", "one F\ntwo\nthree F\n", "feat: second");
+    fx.git(&["checkout", "-q", "main"]);
+    commit_file(&fx, "f.txt", "one M\ntwo\nthree M\n", "main: both");
+    fx.git(&["checkout", "-q", "feature"]);
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::Rebase("main".into()), window, cx));
+    cx.run_until_parked();
+    let check = ws.read_with(cx, |ws, _| ws.dialog.as_ref().and_then(|d| d.check.clone())).unwrap();
+    assert!(crate::menu::check_line(&Action::Rebase("main".into()), &check).0.starts_with("May conflict in 1 file: f.txt"), "only a hint for a rebase");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+
+    for (step, mine) in [(1, "Your commit: feat: first"), (2, "Your commit: feat: second")] {
+        let state = ws.read_with(cx, |ws, _| ws.operation().map(|op| (op.step, op.current.title.clone(), op.incoming.title.clone())));
+        assert_eq!(state, Some((Some((step, 2)), "Already on main".into(), mine.into())), "at commit {step}");
+        assert_eq!(resolver_state(&ws, cx).map(|r| r.0).as_deref(), Some("f.txt"), "the stop's file is open");
+        click_on(cx, &ws, "choose-0-incoming");
+        click_on(cx, &ws, "conflict-use");
+        click_on(cx, &ws, "operation-continue");
+    }
+    assert_eq!(GitCli::new(fx.repo()).in_progress(), None);
+    assert_eq!(git_as_bo(&fx.repo(), &["log", "--format=%s"]), "feat: second\nfeat: first\nmain: both\nbase\n");
+    assert_eq!(std::fs::read_to_string(fx.repo().join("f.txt")).unwrap(), "one F\ntwo\nthree F\n");
+}
+
+#[gpui::test]
+async fn an_operation_left_half_done_shows_its_bar_when_the_app_starts_again(cx: &mut TestAppContext) {
+    let fx = conflicting_branches("resolve-restart");
+    {
+        let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+        open_project(&ws, cx, &fx.repo());
+    }
+    // The merge stops while the app is closed (in a terminal, say).
+    assert!(matches!(GitCli::new(fx.repo()).merge("other").unwrap(), gitgui_core::Outcome::Conflicts { .. }));
+
+    // Started again, the project reopens and everything is read from git: the bar, its words, its counts.
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("operation-bar").is_some());
+    assert_eq!(ws.read_with(cx, |ws, _| ws.operation().map(|op| op.headline())), Some("Merging other into main".into()));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.conflicts_left()), 2);
+
+    // Continue waits for the files; the bar opens the first one.
+    click_on(cx, &ws, "operation-continue");
+    assert_eq!(GitCli::new(fx.repo()).in_progress(), Some(Operation::Merge));
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| n.text.contains("Resolve the 2 files"))));
+    click_on(cx, &ws, "operation-resolve");
+    assert_eq!(resolver_state(&ws, cx).map(|r| r.0).as_deref(), Some("config.txt"));
+
+    // Abort asks first, then puts everything back.
+    click_on(cx, &ws, "operation-abort");
+    assert_eq!(dialog_text(&ws, cx).0, "Abort the merge?");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    assert_eq!(GitCli::new(fx.repo()).in_progress(), None);
+    assert_eq!(std::fs::read_to_string(fx.repo().join("config.txt")).unwrap(), "one\ntwo main\nthree\nfour\nFIVE\nsix\nseven\neight main\nnine\n");
+    assert!(ws.read_with(cx, |ws, _| ws.operation().is_none()));
+}
+
+#[gpui::test]
+async fn added_twice_binary_and_deleted_files_get_their_own_choices(cx: &mut TestAppContext) {
+    let fx = bare_fixture("resolve-kinds");
+    commit_file(&fx, "notes.txt", "notes\n", "base");
+    std::fs::write(fx.repo().join("logo.png"), b"\x00\x01base").unwrap();
+    commit_file(&fx, "keep.txt", "k\n", "logo");
+    fx.git(&["checkout", "-q", "-b", "other"]);
+    fx.write("deploy.txt", "Tuesdays\n");
+    fx.git(&["rm", "-q", "notes.txt"]);
+    std::fs::write(fx.repo().join("logo.png"), b"\x00\x02other").unwrap();
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "other"]);
+    fx.git(&["checkout", "-q", "main"]);
+    fx.write("deploy.txt", "Thursdays\n");
+    fx.write("notes.txt", "notes, longer\n");
+    std::fs::write(fx.repo().join("logo.png"), b"\x00\x03main").unwrap();
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-q", "-m", "main"]);
+    assert!(matches!(GitCli::new(fx.repo()).merge("other").unwrap(), gitgui_core::Outcome::Conflicts { files: 3, .. }));
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    click_on(cx, &ws, "operation-resolve");
+
+    // Added on both sides: text with no base, so no "Neither"; keep both, theirs first.
+    assert_eq!(resolver_state(&ws, cx).map(|r| r.0).as_deref(), Some("deploy.txt"));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("choose-0-base").is_none());
+    click_on(cx, &ws, "choose-0-both");
+    click_on(cx, &ws, "conflict-swap-0");
+    click_on(cx, &ws, "conflict-use");
+    assert_eq!(std::fs::read_to_string(fx.repo().join("deploy.txt")).unwrap(), "Tuesdays\nThursdays\n");
+
+    // A binary file: one whole version, named by meaning.
+    assert_eq!(resolver_state(&ws, cx).map(|r| r.0).as_deref(), Some("logo.png"));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("conflict-whole").is_some());
+    click_on(cx, &ws, "conflict-take-incoming");
+    assert_eq!(std::fs::read(fx.repo().join("logo.png")).unwrap(), b"\x00\x02other");
+
+    // Deleted on one side, changed on the other: deleting asks first.
+    assert_eq!(resolver_state(&ws, cx).map(|r| r.0).as_deref(), Some("notes.txt"));
+    click_on(cx, &ws, "conflict-delete");
+    assert_eq!(dialog_text(&ws, cx).0, "Delete notes.txt?");
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    assert!(!fx.repo().join("notes.txt").exists());
+    assert!(GitCli::new(fx.repo()).unmerged().unwrap().is_empty());
+
+    click_on(cx, &ws, "operation-continue");
+    assert_eq!(GitCli::new(fx.repo()).in_progress(), None);
+}
+
+#[gpui::test]
+async fn a_long_conflicted_file_folds_its_unchanged_lines_and_draws_quickly(cx: &mut TestAppContext) {
+    let fx = bare_fixture("resolve-long");
+    let lines = |tag: &str| -> String {
+        (0..20_000).map(|i| if i % 5_000 == 2_500 { format!("line {i} {tag}\n") } else { format!("line {i}\n") }).collect()
+    };
+    commit_file(&fx, "long.txt", &lines("base"), "base");
+    fx.git(&["checkout", "-q", "-b", "other"]);
+    commit_file(&fx, "long.txt", &lines("other"), "other");
+    fx.git(&["checkout", "-q", "main"]);
+    commit_file(&fx, "long.txt", &lines("main"), "main");
+    let _ = GitCli::new(fx.repo()).merge("other").unwrap();
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| ws.open_first_conflict(cx));
+    cx.run_until_parked();
+    let rows = ws.read_with(cx, |ws, _| ws.resolver().unwrap().rows.len());
+    assert!(rows < 120, "20,000 unchanged lines fold away: {rows} rows");
+    let folded = frame_ms(&ws, cx, 20);
+
+    // Unfolded, every line is a row, and a frame still costs only the rows in view.
+    let segments: Vec<usize> = ws.read_with(cx, |ws, _| {
+        ws.resolver().unwrap().rows.iter().filter_map(|r| match r { crate::resolver::Row::Fold { segment, .. } => Some(*segment), _ => None }).collect()
+    });
+    for segment in segments {
+        ws.update(cx, |ws, cx| ws.unfold(segment, cx));
+    }
+    let rows = ws.read_with(cx, |ws, _| ws.resolver().unwrap().rows.len());
+    assert!(rows > 20_000, "{rows} rows");
+    ws.read_with(cx, |ws, _| ws.resolver().unwrap().list.scroll_to(gpui::ListOffset { item_ix: rows / 2, offset_in_item: px(0.) }));
+    let unfolded = frame_ms(&ws, cx, 20);
+    eprintln!("long conflict: folded {folded:.2} ms/frame, unfolded and scrolled {unfolded:.2} ms/frame");
+    if !cfg!(debug_assertions) {
+        assert!(folded < 8. && unfolded < 8., "{folded:.2} / {unfolded:.2} ms per frame");
+    }
 }

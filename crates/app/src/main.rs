@@ -17,6 +17,7 @@ mod menu;
 mod minimap;
 mod pane;
 mod preview;
+mod resolver;
 mod rows;
 mod script;
 mod settings_view;

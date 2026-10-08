@@ -22,6 +22,7 @@
 - **It knows what's merged.** Squash and rebase merges leave no trace in git, so other tools show the branch as open forever. gitgui finds them and marks the branch **✓ squash-merged**.
 - **Pull requests, tidy.** A pull request's commits sit together under it and fold away.
 - **It remembers your team's workflow.** Branch names, where work starts, how things merge: read from the repo, then **New branch…** builds `feature/74-driver-reporting` for you.
+- **Conflicts, explained.** Resolve them without leaving the app, with each side named plainly (never "ours/theirs") and who changed it and why in front of you. The merge question tells you beforehand if it will conflict.
 - **Blame where you're looking.** Rest the pointer on a line in a diff: who changed it, and when.
 - **Yours to restyle.** 14 graph styles, each with its own lines, commit marks and labels.
 - **Fast.** Native Rust, no Electron: thousands of commits and 10,000-line diffs scroll smoothly.

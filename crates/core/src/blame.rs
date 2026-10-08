@@ -112,7 +112,16 @@ impl GitCli {
     /// Who last changed each line of `path` as it is in `rev`, or in the working tree (committed or not) when `rev` is
     /// `None`. Whitespace-only changes are not blamed (`-w`), and a file that has no such revision is an error.
     pub fn blame(&self, rev: Option<&str>, path: &str) -> Result<Blame, Error> {
-        let mut args = vec!["blame", "--line-porcelain", "-w"];
+        self.blame_with(rev, path, true)
+    }
+
+    /// [`GitCli::blame`], counting whitespace-only changes too when `ignore_whitespace` is false: in a conflict a
+    /// re-indent is a change like any other.
+    pub(crate) fn blame_with(&self, rev: Option<&str>, path: &str, ignore_whitespace: bool) -> Result<Blame, Error> {
+        let mut args = vec!["blame", "--line-porcelain"];
+        if ignore_whitespace {
+            args.push("-w");
+        }
         if let Some(rev) = rev {
             args.push(rev);
         }

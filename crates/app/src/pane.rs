@@ -25,7 +25,10 @@ impl Workspace {
         let files_visible = repo.files_visible && !work;
 
         let (short, summary) = match (&repo.phase, repo.selected) {
-            _ if work => (SharedString::default(), SharedString::from(format!("Uncommitted changes · {} files", repo.work.len()))),
+            _ if work => {
+                let n = repo.work.len();
+                (SharedString::default(), SharedString::from(format!("Uncommitted changes · {n} file{}", if n == 1 { "" } else { "s" })))
+            }
             (Phase::Ready(view), Some(ix)) => match view.entries.get(ix) {
                 Some(entry) => (entry.short_id.clone(), entry.summary.clone()),
                 None => Default::default(),
@@ -95,7 +98,7 @@ impl Workspace {
                 let content = if repo.file.is_some() {
                     self.render_diff(window, cx)
                 } else if work {
-                    text_panel("Pick a changed file under the project in the sidebar.", t().muted)
+                    self.render_work_overview(cx)
                 } else {
                     match self.commit_view() {
                         Some(view) => self.render_info(&view.detail, cx),

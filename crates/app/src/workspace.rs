@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gitgui_core::{
     Backend, Blame, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
-    MergeClue, Operation, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, Upstream, WebRemote, Gap, fetch_due, filter_commits, matches_text, reveal,
+    MergeClue, OperationState, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, Upstream, WebRemote, Gap, fetch_due, filter_commits, matches_text, reveal,
     scan_inputs, stash_count, visible_rows, people, web_remote,
 };
 use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
@@ -23,7 +23,7 @@ use gpui::{
 
 use crate::graph::{self, Entry};
 use crate::layout;
-use crate::menu::{Dialog, MenuState, Notice, NoticeAction};
+use crate::menu::{Dialog, MenuState, Notice};
 use crate::rows::{Anchor, DisplayRow, Mode, display_rows};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::ui::{self, button, ghost};
@@ -86,6 +86,8 @@ pub struct RepoView {
     pub upstreams: HashMap<String, Upstream>,
     /// The repository's remotes; none means there is nothing to fetch, pull or push.
     pub remotes: Vec<String>,
+    /// A merge, rebase or cherry-pick that stopped and is waiting, with its sides named by meaning.
+    pub operation: Option<OperationState>,
 }
 
 /// The branches to check for merges and the trunks to check them against.
@@ -307,6 +309,8 @@ pub struct FileState {
     pub single_column: bool,
     /// Who last changed each line, read the first time the pointer rests on one.
     pub blame: BlameState,
+    /// A file with conflicts opens in the resolver instead of as a diff.
+    pub resolver: Option<Box<crate::resolver::Resolver>>,
 }
 
 /// Blame for the open file: not asked for until a line is pointed at, then read in the background.
@@ -319,7 +323,7 @@ pub enum BlameState {
 }
 
 impl FileState {
-    fn new(index: usize) -> Self {
+    pub(crate) fn new(index: usize) -> Self {
         Self {
             index,
             phase: Phase::Loading,
@@ -345,6 +349,7 @@ impl FileState {
             diff_bounds: Default::default(),
             single_column: false,
             blame: BlameState::NotAsked,
+            resolver: None,
         }
     }
 
@@ -514,8 +519,10 @@ pub const FILES_MAX: f32 = 520.;
 pub const PANE_HEIGHT_SHARE: f32 = 0.6;
 pub const PANE_HEIGHT_MIN: f32 = 180.;
 pub const GRAPH_HEIGHT_MIN: f32 = 160.;
-/// About what the banner at the bottom takes while it shows.
+/// About what the banner at the bottom takes while it shows, and the bar over the main area while an operation is in
+/// progress.
 const NOTICE_HEIGHT: f32 = 36.;
+const OPERATION_BAR_HEIGHT: f32 = 36.;
 /// How often, while fetching on its own is on, the app looks whether the open project is due a fetch.
 pub(crate) const AUTO_FETCH_TICK: Duration = Duration::from_secs(30);
 
@@ -607,6 +614,10 @@ pub struct Workspace {
     /// Fetches on its own that failed in a row, and whether the banner has said so.
     auto_fetch_failures: u32,
     auto_fetch_warned: bool,
+    /// An operation just stopped on conflicts: the next read of the repository opens the first file with conflicts.
+    pub(crate) open_next_conflict: bool,
+    /// The graph was hidden to make room for resolving conflicts, and comes back when the operation ends.
+    pub(crate) graph_hidden_for_conflicts: bool,
 }
 
 /// Background work done so far, counted so tests can tell work that ran from work that was skipped.
@@ -647,8 +658,8 @@ struct RepoData {
     current_branch: Option<String>,
     changed: usize,
     read: Duration,
-    /// A merge, rebase or cherry-pick that an earlier session left half done.
-    in_progress: Option<Operation>,
+    /// A merge, rebase or cherry-pick that stopped (in this session or an earlier one) and is waiting.
+    operation: Option<OperationState>,
     /// The repository's web home, from its remote, for pull request and commit links.
     web: Option<WebRemote>,
     work: Vec<WorkFile>,
@@ -685,7 +696,7 @@ fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_cor
     let (fingerprint, commits) = git.log_if_changed(&LogOptions { max_count: Some(LOAD_LIMIT), skip: 0 }, unchanged)?;
     let current_branch = git.current_branch()?;
     let changed = git.changed_files()?;
-    let in_progress = git.in_progress();
+    let operation = git.operation_state();
     let web = git.remote_url().ok().flatten().and_then(|url| web_remote(&url));
     let work = git.work_status().unwrap_or_default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
@@ -693,7 +704,7 @@ fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_cor
     // Nice to know, not worth failing the read over.
     let upstreams = git.branch_sync().unwrap_or_default().into_iter().map(|b| (b.branch, b.upstream)).collect();
     let remotes = git.remotes().unwrap_or_default();
-    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), in_progress, web, work, today, upstreams, remotes })
+    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), operation, web, work, today, upstreams, remotes })
 }
 
 /// A commit's record and the files it changed; `None` when it stopped early because `wanted` said the
@@ -885,6 +896,8 @@ impl Workspace {
             fetched_at: HashMap::new(),
             auto_fetch_failures: 0,
             auto_fetch_warned: false,
+            open_next_conflict: false,
+            graph_hidden_for_conflicts: false,
         };
         this.schedule_auto_fetch(cx);
         this.reopen_last_project(cx);
@@ -1054,6 +1067,10 @@ impl Workspace {
         }
         self.loads += 1;
         let generation = self.loads;
+        // What the banner says is about the project it was said in.
+        if self.repo.as_ref().is_some_and(|repo| repo.project.path != path) {
+            self.notice = None;
+        }
         // Reading the same repository again keeps its filters; another one starts with none.
         let kept = self.repo.as_ref().filter(|repo| repo.project.path == path).map(|repo| GraphFilter {
             found: None,
@@ -1136,7 +1153,6 @@ impl Workspace {
                 let Some(repo) = this.repo.as_mut() else { return };
                 match result {
                     Ok((data, commits, everyone)) => {
-                        let in_progress = data.in_progress;
                         repo.work = data.work;
                         repo.graph_filter.today = data.today;
                         this.last_log = Some(LastLog {
@@ -1170,6 +1186,7 @@ impl Workspace {
                             scan_inputs: (branches, targets),
                             upstreams: data.upstreams,
                             remotes: data.remotes,
+                            operation: data.operation,
                         };
                         // Branches that have not moved since the last scan are known at once.
                         let cache = this.scan_caches.entry(path.clone()).or_default().clone();
@@ -1186,20 +1203,17 @@ impl Workspace {
                         // Read again in the background (after a fetch), the selected commit stays selected wherever its row went.
                         let selected = repo.selected_id();
                         repo.selected = selected.and_then(|id| view.entries.iter().position(|e| e.commit.as_deref() == Some(id.as_str())));
+                        let finished = view.operation.is_none();
                         repo.phase = Phase::Ready(view);
-                        if let Some(operation) = in_progress.filter(|_| this.notice.is_none()) {
-                            this.notice = Some(Notice {
-                                text: format!(
-                                    "A {} is in progress in this repository, left half done. Finish it in your editor or terminal, or abort it.",
-                                    operation.name()
-                                )
-                                .into(),
-                                warn: true,
-                                action: Some((format!("Abort {}", operation.name()).into(), NoticeAction::Abort(operation))),
-                            });
+                        if finished && std::mem::take(&mut this.graph_hidden_for_conflicts) {
+                            this.graph_hidden = false;
                         }
                         if scan {
                             this.start_merge_scan(path, inputs, cache, cx);
+                        }
+                        // An operation that just stopped on conflicts opens its first file in the resolver.
+                        if std::mem::take(&mut this.open_next_conflict) {
+                            this.open_first_conflict(cx);
                         }
                     }
                     Err(err) => repo.phase = Phase::Failed(err.into()),
@@ -1456,6 +1470,10 @@ impl Workspace {
     // ---- files ------------------------------------------------------------------------------
 
     pub fn open_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        // A file left in conflict opens in the resolver, not as a diff.
+        if self.work_open() && self.repo.as_ref().is_some_and(|repo| repo.work.get(index).is_some_and(|f| f.conflicted)) {
+            return self.open_conflict(index, cx);
+        }
         let Some(repo) = self.repo.as_mut() else { return };
         let Some(commit) = repo.commit.as_ref() else { return };
         let Phase::Ready(view) = &commit.phase else { return };
@@ -1695,6 +1713,7 @@ impl Workspace {
     /// Hides or shows the graph while a commit is open.
     pub fn toggle_graph_hidden(&mut self, cx: &mut Context<Self>) {
         self.graph_hidden = !self.graph_hidden;
+        self.graph_hidden_for_conflicts = false;
         self.peek = None;
         cx.notify();
     }
@@ -1702,7 +1721,8 @@ impl Workspace {
     /// The height of the area the graph and the file pane share: the window's, less the banner when one shows.
     pub(crate) fn main_height(&self, window: &Window) -> f32 {
         let banner = if self.notice.is_some() || self.busy.is_some() { NOTICE_HEIGHT } else { 0. };
-        f32::from(window.viewport_size().height) - banner
+        let bar = if self.operation().is_some() { OPERATION_BAR_HEIGHT } else { 0. };
+        f32::from(window.viewport_size().height) - banner - bar
     }
 
     /// A thin strip standing where a hidden panel was; pointing at it slides the panel in over the content.
@@ -2270,6 +2290,7 @@ impl Render for Workspace {
                     this.step_file(1, cx);
                 }
             }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| this.resolver_key(event, window, cx)))
             .bg(rgb(t().bg))
             .text_color(rgb(t().text))
             .text_sm()
@@ -2284,6 +2305,7 @@ impl Render for Workspace {
                     .h_full()
                     .flex()
                     .flex_col()
+                    .children(self.render_operation_bar(cx))
                     .child(div().flex_1().min_h_0().child(self.render_main(window, sidebar_width, total, cx)))
                     .children(self.render_notice(cx)),
             )
@@ -2403,7 +2425,8 @@ impl Workspace {
                     .text_size(px(11.))
                     .text_color(rgb(t().muted))
                     .children(branch.clone().map(|branch| div().min_w_0().overflow_hidden().line_clamp(1).text_ellipsis().child(branch)))
-                    .child("·")
+                    // A detached HEAD (in the middle of a rebase, say) has no name to separate.
+                    .when(branch.is_some(), |row| row.child("·"))
                     .child(if *changes == 0 {
                         div().flex_none().child("clean")
                     } else {
