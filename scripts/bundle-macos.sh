@@ -76,5 +76,17 @@ codesign --force --deep --sign - "$APP"
 
 DMG="$OUT/gitgui-$VERSION-macos-$ARCH.dmg"
 rm -f "$DMG"
-hdiutil create -quiet -volname gitgui -srcfolder "$APP" -ov -format UDZO "$DMG"
+# hdiutil now and then fails on a busy CI machine ("Resource busy") and works a moment later; say what it
+# said, and try again before giving up.
+attempt=1
+until hdiutil create -volname gitgui -srcfolder "$APP" -ov -format UDZO "$DMG"; do
+    if [ "$attempt" -ge 4 ]; then
+        echo "hdiutil failed $attempt times" >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    echo "hdiutil failed; trying again (attempt $attempt of 4)" >&2
+    sleep $((attempt * 5))
+    rm -f "$DMG"
+done
 echo "Built $APP and $DMG"
