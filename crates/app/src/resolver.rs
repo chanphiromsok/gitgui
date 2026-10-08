@@ -18,8 +18,8 @@ use gitgui_core::{
     Resolution, Segment, Side, SideCommit, SideName, TextConflict, Verdict, assemble, classify, indentation_matters,
 };
 use gpui::{
-    AnyElement, Context, FontWeight, KeyDownEvent, ListAlignment, ListOffset, ListState, SharedString, StyledText, Window, canvas, div, list,
-    prelude::*, px, rgb,
+    AnyElement, Context, Div, FontWeight, KeyDownEvent, ListAlignment, ListOffset, ListState, SharedString, Stateful, StyledText, Window, canvas,
+    div, list, prelude::*, px, rgb,
 };
 
 use crate::diff_view::LINE_H;
@@ -28,7 +28,7 @@ use crate::menu::{Action, Notice, explain};
 use crate::rows::Mode;
 use crate::syntax::{self, Lines, Span};
 use crate::theme::{self, t};
-use crate::ui::{self, MONO, button, ghost, segment, segmented, toggle};
+use crate::ui::{self, MONO, button, ghost, segmented, toggle};
 use crate::workspace::{FileState, Phase, Workspace};
 
 /// Unchanged lines kept in view beside a conflict; more between two conflicts are folded away.
@@ -38,7 +38,7 @@ const FOLD_AT_LEAST: usize = 4;
 /// Narrower than this, a card puts its sides one under the other instead of side by side.
 const STACK_BELOW: f32 = 640.;
 const HEAD_H: f32 = 36.;
-const LABEL_H: f32 = 24.;
+const LABEL_H: f32 = 28.;
 /// Commits listed per side before "more".
 const STORY_SHOWN: usize = 3;
 /// A line longer than this many characters is cut short in the resolver (a minified file would wrap for screens).
@@ -478,7 +478,7 @@ pub(crate) fn choice_text(choice: Resolution, names: &(SideName, SideName)) -> S
         Resolution::Incoming => format!("{}'s version", names.1.short),
         Resolution::CurrentThenIncoming => format!("both, {} first", names.0.short),
         Resolution::IncomingThenCurrent => format!("both, {} first", names.1.short),
-        Resolution::Base => "neither: the lines as they were before both changes".to_owned(),
+        Resolution::Base => "the original lines, as they were before both changes".to_owned(),
     }
 }
 
@@ -874,7 +874,7 @@ impl Workspace {
 
     /// The keys of the resolver, while a conflicted file is open and no field or window has the keyboard:
     /// N and P (or J and K) next and previous conflict, 1 the current side, 2 the incoming side, 3 both (current
-    /// first), 4 both (incoming first), 0 neither (the base), Backspace undo the choice, Cmd-Enter use the result.
+    /// first), 4 both (incoming first), 0 keep the original, Backspace undo the choice, Cmd-Enter use the result.
     pub fn resolver_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.resolver().is_none_or(|r| r.text().is_none())
             || self.dialog.is_some()
@@ -1174,7 +1174,7 @@ impl Workspace {
         let safe = resolver.safe_left();
         let decided = resolver.decided();
         let keys = format!(
-            "N / P next, previous   1 {}   2 {}   3 both   0 base   ⌫ undo   ⌘↩ use result",
+            "N / P next, previous   1 {}   2 {}   3 both   0 original   ⌫ undo   ⌘↩ use result",
             clipped(&names.0.short, 14),
             clipped(&names.1.short, 14)
         );
@@ -1343,10 +1343,10 @@ impl Workspace {
                     .child(format!("⋯  {hidden} unchanged line{}", if hidden == 1 { "" } else { "s" }))
                     .into_any_element()
             }
-            Row::Head(block) => self.render_card_head(block, &names, cx),
+            Row::Head(block) => self.render_card_head(block, cx),
             Row::Sides(block) => {
-                let half = |side: Side| self.side_label(block, side, &names);
-                inset(card(block).flex().child(half(Side::Current)).child(div().w(px(1.)).h_full().bg(rgb(t().border))).child(half(Side::Incoming)))
+                let (current, incoming) = (self.side_label(block, Side::Current, &names, cx), self.side_label(block, Side::Incoming, &names, cx));
+                inset(card(block).flex().child(current).child(div().w(px(1.)).h_full().bg(rgb(t().border))).child(incoming))
             }
             Row::Pair { block, line } => {
                 let Some(conflict) = resolver.block(block) else { return div().into_any_element() };
@@ -1363,8 +1363,8 @@ impl Workspace {
             }
             Row::Label { block, part } => {
                 let label: AnyElement = match part {
-                    Part::Current => self.side_label(block, Side::Current, &names),
-                    Part::Incoming => self.side_label(block, Side::Incoming, &names),
+                    Part::Current => self.side_label(block, Side::Current, &names, cx),
+                    Part::Incoming => self.side_label(block, Side::Incoming, &names, cx),
                     Part::Base => {
                         let empty = resolver.block(block).is_some_and(|b| b.base.as_ref().is_some_and(Vec::is_empty));
                         div()
@@ -1422,8 +1422,8 @@ impl Workspace {
         }
     }
 
-    /// A side's name in a card, with who last changed its lines there.
-    fn side_label(&self, block: usize, side: Side, names: &(SideName, SideName)) -> AnyElement {
+    /// A side's name in a card, with who last changed its lines there, and the button that accepts it.
+    fn side_label(&self, block: usize, side: Side, names: &(SideName, SideName), cx: &mut Context<Self>) -> AnyElement {
         let title = if side == Side::Current { &names.0.title } else { &names.1.title };
         let change: Option<&LastChange> = self.resolver().and_then(|r| r.changes.get(block)).and_then(|pair| pair[side as usize].as_ref());
         let now = now();
@@ -1460,38 +1460,74 @@ impl Workspace {
                     .text_color(rgb(t().muted))
                     .child(format!("{} · {} · {}", change.author, ui::ago(now - change.time), change.summary))
             }))
+            // The button sits with the side it takes, so it is plain which lines "Accept" means.
+            .child(self.choice_button(
+                block,
+                if side == Side::Current { "current" } else { "incoming" },
+                ("Accept", "✓ Accepted"),
+                if side == Side::Current { Resolution::Current } else { Resolution::Incoming },
+                cx,
+            ))
             .into_any_element()
     }
 
+    /// A button that takes one choice for a conflict: it reads as an action (a border, a verb), and is filled with a
+    /// check while it is the choice made. Another click takes the choice back; on "both" it swaps the order.
+    fn choice_button(&self, block: usize, key: &'static str, label: (&'static str, &'static str), this: Resolution, cx: &mut Context<Self>) -> Stateful<Div> {
+        let chosen = self.resolver().and_then(|resolver| resolver.choices.get(block).copied().flatten());
+        let lit = match this {
+            Resolution::CurrentThenIncoming => matches!(chosen, Some(Resolution::CurrentThenIncoming | Resolution::IncomingThenCurrent)),
+            _ => chosen == Some(this),
+        };
+        div()
+            .id(SharedString::from(format!("choose-{block}-{key}")))
+            .debug_selector(move || format!("choose-{block}-{key}"))
+            .flex_none()
+            .h(px(22.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_sm()
+            .border_1()
+            .text_xs()
+            .cursor_pointer()
+            .when(lit, |button| {
+                button
+                    .bg(rgb(t().accent))
+                    .border_color(rgb(t().accent))
+                    .text_color(rgb(t().on_accent))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .hover(|style| style.bg(rgb(theme::mix(t().accent, t().text_strong, 0.15))))
+            })
+            .when(!lit, |button| {
+                button
+                    .bg(rgb(t().element))
+                    .border_color(rgb(t().border))
+                    .hover(|style| style.bg(rgb(t().element_hover)).border_color(rgb(t().accent)))
+            })
+            .child(if lit { label.1 } else { label.0 })
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                let next = match (chosen, this) {
+                    (Some(Resolution::CurrentThenIncoming), Resolution::CurrentThenIncoming) => Some(Resolution::IncomingThenCurrent),
+                    (Some(Resolution::IncomingThenCurrent), Resolution::CurrentThenIncoming) => Some(Resolution::CurrentThenIncoming),
+                    (Some(now), _) if now == this => None,
+                    _ => Some(this),
+                };
+                workspace.choose_block(block, next, false, cx);
+            }))
+    }
+
     /// The top of a card: which conflict, where it is, and the choices.
-    fn render_card_head(&self, block: usize, names: &(SideName, SideName), cx: &mut Context<Self>) -> AnyElement {
+    fn render_card_head(&self, block: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(resolver) = self.resolver() else { return div().into_any_element() };
         let Some(conflict) = resolver.block(block) else { return div().into_any_element() };
         let chosen = resolver.choices[block];
         let focused = resolver.focused == block;
         let line = resolver.block_lines.get(block).copied().unwrap_or(1);
-        let choice = |key: &'static str, label: String, this: Resolution, lit: bool, cx: &mut Context<Self>| {
-            segment(SharedString::from(format!("choose-{block}-{key}")), label, lit)
-                .debug_selector(move || format!("choose-{block}-{key}"))
-                .on_click(cx.listener(move |workspace, _, _, cx| {
-                    // Clicking the lit choice again takes it back; Both again swaps the order.
-                    let next = match (chosen, this) {
-                        (Some(Resolution::CurrentThenIncoming), Resolution::CurrentThenIncoming) => Some(Resolution::IncomingThenCurrent),
-                        (Some(Resolution::IncomingThenCurrent), Resolution::CurrentThenIncoming) => Some(Resolution::CurrentThenIncoming),
-                        (Some(now), _) if now == this => None,
-                        _ => Some(this),
-                    };
-                    workspace.choose_block(block, next, false, cx);
-                }))
-        };
-        let both = matches!(chosen, Some(Resolution::CurrentThenIncoming | Resolution::IncomingThenCurrent));
-        let mut choices = vec![
-            choice("current", clipped(&names.0.short, 18), Resolution::Current, chosen == Some(Resolution::Current), cx),
-            choice("incoming", clipped(&names.1.short, 18), Resolution::Incoming, chosen == Some(Resolution::Incoming), cx),
-            choice("both", "Both".into(), Resolution::CurrentThenIncoming, both, cx),
-        ];
+        // The two sides carry their own Accept buttons (see `side_label`); these take what neither side alone says.
+        let mut choices = vec![self.choice_button(block, "both", ("Accept both", "✓ Both"), Resolution::CurrentThenIncoming, cx)];
         if conflict.base.is_some() {
-            choices.push(choice("base", "Neither".into(), Resolution::Base, chosen == Some(Resolution::Base), cx));
+            choices.push(self.choice_button(block, "base", ("Keep original", "✓ Original"), Resolution::Base, cx));
         }
         let mark = match chosen {
             Some(_) => div().flex_none().text_color(rgb(t().added)).child("✓"),
@@ -1532,7 +1568,7 @@ impl Workspace {
                             .child(format!("Conflict {} of {}", block + 1, resolver.blocks())),
                     )
                     .child(div().min_w_0().flex_1().overflow_hidden().line_clamp(1).text_ellipsis().text_xs().text_color(rgb(t().muted)).child(format!("line {line}")))
-                    .child(segmented(choices)),
+                    .child(div().flex_none().flex().gap_1().children(choices)),
             )
             .into_any_element()
     }
@@ -1576,6 +1612,16 @@ impl Workspace {
                                 .child("swap order"),
                         )
                     })
+                    .child(
+                        div()
+                            .id(("conflict-undo", block))
+                            .debug_selector(move || format!("conflict-undo-{block}"))
+                            .flex_none()
+                            .text_color(rgb(t().link))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.choose_block(block, None, false, cx)))
+                            .child("undo"),
+                    )
                     .children(why.map(|why| {
                         div()
                             .debug_selector(move || format!("conflict-why-{block}"))
@@ -1608,7 +1654,7 @@ impl Workspace {
             (None, Some(verdict)) => row
                 .child(div().flex_none().text_color(rgb(t().muted)).child("Not chosen yet"))
                 .child(div().min_w_0().overflow_hidden().line_clamp(1).text_ellipsis().text_color(rgb(t().added)).child(format!("safe: {}", reason_text(verdict.reason, names)))),
-            (None, None) => row.child(div().text_color(rgb(t().muted)).child("Not chosen yet: pick a side above")),
+            (None, None) => row.child(div().text_color(rgb(t().muted)).child("Not chosen yet: press Accept on a side above")),
         };
         div().w_full().px_3().child(content).into_any_element()
     }
