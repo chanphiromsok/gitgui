@@ -1,0 +1,35 @@
+name: ci
+
+# Checks every push to main and every pull request on the two systems gitgui is released for, so a build that would
+# fail only on Windows (or only on a Mac) is found before a release is tagged, not during it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, os: macos-14 }
+          - { name: Windows, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The libraries and the command line tool (the workspace's default members), with their tests.
+      - name: Test
+        run: cargo test
+      # The window itself: it has to compile, and everything it links.
+      - name: Build the app
+        run: cargo build -p gitgui-app

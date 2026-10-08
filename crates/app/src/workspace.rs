@@ -701,6 +701,8 @@ pub struct Workspace {
     pub busy: Option<SharedString>,
     /// The key to the graph's marks is open.
     pub legend_open: bool,
+    /// The signed-in GitHub account, and the pull requests and issues read with it.
+    pub github: crate::github_ui::GithubState,
     /// The branch line the pointer is on in the graph.
     pub graph_hover: Option<usize>,
     /// The commit that is a copy of the one the pointer is on, to light.
@@ -1005,6 +1007,7 @@ impl Workspace {
             dialog: None,
             busy: None,
             legend_open: false,
+            github: crate::github_ui::GithubState::new(),
             graph_hover: None,
             twin_hover: None,
             opening: 0,
@@ -1382,6 +1385,7 @@ impl Workspace {
                         if std::mem::take(&mut this.open_next_conflict) {
                             this.open_first_conflict(cx);
                         }
+                        this.github_after_read(cx);
                     }
                     Err(err) => repo.phase = Phase::Failed(err.into()),
                 }
@@ -2756,6 +2760,10 @@ impl Workspace {
             if selected && let Some(changes) = self.render_changes(cx) {
                 rows.push(changes);
             }
+            // And, for a project on GitHub, its pull requests and issues.
+            if selected && let Some(github) = self.render_github_sidebar(cx) {
+                rows.push(github);
+            }
         }
 
         div()
@@ -3003,9 +3011,16 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(header)
-            .child(self.render_filter_bar(repo, view, area < 640., cx))
-            .children(self.render_rebased_bar(view, cx))
-            .child(self.render_graph(area, cx))
+            .children(self.render_main_tabs(cx))
+            .when(self.github.tab == crate::github_ui::MainTab::Graph || self.github_repo().is_none(), |center| {
+                center
+                    .child(self.render_filter_bar(repo, view, area < 640., cx))
+                    .children(self.render_rebased_bar(view, cx))
+                    .child(self.render_graph(area, cx))
+            })
+            .when(self.github.tab != crate::github_ui::MainTab::Graph && self.github_repo().is_some(), |center| {
+                center.child(self.render_github_main(cx))
+            })
             .when(self.legend_open, |center| center.child(self.render_legend(cx)))
             .into_any_element()
     }

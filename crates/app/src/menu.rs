@@ -76,6 +76,8 @@ pub enum Action {
     DeleteConflicted(String),
     /// Move the branch back to where it was before its last rebase.
     UndoRebase(gitgui_core::Rebased),
+    /// The window that shows the code to type on github.com while the sign-in waits.
+    GithubSignIn,
 }
 
 /// What the test merge behind a question has found so far.
@@ -519,7 +521,7 @@ impl Workspace {
                 true,
                 None,
             ),
-            Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => return,
+            Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) | Action::GithubSignIn => return,
         };
         if let Some(initial) = &prompt {
             let initial = initial.clone();
@@ -563,7 +565,11 @@ impl Workspace {
     }
 
     pub fn cancel_dialog(&mut self, cx: &mut Context<Self>) {
-        if self.dialog.take().is_some() {
+        if let Some(dialog) = self.dialog.take() {
+            // Closing the sign-in window is giving up on the sign-in.
+            if dialog.action == Action::GithubSignIn {
+                self.github_cancel_sign_in(cx);
+            }
             cx.notify();
         }
     }
@@ -647,6 +653,7 @@ impl Workspace {
             ),
             Action::StartOver(path) => self.restart_conflict(path, cx),
             Action::DeleteConflicted(path) => self.delete_conflicted(path, cx),
+            Action::GithubSignIn => self.github_reopen(cx),
             Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => {}
             Action::Clone => {
                 let folder = dialog.folder.unwrap_or_else(|| self.clone_folder());

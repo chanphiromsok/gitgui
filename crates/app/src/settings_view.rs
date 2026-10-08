@@ -30,10 +30,12 @@ pub enum SettingsPage {
     Files,
     Appearance,
     Projects,
+    GitHub,
 }
 
 impl SettingsPage {
-    pub const ALL: [SettingsPage; 6] = [Self::Graph, Self::GraphStyle, Self::Workflow, Self::Files, Self::Appearance, Self::Projects];
+    pub const ALL: [SettingsPage; 7] =
+        [Self::Graph, Self::GraphStyle, Self::Workflow, Self::Files, Self::Appearance, Self::Projects, Self::GitHub];
 
     fn title(self) -> &'static str {
         match self {
@@ -43,6 +45,7 @@ impl SettingsPage {
             Self::Files => "Files & diffs",
             Self::Appearance => "Appearance",
             Self::Projects => "Projects",
+            Self::GitHub => "GitHub",
         }
     }
 
@@ -54,6 +57,7 @@ impl SettingsPage {
             Self::Files => "How a commit's changed files and their diffs are laid out.",
             Self::Appearance => "Colors and file icons.",
             Self::Projects => "Where new clones go, fetching from remotes, and where gitgui keeps its own files.",
+            Self::GitHub => "Signing in to see a repository's pull requests and issues.",
         }
     }
 }
@@ -77,7 +81,7 @@ pub(crate) fn switch(id: &'static str, on: bool) -> Stateful<gpui::Div> {
 }
 
 /// One setting: its name and what it does, and its control.
-fn row(title: &'static str, detail: &'static str, control: impl IntoElement) -> AnyElement {
+pub(crate) fn row(title: &'static str, detail: &'static str, control: impl IntoElement) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -286,6 +290,7 @@ impl Workspace {
                 ]
             }
             SettingsPage::GraphStyle => vec![self.graph_style_cards(card_w, cx)],
+            SettingsPage::GitHub => self.github_settings_cards(cx),
             SettingsPage::Workflow => self.workflow_page(cx),
             SettingsPage::Files => vec![card(
                 None,

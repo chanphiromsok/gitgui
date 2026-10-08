@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/store", "crates/cli", "crates/app"]
-default-members = ["crates/core", "crates/store", "crates/cli"]
+members = ["crates/core", "crates/store", "crates/cli", "crates/forge", "crates/app"]
+default-members = ["crates/core", "crates/store", "crates/cli", "crates/forge"]
 exclude = ["vendor/gpui"]
 
 [workspace.package]

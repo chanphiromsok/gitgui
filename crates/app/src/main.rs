@@ -10,6 +10,8 @@ mod changes;
 mod detail;
 mod diff_view;
 mod graph;
+mod github_ui;
+mod github_view;
 mod graph_style;
 mod icons;
 mod layout;
