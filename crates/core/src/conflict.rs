@@ -777,7 +777,18 @@ impl GitCli {
 
 /// A path from git's own list, checked before it is handed back to git: never an option.
 fn check_path(path: &str) -> Result<(), Error> {
-    if path.is_empty() || path.starts_with('-') || Path::new(path).is_absolute() || path.split('/').any(|part| part == "..") {
+    // Rooted counts as absolute on every system: on Windows `/etc/passwd` has no drive, so `is_absolute` says no,
+    // yet it still names a place outside the repository.
+    let rooted = path.starts_with('/')
+        || (cfg!(windows) && (path.starts_with('\\') || path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic()));
+    let parent = |part: &str| part == "..";
+    if path.is_empty()
+        || path.starts_with('-')
+        || rooted
+        || Path::new(path).is_absolute()
+        || path.split('/').any(parent)
+        || (cfg!(windows) && path.split('\\').any(parent))
+    {
         return Err(Error::Parse(format!("not a usable path: {path:?}")));
     }
     Ok(())
@@ -1217,5 +1228,10 @@ mod tests {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
         assert!(check_path("src/a b.rs").is_ok());
+        if cfg!(windows) {
+            for bad in [r"\Windows\System32", r"C:\Windows", "C:/Windows", r"a\..\..\b"] {
+                assert!(check_path(bad).is_err(), "{bad:?}");
+            }
+        }
     }
 }

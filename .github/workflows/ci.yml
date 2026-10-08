@@ -29,7 +29,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The libraries and the command line tool (the workspace's default members), with their tests.
       - name: Test
-        run: cargo test
+        run: cargo test --no-fail-fast
       # The window itself: it has to compile, and everything it links.
       - name: Build the app
         run: cargo build -p gitgui-app
