@@ -942,7 +942,12 @@ fn fetch_brings_in_the_remotes_branches_and_a_new_local_branch_says_it_is_not_on
 #[test]
 fn clone_copies_a_repository_by_address_and_refuses_what_could_run_a_program_or_overwrite() {
     let source = trunk();
-    let url = format!("file://{}", source.path().display());
+    // A file address has three slashes and forward slashes on Windows too: file:///C:/Users/…
+    let file_url = |path: &std::path::Path| {
+        let text = path.display().to_string().replace('\\', "/");
+        if text.starts_with('/') { format!("file://{text}") } else { format!("file:///{text}") }
+    };
+    let url = file_url(source.path());
     let parent = std::env::temp_dir().join(format!("gitgui-test-{}-clone-parent", std::process::id()));
     let _ = std::fs::remove_dir_all(&parent);
 
@@ -962,7 +967,7 @@ fn clone_copies_a_repository_by_address_and_refuses_what_could_run_a_program_or_
     assert!(gitgui_core::clone::clone(&evil, &parent, "evil").is_err());
     assert!(!marker.exists() && !parent.join("evil").exists());
     // A failing address (nothing there) reports git's own words and leaves no folder.
-    let missing = format!("file://{}/no-such-repo", parent.display());
+    let missing = format!("{}/no-such-repo", file_url(&parent));
     let failed = gitgui_core::clone::clone(&missing, &parent, "nothing");
     assert!(matches!(failed, Err(Error::Git { .. })), "{failed:?}");
     assert!(!parent.join("nothing").exists());
