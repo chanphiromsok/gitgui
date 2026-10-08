@@ -2,9 +2,10 @@
 resolver = "2"
 members = ["crates/core", "crates/store", "crates/cli", "crates/app"]
 default-members = ["crates/core", "crates/store", "crates/cli"]
+exclude = ["vendor/gpui"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT"
 
@@ -15,6 +16,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# GPUI 0.2.2 with one fix (vendor/gpui/src/elements/text.rs, marked "gitgui patch"): text cut short with an
+# ellipsis lost the rest of its style runs for later layout passes and could abort the app on text with
+# non-ASCII characters in it. Drop this when a GPUI release carries the fix.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
 
 # Smaller, faster release binaries; slower to build.
 [profile.release]

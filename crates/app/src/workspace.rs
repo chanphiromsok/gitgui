@@ -583,6 +583,8 @@ pub struct Workspace {
     pub(crate) branch_pick_reveal: std::cell::Cell<bool>,
     /// What is being done right now, while a git operation runs.
     pub busy: Option<SharedString>,
+    /// How many folders are being looked at to be added as projects.
+    opening: usize,
     loads: u64,
     graph_scroll: UniformListScrollHandle,
     /// The sidebar's width as last dragged; the window may allow less (see `layout`).
@@ -877,6 +879,7 @@ impl Workspace {
             menu: None,
             dialog: None,
             busy: None,
+            opening: 0,
             loads: 0,
             graph_scroll: UniformListScrollHandle::new(),
             sidebar_width: layout::SIDEBAR_DEFAULT,
@@ -1016,23 +1019,51 @@ impl Workspace {
     }
 
     /// Adds a folder to the sidebar and opens it. A folder inside a repository adds the repository.
+    /// Asking git where the repository starts takes a moment (on Windows, with a virus scanner, many), so
+    /// it happens off the window's thread; the window says "Opening…" meanwhile and stays usable.
     pub fn add_folder(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let root = match GitCli::new(path).toplevel() {
-            Ok(root) => root,
-            Err(_) => return self.fail(format!("{} is not inside a git repository.", path.display()), cx),
-        };
+        self.add_folder_noting(path, None, cx);
+    }
+
+    /// `add_folder`, then says `note` once the project is open (opening a project clears the banner).
+    pub(crate) fn add_folder_noting(&mut self, path: &Path, note: Option<String>, cx: &mut Context<Self>) {
         let Some(store) = &self.store else {
             return self.fail("There is no folder to save projects in.", cx);
         };
-        match store.add_project(&root) {
-            Ok(project) => {
-                if !self.projects.iter().any(|p| p.path == project.path) {
-                    self.projects.push(project.clone());
+        let store = Store::at(store.dir());
+        let path = path.to_owned();
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        self.opening += 1;
+        self.busy = Some(format!("Opening {name}…").into());
+        cx.notify();
+        self.spawn_load(
+            cx,
+            move || {
+                let root = GitCli::new(&path)
+                    .toplevel()
+                    .map_err(|_| format!("{} is not inside a git repository.", path.display()))?;
+                store.add_project(&root).map_err(|err| err.to_string())
+            },
+            move |this, result, cx| {
+                this.opening = this.opening.saturating_sub(1);
+                if this.opening == 0 {
+                    this.busy = None;
                 }
-                self.select_project(project.path, cx);
-            }
-            Err(err) => self.fail(err, cx),
-        }
+                match result {
+                    Ok(project) => {
+                        if !this.projects.iter().any(|p| p.path == project.path) {
+                            this.projects.push(project.clone());
+                        }
+                        this.select_project(project.path, cx);
+                        if let Some(note) = note {
+                            this.notice = Some(Notice::info(note));
+                        }
+                    }
+                    Err(message) => this.fail(message, cx),
+                }
+                cx.notify();
+            },
+        );
     }
 
     pub fn remove_project(&mut self, path: &Path, cx: &mut Context<Self>) {

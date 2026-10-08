@@ -68,6 +68,7 @@ pub fn clone(url: &str, parent: &Path, name: &str) -> Result<PathBuf, Error> {
     }
     std::fs::create_dir_all(parent).map_err(Error::Spawn)?;
     let mut command = Command::new("git");
+    crate::process::windowless(&mut command);
     command
         .args(["-c", "protocol.ext.allow=never", "clone", "--", url.trim()])
         .arg(&dest)

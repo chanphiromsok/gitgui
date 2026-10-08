@@ -1997,10 +1997,12 @@ async fn switching_projects_frees_the_old_history_before_the_new_one_loads(cx: &
     let (first, second) = (merged_pr("switch-a"), merged_pr("switch-b"));
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(first.data())), cx));
     open_project(&ws, cx, &first.repo());
-    let old = ws.read_with(cx, |ws, _| ws.kept_history()).expect("the first project's history is kept");
+    open_project(&ws, cx, &second.repo());
+    let old = ws.read_with(cx, |ws, _| ws.kept_history()).expect("the second project's history is kept");
     assert!(old.upgrade().is_some());
 
-    ws.update(cx, |ws, cx| ws.add_folder(&second.repo(), cx));
+    let first_path = ws.read_with(cx, |ws, _| ws.projects[0].path.clone());
+    ws.update(cx, |ws, cx| ws.select_project(first_path, cx));
     // Not yet read: the old history must already be gone.
     assert!(old.upgrade().is_none(), "the old project's commits are still held while the new one loads");
     cx.run_until_parked();

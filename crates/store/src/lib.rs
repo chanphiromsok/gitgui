@@ -230,12 +230,20 @@ impl Store {
     // ---- projects -------------------------------------------------------------------------
 
     pub fn projects(&self) -> Result<Vec<Project>, Error> {
-        read_json(&self.dir.join("projects.json"))
+        let mut projects: Vec<Project> = read_json(&self.dir.join("projects.json"))?;
+        // Older versions kept Windows paths in their `\\?\` form; the same folder must not be listed twice.
+        for project in &mut projects {
+            project.path = plain_path(std::mem::take(&mut project.path));
+        }
+        let mut seen = std::collections::HashSet::new();
+        projects.retain(|project| seen.insert(project.path.clone()));
+        Ok(projects)
     }
 
     /// Adds a folder to the sidebar. Adding one already there changes nothing.
     pub fn add_project(&self, path: &Path) -> Result<Project, Error> {
         let path = fs::canonicalize(path).map_err(|source| Error::Io { path: path.to_owned(), source })?;
+        let path = plain_path(path);
         let mut projects = self.projects()?;
         if let Some(existing) = projects.iter().find(|p| p.path == path) {
             return Ok(existing.clone());
@@ -335,6 +343,23 @@ impl Store {
     }
 }
 
+/// `fs::canonicalize` answers `\\?\C:\work\repo` on Windows, the form the system uses inside. Nobody writes a
+/// path that way, git and other programs do not all take it, and it would not equal the same folder as
+/// `C:\work\repo` or as git writes it. This gives the ordinary form back, and leaves any other path alone.
+fn plain_path(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else { return path };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let drive = rest.as_bytes();
+        if drive.len() >= 2 && drive[0].is_ascii_alphabetic() && drive[1] == b':' {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn default_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("GITGUI_DATA_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
@@ -399,6 +424,33 @@ fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_paths_lose_their_verbatim_prefix() {
+        let plain = |text: &str| plain_path(PathBuf::from(text));
+        assert_eq!(plain(r"\\?\C:\work\repo"), PathBuf::from(r"C:\work\repo"));
+        assert_eq!(plain(r"\\?\UNC\server\share\repo"), PathBuf::from(r"\\server\share\repo"));
+        assert_eq!(plain(r"C:\work\repo"), PathBuf::from(r"C:\work\repo"));
+        assert_eq!(plain("/Users/me/repo"), PathBuf::from("/Users/me/repo"));
+        // A device path that is not a drive stays as it is.
+        assert_eq!(plain(r"\\?\Volume{1234}\repo"), PathBuf::from(r"\\?\Volume{1234}\repo"));
+    }
+
+    #[test]
+    fn projects_saved_with_the_prefix_are_listed_once_without_it() {
+        let dir = std::env::temp_dir().join(format!("gitgui-plain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("projects.json"),
+            r#"[{"path":"\\\\?\\C:\\work\\repo","name":"repo","workflow":null},{"path":"C:\\work\\repo","name":"repo","workflow":null}]"#,
+        )
+        .unwrap();
+        let projects = Store::at(&dir).projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, PathBuf::from(r"C:\work\repo"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     struct Scratch(PathBuf);
 

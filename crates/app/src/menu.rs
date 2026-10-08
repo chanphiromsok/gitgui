@@ -729,9 +729,8 @@ impl Workspace {
                 this.busy = None;
                 match result {
                     Ok((dest, name)) => {
-                        this.add_folder(&dest, cx);
-                        this.notice = Some(Notice::info(format!("Cloned {name} into {}.", dest.display())));
-                        cx.notify();
+                        let note = format!("Cloned {name} into {}.", dest.display());
+                        this.add_folder_noting(&dest, Some(note), cx);
                     }
                     Err(error) => this.fail(explain(&error), cx),
                 }

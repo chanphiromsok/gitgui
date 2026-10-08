@@ -11,6 +11,7 @@ pub mod hosting;
 pub mod lineage;
 pub mod model;
 pub mod people;
+pub mod process;
 pub mod squash;
 pub mod sync;
 pub mod tree;

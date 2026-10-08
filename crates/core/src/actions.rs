@@ -129,7 +129,9 @@ impl GitCli {
     }
 
     fn write_output(&self, args: &[&str]) -> Result<std::process::Output, Error> {
-        Process::new("git")
+        let mut process = Process::new("git");
+        crate::process::windowless(&mut process);
+        process
             .arg("-C")
             .arg(self.root())
             .args(args)

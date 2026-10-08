@@ -118,6 +118,7 @@ impl GitCli {
 
     pub(crate) fn command(&self, args: &[&str]) -> Process {
         let mut process = Process::new("git");
+        crate::process::windowless(&mut process);
         // A viewer must not take `index.lock`; it would make the user's own `git add` fail.
         process.arg("--no-optional-locks").arg("-C").arg(&self.root).args(args);
         if self.low_priority {

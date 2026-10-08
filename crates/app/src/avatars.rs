@@ -209,7 +209,9 @@ pub fn gh_lookup(hint: &Hint) -> Result<Option<String>, ()> {
     let mut child = ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
         .iter()
         .find_map(|gh| {
-            Command::new(gh)
+            let mut command = Command::new(gh);
+            gitgui_core::process::windowless(&mut command);
+            command
                 .args(["api", &format!("repos/{}/commits/{}", hint.repo, hint.sha), "--jq", ".author.avatar_url // empty"])
                 .env("GH_PROMPT_DISABLED", "1")
                 .env("NO_COLOR", "1")
