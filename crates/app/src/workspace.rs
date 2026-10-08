@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gitgui_core::{
     Backend, Blame, BranchTip, Commit, CommitDetail, Evidence, FileChange, FileDiff, FileStatus, GitCli, Host, Layout, Lineage, LogOptions, People, WorkFile,
-    MergeClue, Operation, Query, ScanCache, Scope, TreeRow, WebRemote, filter_commits, matches_text, scan_inputs, stash_count,
+    MergeClue, Operation, Query, REVEAL_STEP, Reveal, ScanCache, Scope, TreeRow, WebRemote, Gap, filter_commits, matches_text, reveal, scan_inputs, stash_count,
     visible_rows, people, web_remote,
 };
 use gitgui_store::{Comment, DiffMode, FileLayout, GraphFaces, ReviewLayout, NewComment, Project, Settings, Store};
@@ -38,6 +38,8 @@ const LOAD_LIMIT: usize = 20_000;
 const DIFF_CONTEXT: u32 = 3;
 /// "Whole file": more context than any file has lines.
 pub const WHOLE_FILE: u32 = 1_000_000;
+/// A file bigger than this is not read to show more of the lines around the changes.
+const REVEAL_MAX_BYTES: usize = 8 << 20;
 
 pub enum Phase<T> {
     Loading,
@@ -257,7 +259,17 @@ pub struct FileState {
     /// Index into the commit's files.
     pub index: usize,
     pub phase: Phase<()>,
+    /// What is shown: `raw` with the unchanged lines `reveals` ask for put in.
     pub diff: FileDiff,
+    /// The diff as git gave it.
+    pub raw: FileDiff,
+    /// The file after the change, for showing more of the lines around the changes; none when it is too big or not text.
+    pub text: Option<Arc<String>>,
+    /// How much is shown of each gap of `raw`.
+    pub reveals: Vec<Reveal>,
+    /// For each hunk of `diff`, the gap over it that still has lines hidden; and the one after the last hunk.
+    pub above: Vec<Option<Gap>>,
+    pub below: Option<Gap>,
     /// Syntax colors for the diff's lines; empty until read, or for a language not known.
     pub colors: syntax::FileColors,
     /// The picture before and after, for an image file.
@@ -300,6 +312,11 @@ impl FileState {
             index,
             phase: Phase::Loading,
             diff: FileDiff::default(),
+            raw: FileDiff::default(),
+            text: None,
+            reveals: Vec::new(),
+            above: Vec::new(),
+            below: None,
             colors: syntax::FileColors::default(),
             images: None,
             comments: Vec::new(),
@@ -324,11 +341,46 @@ impl FileState {
         if self.single_column { Mode::Unified } else { wanted }
     }
 
+    /// Puts `raw` and what `reveals` ask to be shown of the unchanged lines together as `diff`.
+    pub fn apply_reveals(&mut self) {
+        match self.text.as_deref().filter(|_| !self.single_column) {
+            Some(text) => {
+                let shown = reveal(&self.raw, text, &self.reveals);
+                (self.diff, self.above, self.below) = (shown.diff, shown.above, shown.below);
+            }
+            None => {
+                self.diff = self.raw.clone();
+                self.above = vec![None; self.diff.hunks.len()];
+                self.below = None;
+            }
+        }
+    }
+
+    /// Shows `REVEAL_STEP` more unchanged lines in gap `gap`: over the hunk after it (`up`), or under the one before it.
+    /// The view stays where it is: lines shown over a hunk come in under its header, which does not move, and lines shown
+    /// under the hunk before it come in above the header, which goes down with them.
+    pub fn show_more(&mut self, mode: Mode, gap: usize, up: bool) {
+        if self.reveals.len() <= gap {
+            self.reveals.resize(gap + 1, Reveal::default());
+        }
+        let step = &mut self.reveals[gap];
+        if up {
+            step.above += REVEAL_STEP;
+        } else {
+            step.below += REVEAL_STEP;
+        }
+        self.apply_reveals();
+        self.rebuild(mode, true);
+    }
+
     /// Rebuilds the rows from the diff, comments and composer. Scroll stays where it was unless
     /// the whole layout changed (a different mode).
     pub fn rebuild(&mut self, mode: Mode, keep_scroll: bool) {
         let top = self.list.logical_scroll_top();
         self.rows = display_rows(&self.diff, self.mode(mode), &self.comments, self.composing);
+        if self.below.is_some() {
+            self.rows.push(DisplayRow::Tail);
+        }
         self.minimap = crate::minimap::build(&self.diff, &self.rows, crate::diff_view::LINE_H);
         self.max_cols = self
             .diff
@@ -1304,7 +1356,7 @@ impl Workspace {
         let (latest, counts) = (self.file_ticket.clone(), self.counts.clone());
         self.spawn_load(
             cx,
-            move || -> Option<Result<(FileDiff, syntax::FileColors, Option<preview::Images>), gitgui_core::Error>> {
+            move || -> Option<Result<(FileDiff, syntax::FileColors, Option<preview::Images>, Option<Arc<String>>), gitgui_core::Error>> {
                 let wanted = || current(&latest, ticket);
                 if !wanted() {
                     return None;
@@ -1325,7 +1377,7 @@ impl Workspace {
                         if !wanted() {
                             return None;
                         }
-                        let (old, new) = if image || language { git.work_sides(work) } else { (None, None) };
+                        let (old, new) = if image || language || (!diff.binary && !single_column) { git.work_sides(work) } else { (None, None) };
                         (diff, old, new)
                     }
                     None => {
@@ -1336,7 +1388,7 @@ impl Workspace {
                         if !wanted() {
                             return None;
                         }
-                        let (old, new) = if image || language {
+                        let (old, new) = if image || language || (!diff.binary && !single_column) {
                             let old_path = read_change.old_path.as_deref().unwrap_or(path);
                             let old = (read_change.status != FileStatus::Added)
                                 .then(|| git.file_bytes_at(&format!("{read_id}^1"), old_path).ok().flatten())
@@ -1367,7 +1419,12 @@ impl Workspace {
                 } else {
                     syntax::FileColors::default()
                 };
-                Some(Ok((diff, colors, images)))
+                // The file after the change, to show more of the unchanged lines around the changes from.
+                let text = (!diff.binary && !single_column)
+                    .then(|| new.as_deref().filter(|bytes| bytes.len() <= REVEAL_MAX_BYTES).and_then(|bytes| String::from_utf8(bytes.to_vec()).ok()))
+                    .flatten()
+                    .map(Arc::new);
+                Some(Ok((diff, colors, images, text)))
             },
             move |this, result, cx| {
                 // Stopped early: another file was opened since.
@@ -1381,11 +1438,14 @@ impl Workspace {
                     return;
                 };
                 match result {
-                    Ok((diff, colors, images)) => {
-                        file.diff = diff;
+                    Ok((diff, colors, images, text)) => {
+                        file.raw = diff;
+                        file.text = text;
+                        file.reveals.clear();
                         file.colors = colors;
                         file.images = images;
                         file.single_column = single_column;
+                        file.apply_reveals();
                         file.phase = Phase::Ready(());
                         file.rebuild(mode, keep_scroll);
                     }

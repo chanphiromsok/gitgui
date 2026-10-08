@@ -55,7 +55,7 @@ impl Minimap {
 fn estimated_height(row: &DisplayRow, line_h: f32) -> f32 {
     match row {
         DisplayRow::Line { .. } | DisplayRow::Pair { .. } => line_h,
-        DisplayRow::Hunk(_) => line_h + 4.,
+        DisplayRow::Hunk(_) | DisplayRow::Tail => line_h + 4.,
         DisplayRow::Notice(_) => line_h + 10.,
         DisplayRow::Comment(_) => 84.,
         DisplayRow::Composer(_) => 150.,
@@ -81,7 +81,7 @@ fn kind_of(row: &DisplayRow, diff: &FileDiff) -> Option<MarkKind> {
             }
         }
         DisplayRow::Comment(_) | DisplayRow::Composer(_) => Some(MarkKind::Comment),
-        DisplayRow::Hunk(_) | DisplayRow::Notice(_) => None,
+        DisplayRow::Hunk(_) | DisplayRow::Notice(_) | DisplayRow::Tail => None,
     }
 }
 

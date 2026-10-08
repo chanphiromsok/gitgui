@@ -2536,7 +2536,7 @@ async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_win
 
     // The button is by the line numbers, at the left edge of the code, not at the far end of the header row.
     let code = cx.debug_bounds("diff-list").unwrap();
-    let more = center_of(cx, "hunk-more-0".to_owned());
+    let more = center_of(cx, "hunk-up-0".to_owned());
     assert!(more.x - code.origin.x < px(60.), "beside the line numbers: {:?} vs {:?}", more.x, code.origin.x);
 
     // While reading, the code area is the biggest part of the window: no sidebar, no graph.
@@ -2554,6 +2554,73 @@ async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_win
     ws.update(cx, |ws, cx| ws.back(cx));
     draw(cx, &ws);
     assert_eq!(cx.debug_bounds("diff-list").unwrap().origin.x, before_x, "the sidebar and graph come back");
+}
+
+/// The arrows in the gutter show 20 more unchanged lines on the side they point to, and only there.
+#[gpui::test]
+async fn the_arrows_in_the_gutter_show_more_lines_above_or_below_a_hunk_only(cx: &mut TestAppContext) {
+    let fx = bare_fixture("arrows-gutter");
+    let text = |a: &str| -> String { (1..=60).map(|n| if n == 30 { format!("{a}\n") } else { format!("line {n}\n") }).collect() };
+    commit_file(&fx, "r.txt", &text("before"), "base");
+    commit_file(&fx, "r.txt", &text("after"), "change");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    ws.update(cx, |ws, cx| ws.set_review_layout(gitgui_store::ReviewLayout::Beside, cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "change");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+
+    // What is shown: the new side's first and last line number, and where lines are still hidden.
+    let shown = |ws: &Entity<Workspace>, cx: &VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+            let lines: Vec<_> = file.diff.hunks.iter().flat_map(|h| &h.lines).filter_map(|l| l.new_no).collect();
+            (
+                (lines.first().copied(), lines.last().copied()),
+                file.above[0].map(|g| g.left),
+                file.below.map(|g| g.left),
+                file.rows.iter().any(|r| matches!(r, DisplayRow::Tail)),
+            )
+        })
+    };
+    // 3 lines around the change: 27..33 of 60 are shown, 26 are hidden above and 27 below.
+    assert_eq!(shown(&ws, cx), ((Some(27), Some(33)), Some(26), Some(27), true));
+    assert!(cx.debug_bounds("hunk-up-0").is_some() && cx.debug_bounds("tail-down-0").is_some());
+    assert!(cx.debug_bounds("hunk-down-0").is_none(), "nothing is before the first hunk to show more under");
+
+    // Up: 20 more lines over the hunk, none under it.
+    let at = center_of(cx, "hunk-up-0".to_owned());
+    click(cx, MouseButton::Left, at);
+    draw(cx, &ws);
+    assert_eq!(shown(&ws, cx), ((Some(7), Some(33)), Some(6), Some(27), true));
+
+    // Down at the end: 20 more under it.
+    let at = center_of(cx, "tail-down-0".to_owned());
+    click(cx, MouseButton::Left, at);
+    draw(cx, &ws);
+    assert_eq!(shown(&ws, cx), ((Some(7), Some(53)), Some(6), Some(7), true));
+
+    // What is left shows in full and the arrows go.
+    let at = center_of(cx, "tail-down-0".to_owned());
+    click(cx, MouseButton::Left, at);
+    let at = center_of(cx, "hunk-up-0".to_owned());
+    click(cx, MouseButton::Left, at);
+    draw(cx, &ws);
+    assert_eq!(shown(&ws, cx), ((Some(1), Some(60)), None, None, false));
+
+    // The numbers are right on both sides, and a collapse puts everything back.
+    let numbers = ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        file.diff.hunks[0].lines.iter().all(|l| l.kind == gitgui_core::LineKind::Context && l.old_no == l.new_no || l.old_no.is_some() != l.new_no.is_some())
+    });
+    assert!(numbers, "the same line has the same number in both files here");
+    ws.update(cx, |ws, cx| ws.set_diff_context(Some(25), cx));
+    cx.run_until_parked();
+    ws.update(cx, |ws, cx| ws.set_diff_context(None, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert_eq!(shown(&ws, cx), ((Some(27), Some(33)), Some(26), Some(27), true));
 }
 
 #[gpui::test]

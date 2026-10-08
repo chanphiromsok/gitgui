@@ -50,6 +50,8 @@ pub enum DisplayRow {
     /// The text field for a new comment on this anchor.
     Composer(Anchor),
     Notice(Notice),
+    /// After the last hunk, when the file goes on: the arrow that shows more of it.
+    Tail,
 }
 
 /// `comments` are the ones for this file in this commit. `composing` is the line a comment is being

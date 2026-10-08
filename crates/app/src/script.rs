@@ -124,6 +124,16 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             workspace.open_branch_picker(window, cx);
             workspace.branch_search.update(cx, |input, cx| input.replace_text(rest, cx));
         }
+        // reveal up N | reveal down N | reveal tail: the arrows in the diff's gutter, of hunk N.
+        "reveal" => {
+            let mut words = rest.split_whitespace();
+            let (which, hunk) = (words.next().unwrap_or(""), words.next().and_then(|n| n.parse().ok()));
+            match which {
+                "up" => workspace.reveal_lines(hunk, true, cx),
+                "down" => workspace.reveal_lines(hunk, false, cx),
+                _ => workspace.reveal_lines(None, false, cx),
+            }
+        }
         "search" => workspace.set_search(rest.to_owned(), cx),
         "menu" => {
             // menu authors|dates X Y: the menu a click there on that chip would open.

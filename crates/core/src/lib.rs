@@ -28,7 +28,7 @@ pub use filter::{
     Constraints, Day, Query, Scope, add_days, commit_day, day_of, filter_commits, matches_text, narrow, parse_constraints, stash_count,
     term, with_term,
 };
-pub use diff::{DiffLine, FileDiff, Hunk, LineKind, Pair};
+pub use diff::{DiffLine, FileDiff, Gap, Hunk, LineKind, Pair, REVEAL_STEP, Reveal, Revealed, reveal};
 pub use people::{People, Person, people};
 pub use model::{Commit, CommitDetail, FileChange, FileStatus, Label, LabelKind, Ref, RefKind, labels};
 pub use squash::{BranchTip, Evidence, MergeClue, MergeScan, scan_inputs, subject_pr};

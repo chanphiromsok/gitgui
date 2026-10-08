@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gitgui_core::{DiffLine, FileStatus, GitCli, LineKind};
+use gitgui_core::{Gap, DiffLine, FileStatus, GitCli, LineKind};
 use gitgui_store::{Comment, Side};
 use gpui::{
     AnyElement, Context, ElementId, FontWeight, ListOffset, MouseButton, SharedString, StyledText, Window, canvas, div, list,
@@ -38,6 +38,21 @@ fn side_name(side: Side) -> &'static str {
 }
 
 impl Workspace {
+    /// An arrow was clicked: shows more of the unchanged lines over the hunk (`up`) or under the hunk before it; `hunk` is
+    /// `None` for the arrow after the last hunk.
+    pub fn reveal_lines(&mut self, hunk: Option<usize>, up: bool, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.as_mut() else { return };
+        let mode = repo.mode;
+        let Some(file) = repo.file.as_mut() else { return };
+        let gap = match hunk {
+            Some(h) => file.above.get(h).copied().flatten(),
+            None => file.below,
+        };
+        let Some(gap) = gap else { return };
+        file.show_more(mode, gap.index, up);
+        cx.notify();
+    }
+
     pub fn render_diff(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Some(file) = repo.file.as_ref() else { return div().into_any_element() };
@@ -323,7 +338,8 @@ impl Workspace {
         let note = self.blame_note(ix);
 
         match row {
-            DisplayRow::Hunk(h) => hunk_header(h, &file.diff.hunks[h].header, file.context < WHOLE_FILE && !file.single_column, cx),
+            DisplayRow::Hunk(h) => hunk_header(h, &file.diff.hunks[h].header, file.above.get(h).copied().flatten(), cx),
+            DisplayRow::Tail => tail_row(file.below, cx),
             DisplayRow::Line { hunk, line } => {
                 let line = &file.diff.hunks[hunk].lines[line];
                 unified_line(ix, line, file.colors.of(line), comments, sx, note.as_ref(), cx)
@@ -460,7 +476,34 @@ fn centered_text(text: impl Into<SharedString>, color: u32) -> AnyElement {
     div().size_full().flex().items_center().justify_center().text_color(rgb(color)).child(text.into()).into_any_element()
 }
 
-fn hunk_header(h: usize, header: &str, can_expand: bool, cx: &mut Context<Workspace>) -> AnyElement {
+/// An arrow in the gutter, where the line numbers are: a click shows more of the unchanged lines on that side.
+fn arrow(id: &'static str, key: usize, glyph: &'static str, width: f32, up: bool, hunk: Option<usize>, cx: &mut Context<Workspace>) -> AnyElement {
+    div()
+        .id((id, key))
+        .debug_selector(move || format!("{id}-{key}"))
+        .flex_none()
+        .w(px(width))
+        .h_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .text_sm()
+        .text_color(rgb(t().accent))
+        .font_weight(FontWeight::BOLD)
+        .hover(|style| style.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
+        .on_click(cx.listener(move |this, _, _, cx| this.reveal_lines(hunk, up, cx)))
+        .child(glyph)
+        .into_any_element()
+}
+
+fn hidden_text(left: u32) -> SharedString {
+    SharedString::from(if left == 1 { "1 line hidden".to_owned() } else { format!("{left} lines hidden") })
+}
+
+/// The line that starts a hunk. `gap` is the stretch of unchanged lines over it that is still hidden: an arrow up shows more
+/// of it next to this hunk, and (unless this is the first hunk) an arrow down shows more under the hunk before.
+fn hunk_header(h: usize, header: &str, gap: Option<Gap>, cx: &mut Context<Workspace>) -> AnyElement {
     div()
         .w_full()
         .h(px(LINE_H + 4.))
@@ -470,28 +513,36 @@ fn hunk_header(h: usize, header: &str, can_expand: bool, cx: &mut Context<Worksp
         .text_color(rgb(t().hunk_fg))
         .font_family(MONO)
         .text_xs()
-        // Where the line numbers are: a button to show more of the unchanged lines around every change.
-        .child(if can_expand {
-            div()
-                .id(("hunk-more", h))
-                .debug_selector(move || format!("hunk-more-{h}"))
+        .child(match gap {
+            Some(_) if h == 0 => arrow("hunk-up", h, "↑", 42., true, Some(h), cx),
+            Some(_) => div()
                 .flex_none()
                 .w(px(42.))
                 .h_full()
                 .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .text_color(rgb(t().accent))
-                .font_weight(FontWeight::BOLD)
-                .hover(|style| style.bg(rgb(t().accent)).text_color(rgb(t().on_accent)))
-                .on_click(cx.listener(|this, _, _, cx| this.more_context(cx)))
-                .child("↕")
-                .into_any_element()
-        } else {
-            div().flex_none().w(px(42.)).into_any_element()
+                .child(arrow("hunk-up", h, "↑", 21., true, Some(h), cx))
+                .child(arrow("hunk-down", h, "↓", 21., false, Some(h), cx))
+                .into_any_element(),
+            None => div().flex_none().w(px(42.)).into_any_element(),
         })
         .child(div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().child(SharedString::from(header.to_owned())))
+        .children(gap.map(|gap| div().flex_none().px_2().text_color(rgb(t().muted)).child(hidden_text(gap.left))))
+        .into_any_element()
+}
+
+/// After the last hunk, when the file goes on: an arrow down shows more of it.
+fn tail_row(gap: Option<Gap>, cx: &mut Context<Workspace>) -> AnyElement {
+    div()
+        .w_full()
+        .h(px(LINE_H + 4.))
+        .flex()
+        .items_center()
+        .bg(rgb(t().hunk_bg))
+        .text_color(rgb(t().hunk_fg))
+        .font_family(MONO)
+        .text_xs()
+        .child(arrow("tail-down", 0, "↓", 42., false, None, cx))
+        .children(gap.map(|gap| div().min_w_0().flex_1().overflow_hidden().whitespace_nowrap().child(hidden_text(gap.left))))
         .into_any_element()
 }
 
