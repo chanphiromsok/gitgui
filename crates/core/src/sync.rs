@@ -77,6 +77,19 @@ pub fn divergence(commits: &[Commit], tracked: &[(String, String)], unpublished:
             }
         }
     }
+    // A commit some remote branch has is pushed, whichever branch it is on here: a feature branch built on main
+    // is not "unpushed" for the commits of main the remote already holds.
+    let mut on_remote: HashSet<&str> = HashSet::new();
+    if !tracked.is_empty() || unpublished.is_some() {
+        let mut todo: Vec<&str> =
+            commits.iter().filter(|c| c.refs.iter().any(|r| r.kind == RefKind::RemoteBranch)).map(|c| c.id.as_str()).collect();
+        while let Some(id) = todo.pop() {
+            let Some(commit) = by_id.get(id) else { continue };
+            if on_remote.insert(commit.id.as_str()) {
+                todo.extend(commit.parents.iter().map(String::as_str));
+            }
+        }
+    }
     let mut found = Divergence::default();
     for (branch, upstream) in tracked {
         let (Some(local), Some(remote)) = (tips.get(branch.as_str()), tips.get(upstream.as_str())) else { continue };
@@ -84,20 +97,14 @@ pub fn divergence(commits: &[Commit], tracked: &[(String, String)], unpublished:
             continue;
         }
         let (here, there) = (reach(local, &by_id), reach(remote, &by_id));
-        found.unpushed.extend(here.difference(&there).map(|id| (*id).to_owned()));
+        found.unpushed.extend(here.difference(&there).filter(|id| !on_remote.contains(**id)).map(|id| (*id).to_owned()));
         found.unpulled.extend(there.difference(&here).map(|id| (*id).to_owned()));
     }
-    if let Some(head) = unpublished.and_then(|branch| tips.get(branch)) {
-        let mut on_remote: HashSet<&str> = HashSet::new();
-        for commit in commits {
-            if commit.refs.iter().any(|r| r.kind == RefKind::RemoteBranch) {
-                on_remote.extend(reach(&commit.id, &by_id));
-            }
-        }
-        // Only when some remote branch exists at all: with none, every commit would be "unpushed" and say nothing.
-        if !on_remote.is_empty() {
-            found.unpushed.extend(reach(head, &by_id).difference(&on_remote).map(|id| (*id).to_owned()));
-        }
+    // Only when some remote branch exists at all: with none, every commit would be "unpushed" and say nothing.
+    if let Some(head) = unpublished.and_then(|branch| tips.get(branch))
+        && !on_remote.is_empty()
+    {
+        found.unpushed.extend(reach(head, &by_id).difference(&on_remote).map(|id| (*id).to_owned()));
     }
     found
 }
@@ -231,6 +238,20 @@ mod tests {
         let found = divergence(&diverged(), &[("feat".into(), "origin/feat".into())], None);
         assert_eq!(found.unpushed, HashSet::from(["l2".to_owned(), "l1".to_owned()]));
         assert_eq!(found.unpulled, HashSet::from(["r1".to_owned()]));
+    }
+
+    #[test]
+    fn commits_another_remote_branch_has_are_not_unpushed() {
+        // feat is built on main's m1, which origin/main has; only f1 is not on any remote. origin/feat is at the old f0.
+        let commits = vec![
+            commit("f1", &["m1"], &[("feat", RefKind::LocalBranch)]),
+            commit("f0", &["b"], &[("origin/feat", RefKind::RemoteBranch)]),
+            commit("m1", &["b"], &[("origin/main", RefKind::RemoteBranch)]),
+            commit("b", &[], &[]),
+        ];
+        let found = divergence(&commits, &[("feat".into(), "origin/feat".into())], None);
+        assert_eq!(found.unpushed, HashSet::from(["f1".to_owned()]));
+        assert_eq!(found.unpulled, HashSet::from(["f0".to_owned()]));
     }
 
     #[test]

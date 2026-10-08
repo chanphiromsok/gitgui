@@ -110,7 +110,7 @@ pub enum CheckoutTarget {
 
 /// A name or id that is safe to pass to git as an argument: not empty, not an option, no spaces or
 /// control characters.
-fn check_name(name: &str) -> Result<(), Error> {
+pub(crate) fn check_name(name: &str) -> Result<(), Error> {
     if name.is_empty() || name.starts_with('-') || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(Error::Parse(format!("not a usable name: {name:?}")));
     }

@@ -74,6 +74,8 @@ pub enum Action {
     StartOver(String),
     /// Resolve a conflicted file by deleting it.
     DeleteConflicted(String),
+    /// Move the branch back to where it was before its last rebase.
+    UndoRebase(gitgui_core::Rebased),
 }
 
 /// What the test merge behind a question has found so far.
@@ -470,6 +472,21 @@ impl Workspace {
                     None,
                 )
             }
+            Action::UndoRebase(rebased) => {
+                let old = rebased.old_tip.chars().take(7).collect::<String>();
+                (
+                    format!("Undo the rebase of {}?", rebased.branch),
+                    format!(
+                        "Moves {} back to {old}, where it was before the rebase. Nothing is deleted: the rebased commits stay in \
+                         the reflog for a while, so the rebase can be done again. It stops, and changes nothing, if you have \
+                         changes that are not committed.",
+                        rebased.branch
+                    ),
+                    "Undo Rebase",
+                    false,
+                    None,
+                )
+            }
             Action::SkipCommit(operation) => {
                 let commit = self.side_names().1.title;
                 (
@@ -610,6 +627,17 @@ impl Workspace {
                 move |git| git.abort(operation).map(Outcome::Done),
                 cx,
             ),
+            Action::UndoRebase(rebased) => {
+                let old = rebased.old_tip.chars().take(7).collect::<String>();
+                let branch = rebased.branch.clone();
+                self.run(
+                    format!("Moving {branch} back…"),
+                    format!("Moved {branch} back to {old}, where it was before the rebase."),
+                    None,
+                    move |git| git.undo_rebase(&rebased).map(Outcome::Done),
+                    cx,
+                )
+            }
             Action::SkipCommit(operation) => self.run(
                 "Skipping the commit…".to_owned(),
                 format!("Skipped the commit and finished the {}.", operation.name()),

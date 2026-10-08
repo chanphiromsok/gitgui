@@ -92,6 +92,11 @@ pub struct RepoView {
     pub remotes: Vec<String>,
     /// A merge, rebase or cherry-pick that stopped and is waiting, with its sides named by meaning.
     pub operation: Option<OperationState>,
+    /// The current branch was just rebased: where it was before, to go back to.
+    pub rebased: Option<gitgui_core::Rebased>,
+    /// Commits that make the same changes as another commit that is only on the other side (rebased or
+    /// cherry-picked copies), each pointing at the other, once the search for them has run.
+    pub twins: HashMap<String, String>,
 }
 
 /// The branches to check for merges and the trunks to check them against.
@@ -139,6 +144,34 @@ impl RepoView {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// The pairs of tips whose two sides may hold the same changes under different ids: the current branch against
+    /// its upstream and against the branch it was cut from, when each has commits the other lacks.
+    fn twin_inputs(&self) -> Vec<(String, String)> {
+        let tip_of = |name: &str| {
+            self.commits.iter().find(|c| c.refs.iter().any(|r| r.name == name && matches!(r.kind, gitgui_core::RefKind::LocalBranch | gitgui_core::RefKind::RemoteBranch))).map(|c| c.id.clone())
+        };
+        let Some(branch) = self.current_branch.as_ref().map(|b| b.to_string()) else { return Vec::new() };
+        let Some(head) = tip_of(&branch) else { return Vec::new() };
+        let mut pairs = Vec::new();
+        if let Some(Upstream::Tracking { name, ahead, behind, .. }) = self.upstreams.get(&branch)
+            && *ahead > 0
+            && *behind > 0
+            && let Some(theirs) = tip_of(name)
+        {
+            pairs.push((head.clone(), theirs));
+        }
+        if let Some(base) = &self.base
+            && base.ahead > 0
+            && base.behind > 0
+        {
+            let tip = tip_of(&base.name).or_else(|| self.commits.iter().find(|c| c.refs.iter().any(|r| r.kind == gitgui_core::RefKind::RemoteBranch && r.name.split_once('/').is_some_and(|(_, n)| n == base.name))).map(|c| c.id.clone()));
+            if let Some(tip) = tip {
+                pairs.push((head, tip));
+            }
+        }
+        pairs
     }
 
     /// Which commits are only here and which only on the remote, for the branches that track one that moved apart
@@ -234,6 +267,7 @@ impl RepoView {
         graph::apply_clues(&mut self.entries, &self.clues, &self.tips, &merged_in);
         let divergence = self.divergence();
         graph::apply_divergence(&mut self.entries, &divergence);
+        graph::apply_twins(&mut self.entries, &self.twins);
         let density = graph::Density::from_settings(settings);
         self.graph_width = graph::graph_width(built.widest, density);
         // Counted as if they were all drawn: the button that unfolds them says how many there are either way.
@@ -669,6 +703,8 @@ pub struct Workspace {
     pub legend_open: bool,
     /// The branch line the pointer is on in the graph.
     pub graph_hover: Option<usize>,
+    /// The commit that is a copy of the one the pointer is on, to light.
+    pub twin_hover: Option<String>,
     /// How many folders are being looked at to be added as projects.
     opening: usize,
     loads: u64,
@@ -756,6 +792,8 @@ struct RepoData {
     /// Each local branch's upstream, from one `git for-each-ref`.
     upstreams: HashMap<String, Upstream>,
     remotes: Vec<String>,
+    /// The current branch's last move was a finished rebase, and its old tip is still there.
+    rebased: Option<gitgui_core::Rebased>,
 }
 
 /// Reads the repository; the commits are left unparsed (`None`) when the log is the one `unchanged`
@@ -792,7 +830,8 @@ fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_cor
     // Nice to know, not worth failing the read over.
     let upstreams = git.branch_sync().unwrap_or_default().into_iter().map(|b| (b.branch, b.upstream)).collect();
     let remotes = git.remotes().unwrap_or_default();
-    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), operation, web, work, today, upstreams, remotes })
+    let rebased = current_branch.as_deref().and_then(|branch| git.last_rebase(branch));
+    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), operation, web, work, today, upstreams, remotes, rebased })
 }
 
 /// A commit's record and the files it changed; `None` when it stopped early because `wanted` said the
@@ -967,6 +1006,7 @@ impl Workspace {
             busy: None,
             legend_open: false,
             graph_hover: None,
+            twin_hover: None,
             opening: 0,
             loads: 0,
             graph_scroll: UniformListScrollHandle::new(),
@@ -1308,6 +1348,8 @@ impl Workspace {
                             upstreams: data.upstreams,
                             remotes: data.remotes,
                             operation: data.operation,
+                            rebased: data.rebased,
+                            twins: HashMap::new(),
                         };
                         // Branches that have not moved since the last scan are known at once.
                         let cache = this.scan_caches.entry(path.clone()).or_default().clone();
@@ -1325,9 +1367,13 @@ impl Workspace {
                         let selected = repo.selected_id();
                         repo.selected = selected.and_then(|id| view.entries.iter().position(|e| e.commit.as_deref() == Some(id.as_str())));
                         let finished = view.operation.is_none();
+                        let twin_inputs = view.twin_inputs();
                         repo.phase = Phase::Ready(view);
                         if finished && std::mem::take(&mut this.graph_hidden_for_conflicts) {
                             this.graph_hidden = false;
+                        }
+                        if !twin_inputs.is_empty() {
+                            this.start_twin_scan(path.clone(), twin_inputs, cx);
                         }
                         if scan {
                             this.start_merge_scan(path, inputs, cache, cx);
@@ -1354,6 +1400,35 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn scan_running(&self) -> bool {
         self.running_scan.is_some()
+    }
+
+    /// Looks, in the background, for commits that are copies of one another (a rebase or a cherry-pick makes new commits
+    /// with the same changes), then marks them. Cheap: git compares the patches of what each side has on its own.
+    fn start_twin_scan(&mut self, path: PathBuf, inputs: Vec<(String, String)>, cx: &mut Context<Self>) {
+        let job_inputs = inputs.clone();
+        let git_path = path.clone();
+        self.spawn_load(
+            cx,
+            move || {
+                let git = GitCli::new(&git_path);
+                job_inputs.iter().flat_map(|(a, b)| git.twins(a, b)).collect::<Vec<_>>()
+            },
+            move |this, pairs, cx| {
+                let settings = this.settings.clone();
+                let Some(repo) = this.repo.as_mut().filter(|repo| repo.project.path == path) else { return };
+                let Phase::Ready(view) = &mut repo.phase else { return };
+                // The answer is about the branches as they were when asked.
+                if view.twin_inputs() != inputs {
+                    return;
+                }
+                view.twins = pairs.iter().flat_map(|(a, b)| [(a.clone(), b.clone()), (b.clone(), a.clone())]).collect();
+                if view.twins.is_empty() {
+                    return;
+                }
+                repo.rebuild(&settings);
+                cx.notify();
+            },
+        );
     }
 
     /// Stops the merge scan that is running, if any. What it has found so far stays in its cache.
@@ -2132,9 +2207,10 @@ impl Workspace {
     }
 
     /// The pointer is on a row of this branch line (or, with `None`, has left the graph): its line comes forward.
-    pub fn hover_graph_line(&mut self, line: Option<usize>, cx: &mut Context<Self>) {
-        if self.graph_hover != line {
+    pub fn hover_graph_line(&mut self, line: Option<usize>, twin: Option<String>, cx: &mut Context<Self>) {
+        if self.graph_hover != line || self.twin_hover != twin {
             self.graph_hover = line;
+            self.twin_hover = twin;
             cx.notify();
         }
     }
@@ -2145,7 +2221,11 @@ impl Workspace {
             Some(Phase::Ready(view)) => view.entries.get(row).map(|entry| entry.row.lineage),
             _ => None,
         });
-        self.hover_graph_line(line, cx);
+        let twin = row.and_then(|row| match self.repo.as_ref().map(|repo| &repo.phase) {
+            Some(Phase::Ready(view)) => view.entries.get(row).and_then(|entry| entry.twin.clone()),
+            _ => None,
+        });
+        self.hover_graph_line(line, twin, cx);
     }
 
     pub fn toggle_sync_merges(&mut self, cx: &mut Context<Self>) {
@@ -2924,6 +3004,7 @@ impl Workspace {
             .flex_col()
             .child(header)
             .child(self.render_filter_bar(repo, view, area < 640., cx))
+            .children(self.render_rebased_bar(view, cx))
             .child(self.render_graph(area, cx))
             .when(self.legend_open, |center| center.child(self.render_legend(cx)))
             .into_any_element()
@@ -3061,6 +3142,45 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// "feat/x was rebased onto 3f2a1b9: 3 commits were rewritten" with a button that moves it back, for as long as the
+    /// rebase is the last thing that happened to the branch and the rewritten commits are not on the remote yet.
+    fn render_rebased_bar(&self, view: &RepoView, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let rebased = view.rebased.clone()?;
+        // Pushed (the remote has them): going back would put the two sides apart again.
+        if matches!(view.upstreams.get(&rebased.branch), Some(Upstream::Tracking { ahead: 0, .. })) {
+            return None;
+        }
+        let short = |id: &str| id.chars().take(7).collect::<String>();
+        let onto = rebased.onto.as_deref().map(|onto| format!(" onto {}", short(onto))).unwrap_or_default();
+        let count = if rebased.commits > 0 { format!(": {} commit{} rewritten", rebased.commits, if rebased.commits == 1 { "" } else { "s" }) } else { String::new() };
+        let said = format!("{} was rebased{onto}{count}. Before, it was at {}.", rebased.branch, short(&rebased.old_tip));
+        Some(
+            div()
+                .debug_selector(|| "rebased-bar".to_owned())
+                .flex_none()
+                .h(px(32.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .overflow_hidden()
+                .bg(rgb(crate::theme::mix(t().bg, t().accent, 0.10)))
+                .border_b_1()
+                .border_color(rgb(crate::theme::mix(t().bg, t().accent, 0.30)))
+                .text_xs()
+                .child(div().flex_none().size(px(7.)).rounded_full().bg(rgb(t().accent)))
+                .child(div().min_w_0().flex_1().overflow_hidden().line_clamp(1).text_ellipsis().text_color(rgb(t().text)).child(said))
+                .child(
+                    ui::ghost("undo-rebase", "Undo rebase")
+                        .debug_selector(|| "undo-rebase".to_owned())
+                        .text_color(rgb(t().accent))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_dialog(crate::menu::Action::UndoRebase(rebased.clone()), window, cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn toggle_legend(&mut self, cx: &mut Context<Self>) {
         self.legend_open = !self.legend_open;
         cx.notify();
@@ -3119,7 +3239,7 @@ impl Workspace {
             .child(entry(
                 div().text_color(rgb(t().added)).font_weight(FontWeight::BOLD).child("↑").into_any_element(),
                 "Not pushed yet",
-                "A commit only here. A push would send it.",
+                "A commit no remote branch has. A push would send it.",
             ))
             .child(entry(
                 div().text_color(rgb(t().modified)).font_weight(FontWeight::BOLD).child("↓").into_any_element(),
@@ -3130,6 +3250,11 @@ impl Workspace {
                 gpui::img(crate::icons::flag(t().muted)).size(px(11.)).into_any_element(),
                 "Tag",
                 "A release or version mark on a commit.",
+            ))
+            .child(entry(
+                div().text_color(rgb(t().accent)).font_weight(FontWeight::BOLD).child("≈").into_any_element(),
+                "Same changes as another commit",
+                "A rebase or a cherry-pick copied it. Point at one to light the other.",
             ))
             .child(entry(
                 div().text_color(rgb(t().muted)).child("+N").into_any_element(),
@@ -3216,7 +3341,7 @@ impl Workspace {
             // The line the pointer was on goes back when the pointer leaves the list.
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !*hovered {
-                    this.hover_graph_line(None, cx);
+                    this.hover_graph_line(None, None, cx);
                 }
             }))
             .child(graph::columns(width, cols, lanes_button))
@@ -3262,6 +3387,7 @@ impl Workspace {
                                     selected == Some(ix),
                                     highlight,
                                     this.graph_hover,
+                                    entry.commit.is_some() && entry.commit == this.twin_hover,
                                     cols,
                                     faces,
                                     density,

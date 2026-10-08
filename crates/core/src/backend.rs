@@ -129,7 +129,7 @@ impl GitCli {
 
     /// Runs `first`, feeds its output straight into `second`, and returns what `second` printed. The
     /// output of `first` never passes through this process, so a huge `git log -p` costs no memory here.
-    fn pipeline(&self, first: &[&str], second: &[&str]) -> Result<Vec<u8>, Error> {
+    pub(crate) fn pipeline(&self, first: &[&str], second: &[&str]) -> Result<Vec<u8>, Error> {
         let mut producer = self.command(first);
         producer.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
         let mut producer = producer.spawn().map_err(Error::Spawn)?;
@@ -756,7 +756,7 @@ pub(crate) fn parse_changes(name_status: &[u8], numstat: &[u8]) -> Vec<FileChang
 }
 
 /// Rejects ids that git would read as options. Ids come from our own UI, so this is a backstop.
-fn check_rev(id: &str) -> Result<(), Error> {
+pub(crate) fn check_rev(id: &str) -> Result<(), Error> {
     if id.is_empty() || id.starts_with('-') || id.contains(char::is_whitespace) {
         return Err(Error::Parse(format!("not a revision: {id:?}")));
     }

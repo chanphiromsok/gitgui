@@ -167,6 +167,8 @@ pub struct Entry {
     pub search_miss: bool,
     /// Not pushed yet, or not pulled yet.
     pub mark: Option<Mark>,
+    /// The commit that makes the same changes (a rebased or cherry-picked copy, or what this one was copied from).
+    pub twin: Option<String>,
 }
 
 /// Where the current branch stands against the branch it was cut from.
@@ -298,6 +300,7 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             off_lines: Vec::new(),
             search_miss: false,
             mark: None,
+            twin: None,
         });
     }
     for ((commit, row), (placed, size)) in ordered.iter().zip(rows).zip(&shown) {
@@ -338,6 +341,7 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             off_lines: Vec::new(),
             search_miss: false,
             mark: None,
+            twin: None,
         });
     }
 
@@ -412,6 +416,13 @@ pub fn apply_divergence(entries: &mut [Entry], found: &gitgui_core::Divergence) 
                 None
             }
         });
+    }
+}
+
+/// Marks the commits that are copies of another commit.
+pub fn apply_twins(entries: &mut [Entry], twins: &HashMap<String, String>) {
+    for entry in entries.iter_mut() {
+        entry.twin = entry.commit.as_ref().and_then(|id| twins.get(id)).cloned();
     }
 }
 
@@ -687,6 +698,7 @@ pub fn render_entry(
     selected: bool,
     highlight: Option<usize>,
     hover: Option<usize>,
+    twin_hovered: bool,
     cols: Columns,
     faces: GraphFaces,
     density: Density,
@@ -697,6 +709,8 @@ pub fn render_entry(
     let lines_focus = hover.or(highlight);
     let unpulled = entry.mark == Some(Mark::Unpulled);
     let mark = entry.mark;
+    let twin = entry.twin.clone();
+    let twin_label = entry.twin.as_ref().map(|id| id.chars().take(7).collect::<String>());
     let strokes = entry.row.strokes.clone();
     let lane = entry.row.lane;
     let lineage = entry.row.lineage;
@@ -768,12 +782,14 @@ pub fn render_entry(
         .gap_2()
         .cursor_pointer()
         .when(current, |row| row.bg(rgb(t().head_row)))
+        // The copy of the commit the pointer is on (a rebase or cherry-pick made it) is lit.
+        .when(twin_hovered, |row| row.bg(rgb(crate::theme::mix(t().bg, t().accent, 0.2))))
         .when(selected, |row| row.bg(rgb(t().selected)))
         .hover(|style| style.bg(if selected { rgb(t().selected) } else { rgb(t().hover) }))
         // Its branch line comes forward while the pointer is on the row (the list lets go when the pointer leaves it).
         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
             if *hovered && !uncommitted {
-                this.hover_graph_line(Some(lineage), cx);
+                this.hover_graph_line(Some(lineage), twin.clone(), cx);
             }
         }))
         .on_click(cx.listener(move |this, _event, _window, cx| this.select_entry(ix, cx)))
@@ -877,6 +893,10 @@ pub fn render_entry(
                         Mark::Unpulled => ("↓", t().modified, "on the remote, not pulled yet"),
                     };
                     div().flex_none().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color)).debug_selector(move || format!("mark-{ix}-{says}")).child(glyph)
+                }))
+                // "≈ 3f2a1b9": the same changes as that commit (a rebase or a cherry-pick copied one from the other).
+                .children(twin_label.map(|short| {
+                    div().flex_none().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().accent)).child(format!("≈ {short}"))
                 }))
                 .child(
                     div()

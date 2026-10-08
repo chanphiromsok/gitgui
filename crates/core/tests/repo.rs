@@ -1597,3 +1597,76 @@ fn a_test_merge_says_clean_without_touching_anything_and_an_unknown_branch_says_
     assert_eq!(rev(&repo, "HEAD"), head);
     assert!(status_is_clean(&repo), "nothing changed here");
 }
+
+
+/// main: a ── m1; feat (cut from a): f1, f2 — then rebased onto main, so f1' and f2' sit on m1.
+fn rebased_repo(name: &str) -> TempRepo {
+    let repo = TempRepo::new(name);
+    repo.commit("a.txt", "a");
+    repo.git(&["checkout", "-q", "-b", "feat"]);
+    repo.commit("f1.txt", "f1");
+    repo.commit("f2.txt", "f2");
+    repo.git(&["checkout", "-q", "main"]);
+    repo.commit("m1.txt", "m1");
+    repo.git(&["checkout", "-q", "feat"]);
+    repo.git(&["rebase", "-q", "main"]);
+    repo
+}
+
+#[test]
+fn a_finished_rebase_leaves_the_old_tip_to_go_back_to() {
+    let repo = rebased_repo("rebase-undo");
+    let git = GitCli::new(repo.path());
+    let old = {
+        let out = Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "feat@{1}"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let rebased = git.last_rebase("feat").expect("the last thing to happen to feat was a rebase");
+    assert_eq!((rebased.old_tip.as_str(), rebased.new_tip.as_str()), (old.as_str(), rev(&repo, "feat").as_str()));
+    assert_eq!(rebased.commits, 2, "f1 and f2 sit on main now");
+    assert!(rebased.onto.is_some());
+
+    // Other branches have no such record, and neither has a branch that moved on after its rebase.
+    assert!(git.last_rebase("main").is_none());
+    repo.commit("f3.txt", "f3");
+    assert!(git.last_rebase("feat").is_none(), "a new commit is the last thing now");
+}
+
+#[test]
+fn undoing_a_rebase_moves_the_branch_back_and_refuses_over_uncommitted_changes() {
+    let repo = rebased_repo("rebase-undo-run");
+    let git = GitCli::new(repo.path());
+    let rebased = git.last_rebase("feat").unwrap();
+
+    // A tracked file with changes is in the way.
+    std::fs::write(repo.path().join("f1.txt"), "edited").unwrap();
+    let refused = git.undo_rebase(&rebased).unwrap_err();
+    assert!(refused.to_string().contains("Commit or stash"), "{refused}");
+    assert_eq!(rev(&repo, "feat"), rebased.new_tip, "nothing moved");
+    repo.git(&["checkout", "--", "f1.txt"]);
+
+    // An untracked file is not in the way.
+    std::fs::write(repo.path().join("scratch.txt"), "x").unwrap();
+    git.undo_rebase(&rebased).unwrap();
+    assert_eq!(rev(&repo, "feat"), rebased.old_tip);
+    assert!(git.last_rebase("feat").is_none(), "the last thing is a reset now");
+    // The rebased commits are still there to go forward to.
+    assert!(repo.path().join("scratch.txt").exists());
+}
+
+#[test]
+fn rebased_commits_are_found_beside_the_ones_they_were_copied_from() {
+    let repo = rebased_repo("rebase-twins");
+    let git = GitCli::new(repo.path());
+    let old = rev(&repo, "feat@{1}");
+    let new = rev(&repo, "feat");
+    let pairs = git.twins(&new, &old);
+    assert_eq!(pairs.len(), 2, "f1 and f2, each once: {pairs:?}");
+    let (here, there): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    assert!(here.contains(&rev(&repo, "feat")) && here.contains(&rev(&repo, "feat~1")));
+    assert!(there.contains(&old) && there.contains(&rev(&repo, "feat@{1}~1")));
+    // Two unrelated branches have no twins.
+    repo.git(&["checkout", "-q", "-b", "other", "main"]);
+    repo.commit("o.txt", "o");
+    assert!(git.twins("other", "main").is_empty());
+}

@@ -3580,7 +3580,7 @@ async fn commits_only_here_or_only_on_the_remote_are_marked_and_a_label_click_is
     ws.update(cx, |ws, cx| ws.script_graph_hover(Some(0), cx));
     assert!(ws.read_with(cx, |ws, _| ws.graph_hover.is_some()));
     draw(cx, &ws);
-    ws.update(cx, |ws, cx| ws.hover_graph_line(None, cx));
+    ws.update(cx, |ws, cx| ws.hover_graph_line(None, None, cx));
     assert!(ws.read_with(cx, |ws, _| ws.graph_hover.is_none()));
 
     // A click on a branch label picks that branch out; Escape puts it back.
@@ -3592,4 +3592,54 @@ async fn commits_only_here_or_only_on_the_remote_are_marked_and_a_label_click_is
     draw(cx, &ws);
     ws.update(cx, |ws, cx| ws.back(cx));
     assert!(summaries(&ws, cx).iter().any(|s| s == "mine"), "back to the view the filter bar says");
+}
+
+#[gpui::test]
+async fn a_rebased_branch_shows_its_copies_and_can_be_moved_back(cx: &mut TestAppContext) {
+    let fx = bare_fixture("rebased-branch");
+    commit_file(&fx, "a.txt", "base\n", "base");
+    let remote = fx.0.join("remote.git");
+    fx.git(&["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    fx.git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+    fx.git(&["push", "-q", "-u", "origin", "main"]);
+    fx.git(&["checkout", "-q", "-b", "feat"]);
+    commit_file(&fx, "f1.txt", "1\n", "feat: f1");
+    commit_file(&fx, "f2.txt", "2\n", "feat: f2");
+    fx.git(&["push", "-q", "-u", "origin", "feat"]);
+    fx.git(&["checkout", "-q", "main"]);
+    commit_file(&fx, "m1.txt", "m\n", "chore: m1");
+    fx.git(&["push", "-q", "origin", "main"]);
+    fx.git(&["checkout", "-q", "feat"]);
+    let before = {
+        let out = Command::new("git").arg("-C").arg(fx.repo()).args(["rev-parse", "feat"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    fx.git(&["rebase", "-q", "main"]);
+
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    cx.run_until_parked();
+    draw(cx, &ws);
+
+    // Each rebased commit and the one it was copied from point at one another.
+    let twins = ws.read_with(cx, |ws, _| match ws.repo.as_ref().map(|r| &r.phase) {
+        Some(Phase::Ready(view)) => view.entries.iter().filter(|e| e.twin.is_some()).count(),
+        _ => 0,
+    });
+    assert_eq!(twins, 4, "f1, f2 and their rebased copies");
+
+    // The bar says so, and asks before it moves the branch back.
+    let at = center_of(cx, "undo-rebase".to_owned());
+    click(cx, MouseButton::Left, at);
+    let title = ws.read_with(cx, |ws, _| ws.dialog.as_ref().map(|d| d.title.to_string()));
+    assert_eq!(title.as_deref(), Some("Undo the rebase of feat?"));
+    ws.update(cx, |ws, cx| ws.confirm_dialog(cx));
+    cx.run_until_parked();
+    let after = {
+        let out = Command::new("git").arg("-C").arg(fx.repo()).args(["rev-parse", "feat"]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    assert_eq!(after, before, "feat is where it was before the rebase");
+    draw(cx, &ws);
+    assert!(ws.read_with(cx, |ws, _| ws.notice.as_ref().is_some_and(|n| !n.warn && n.text.contains("Moved feat back"))));
 }
