@@ -38,7 +38,7 @@
 
 <img src="docs/img/wizard.webp" alt="The New branch window, building feature/101-driver-reporting-v2 from develop" width="900">
 
-*Start a branch the way your team does: type, ticket, title. The name and the base branch follow the repo.*
+*Start a branch the way your team does: click a type for its prefix (or skip it), add a ticket and a title. Start from opens a searchable list of local and remote branches.*
 
 <br>
 

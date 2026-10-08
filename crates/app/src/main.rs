@@ -81,11 +81,15 @@ fn main() {
             KeyBinding::new("secondary-q", Quit, None),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+        // A development aid, like the script below: open on the nth screen. A picture of the window is as sharp as its
+        // screen, so the README's are taken on a Retina one.
+        let display = std::env::var("GITGUI_DISPLAY").ok().and_then(|n| n.parse::<usize>().ok()).and_then(|n| cx.displays().get(n).map(|d| d.id()));
+        let bounds = Bounds::centered(display, size(px(1280.), px(800.)), cx);
         let window = cx
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    display_id: display,
                     // The system title bar: close, minimize and zoom buttons, drag to move, and a
                     // menu bar that comes down when the pointer reaches the top in full screen.
                     titlebar: Some(TitlebarOptions { title: Some("gitgui".into()), ..Default::default() }),

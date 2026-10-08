@@ -2,8 +2,10 @@
 # Takes the README's pictures again from the demo repository (scripts/demo-repo.sh). A picture is as sharp as the
 # screen the window opens on: on a Retina screen the capture is 2x, on a 1080p one it is 1x and looks soft in the README.
 #
-#   scripts/readme-shots.sh            # writes docs/img/*.webp; refuses a 1x capture
-#   scripts/readme-shots.sh OUT_DIR    # writes there instead, whatever the screen
+#   GITGUI_DISPLAY=1 scripts/readme-shots.sh   # opens the window on the second screen (0 is the first), writes docs/img/*.webp
+#   scripts/readme-shots.sh OUT_DIR            # writes there instead, whatever the screen
+#
+# Without OUT_DIR it refuses a 1x capture.
 #
 # Needs ImageMagick (magick) and cwebp: brew install imagemagick webp
 set -euo pipefail
@@ -27,7 +29,7 @@ done
 width="$(magick identify -format %w "$WORK/shots/hero.png")"
 if [ "$width" -lt 2000 ] && [ $# -eq 0 ]; then
   echo "The capture is ${width}px wide (a 1x screen), so the pictures would look soft." >&2
-  echo "Open the window on a Retina screen and run again, or pass an OUT_DIR to write somewhere else." >&2
+  echo "Open the window on a Retina screen (GITGUI_DISPLAY=<n> picks the screen) and run again, or pass an OUT_DIR." >&2
   exit 1
 fi
 
