@@ -61,8 +61,9 @@ impl Workspace {
             .gap_3()
             .border_b_1()
             .border_color(rgb(t().border))
-            // With the graph hidden its header, and the sidebar button in it, is gone: keep one here.
-            .when(self.graph_hidden && !expanded, |header| header.child(self.sidebar_button(cx)))
+            // With the graph gone (hidden, or in full view) its header, and the sidebar button in it, is gone: keep
+            // one here.
+            .when(fill, |header| header.child(div().debug_selector(|| "pane-sidebar-button".to_owned()).child(self.sidebar_button(cx))))
             .children((!panels.is_empty()).then(|| segmented(panels)))
             .child(div().flex_none().font_family(MONO).text_xs().text_color(rgb(t().muted)).child(short))
             .child(

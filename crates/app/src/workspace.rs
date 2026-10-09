@@ -2499,19 +2499,17 @@ impl Render for Workspace {
         self.release_pictures(window);
         let total = f32::from(window.viewport_size().width);
         let pane_open = self.repo.as_ref().is_some_and(|repo| repo.commit.is_some());
-        // Full view of the file pane is for reading code: the projects sidebar steps aside too, and comes back
-        // with the graph when it is collapsed.
-        let reading = pane_open && self.repo.as_ref().is_some_and(|repo| repo.expanded);
-        let sidebar_width = if reading { 0. } else { self.shown_sidebar_width(total, pane_open) };
-        // A hidden sidebar leaves its divider at the window's edge, to drag it back out.
+        // The sidebar is the person's to hide, full view of the file pane or not: it stays while they read code
+        // (the files changed are in it) until they hide it with its button, a drag or the shortcut.
+        let sidebar_width = self.shown_sidebar_width(total, pane_open);
         let sidebar = (sidebar_width > 0.).then(|| self.render_sidebar(sidebar_width, cx));
         // Hidden, the sidebar can still be reached by pointing at the window's left edge, where a thin strip
-        // stands in for its divider.
+        // stands in for its divider (to drag it back out as well).
         let sidebar_hidden = sidebar_width <= 0. && self.repo.is_some();
         let divider = if sidebar_hidden {
-            Some(self.rail("sidebar-rail", Panel::Sidebar, Some(Splitter::Sidebar), cx))
+            self.rail("sidebar-rail", Panel::Sidebar, Some(Splitter::Sidebar), cx)
         } else {
-            (!reading).then(|| self.splitter("sidebar-divider", Splitter::Sidebar, cx))
+            self.splitter("sidebar-divider", Splitter::Sidebar, cx)
         };
         let peek_width = layout::sidebar_width(self.sidebar_width, total, pane_open);
         let sidebar_peek = (sidebar_hidden && self.peek == Some(Panel::Sidebar)).then(|| {
@@ -2548,7 +2546,7 @@ impl Render for Workspace {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| this.drag_divider(event, window, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.end_resize(cx)))
             .children(sidebar)
-            .children(divider)
+            .child(divider)
             .child(
                 div()
                     .flex_1()
@@ -2906,7 +2904,7 @@ impl Workspace {
                 let divider = (pane_open && !graph_gone).then(|| self.splitter("pane-divider", Splitter::Pane, cx));
                 let pane = pane_open.then(|| self.render_pane(window, width, None, cx));
                 // Hidden by hand, the graph can be reached by pointing at the left edge of the file pane (in full
-                // view the sidebar's edge is the one in the corner).
+                // view there is no graph to point at; the sidebar's own edge is by the window's).
                 let by_hand = pane_open && !expanded && self.graph_hidden;
                 let rail = by_hand.then(|| self.rail("graph-rail", Panel::Graph, None, cx));
                 let peek = (by_hand && self.peek == Some(Panel::Graph)).then(|| {

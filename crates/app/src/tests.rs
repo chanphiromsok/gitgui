@@ -13,7 +13,7 @@ use gpui::{
 
 use crate::rows::{Anchor, DisplayRow, Mode, Notice};
 use crate::layout;
-use crate::workspace::{Phase, Splitter, Workspace};
+use crate::workspace::{Panel, Phase, Splitter, Workspace};
 
 struct Fixture(PathBuf, std::cell::Cell<u64>);
 
@@ -2529,7 +2529,7 @@ async fn scrolling_down_and_sideways_do_not_fight_and_the_minimap_passes_the_whe
 }
 
 #[gpui::test]
-async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_window(cx: &mut TestAppContext) {
+async fn show_more_sits_in_the_gutter_and_full_view_keeps_the_sidebar_until_it_is_hidden(cx: &mut TestAppContext) {
     let fx = bare_fixture("review-space");
     let text = |a: &str| -> String { (1..=60).map(|n| if n == 30 { format!("{a}\n") } else { format!("line {n}\n") }).collect() };
     commit_file(&fx, "r.txt", &text("before"), "base");
@@ -2547,21 +2547,42 @@ async fn show_more_sits_in_the_gutter_and_full_view_gives_the_code_the_whole_win
     let more = center_of(cx, "hunk-up-0".to_owned());
     assert!(more.x - code.origin.x < px(60.), "beside the line numbers: {:?} vs {:?}", more.x, code.origin.x);
 
-    // While reading, the code area is the biggest part of the window: no sidebar, no graph.
+    // In full view the graph steps aside and the sidebar stays: the code gets the graph's room, not the sidebar's.
     let narrow_pane = code.size.width;
     let before_x = code.origin.x;
+    assert!(cx.debug_bounds("pane-sidebar-button").is_none(), "with the graph showing, its header has the button");
     ws.update(cx, |ws, cx| ws.toggle_expanded(cx));
     draw(cx, &ws);
     let wide = cx.debug_bounds("diff-list").unwrap();
     assert!(
-        wide.origin.x < px(crate::workspace::FILES_WIDTH + 30.),
-        "only the file list is left of the code: starts at {:?}",
+        wide.origin.x > px(layout::SIDEBAR_MIN + crate::workspace::FILES_WIDTH),
+        "the sidebar and the file list are left of the code: starts at {:?}",
         wide.origin.x
     );
     assert!(wide.size.width > narrow_pane * 1.3, "more room for the code in full view: {narrow_pane:?} → {:?}", wide.size.width);
+    assert!(ws.read_with(cx, |ws, _| ws.sidebar_shown()));
+
+    // The graph's header is gone, so the pane's has the button; clicking it hides the sidebar and the code takes
+    // its room, with a strip left at the window's edge to point at.
+    let button = center_of(cx, "pane-sidebar-button".to_owned());
+    click(cx, MouseButton::Left, button);
+    draw(cx, &ws);
+    assert!(!ws.read_with(cx, |ws, _| ws.sidebar_shown()));
+    let hidden = cx.debug_bounds("diff-list").unwrap();
+    assert!(hidden.origin.x < px(crate::workspace::FILES_WIDTH + 30.), "only the file list is left of the code: {:?}", hidden.origin.x);
+    assert!(cx.debug_bounds("sidebar-rail").is_some());
+    // Pointing at the strip slides the sidebar in over the code, still in full view.
+    ws.update(cx, |ws, cx| ws.peek_panel(Panel::Sidebar, cx));
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("sidebar-peek").is_some());
+    ws.update(cx, |ws, cx| ws.unpeek(Panel::Sidebar, cx));
+
+    // Showing it again (the button, or Cmd-B) puts it back; collapsing leaves everything as it was.
+    ws.update(cx, |ws, cx| ws.toggle_sidebar(cx));
     ws.update(cx, |ws, cx| ws.back(cx));
     draw(cx, &ws);
-    assert_eq!(cx.debug_bounds("diff-list").unwrap().origin.x, before_x, "the sidebar and graph come back");
+    assert!(ws.read_with(cx, |ws, _| ws.sidebar_shown() && !ws.repo.as_ref().unwrap().expanded));
+    assert_eq!(cx.debug_bounds("diff-list").unwrap().origin.x, before_x, "the sidebar and graph are where they were");
 }
 
 /// The arrows in the gutter show 20 more unchanged lines on the side they point to, and only there.
@@ -2633,7 +2654,7 @@ async fn the_arrows_in_the_gutter_show_more_lines_above_or_below_a_hunk_only(cx:
 
 #[gpui::test]
 async fn hidden_panels_leave_a_strip_that_brings_them_back_and_the_file_list_resizes(cx: &mut TestAppContext) {
-    use crate::workspace::{FILES_MAX, FILES_MIN, Panel};
+    use crate::workspace::{FILES_MAX, FILES_MIN};
     let fx = merged_pr("panels");
     let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
     // The pane beside the graph, where hiding the graph gives its room to the code.
