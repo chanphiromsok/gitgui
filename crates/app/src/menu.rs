@@ -41,6 +41,8 @@ pub enum MenuTarget {
     Filters,
     /// Which branches the graph shows.
     Scope,
+    /// Text picked in the code of a file: what to copy, and the word to search for when it is one name.
+    Code { text: String, word: Option<String> },
 }
 
 /// What the bar and the menu call a choice of which branches the graph shows.
@@ -87,6 +89,10 @@ pub enum Action {
     FilterDate(Option<String>),
     /// Show these branches in the graph.
     ShowScope(gitgui_core::Scope),
+    /// Ask where this word is used, in the commit being read.
+    FindUsages(String),
+    /// Ask which commits added or removed this word.
+    FindCommits(String),
     /// Switch one of the graph's options (the menu stays open to switch another).
     ToggleOption(GraphOption),
     /// From the Filters menu: pick the author in the same place.
@@ -244,6 +250,17 @@ impl Workspace {
         let copy = |text: &str, what: &'static str| Action::Copy { text: text.to_owned(), what };
 
         match target {
+            MenuTarget::Code { text, word } => {
+                // A name too long for a menu is cut short in the label only.
+                let short = |text: &str| if text.chars().count() > 28 { format!("{}…", text.chars().take(27).collect::<String>()) } else { text.to_owned() };
+                let mut out = vec![item("Copy", copy(text, "text"), true)];
+                if let Some(word) = word {
+                    out.push(separator());
+                    out.push(item(&format!("Find Usages of {}", short(word)), Action::FindUsages(word.clone()), true));
+                    out.push(item("Find Commits that Changed It", Action::FindCommits(word.clone()), true));
+                }
+                out
+            }
             MenuTarget::Scope => {
                 use gitgui_core::Scope;
                 let now = self.repo.as_ref().map(|repo| repo.graph_filter.scope);
@@ -388,6 +405,8 @@ impl Workspace {
             Action::FilterAuthor(value) => return self.set_search_term("author", value, cx),
             Action::FilterDate(value) => return self.set_search_term("date", value, cx),
             Action::ShowScope(scope) => return self.set_scope(scope, cx),
+            Action::FindUsages(word) => return self.find_usages(word, cx),
+            Action::FindCommits(word) => return self.find_commits_changing(word, cx),
             Action::ToggleOption(option) => {
                 return match option {
                     GraphOption::HideMerged => self.toggle_hide_merged(cx),
@@ -607,6 +626,8 @@ impl Workspace {
             | Action::FilterAuthor(_)
             | Action::FilterDate(_)
             | Action::ShowScope(_)
+            | Action::FindUsages(_)
+            | Action::FindCommits(_)
             | Action::ToggleOption(_)
             | Action::PickAuthor
             | Action::PickDate => return,
@@ -743,6 +764,8 @@ impl Workspace {
             | Action::FilterAuthor(_)
             | Action::FilterDate(_)
             | Action::ShowScope(_)
+            | Action::FindUsages(_)
+            | Action::FindCommits(_)
             | Action::ToggleOption(_)
             | Action::PickAuthor
             | Action::PickDate => {}

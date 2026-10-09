@@ -28,6 +28,7 @@ mod tests;
 mod text_input;
 mod theme;
 mod ui;
+mod usage_ui;
 mod workflow_ui;
 mod workspace;
 
@@ -70,6 +71,8 @@ fn main() {
             KeyBinding::new("secondary-r", Refresh, None),
             KeyBinding::new("secondary-f", FindCommits, None),
             KeyBinding::new("secondary-b", ToggleSidebar, None),
+            // Not in a text field, which has its own Copy: only when the window itself has the keys.
+            KeyBinding::new("secondary-c", workspace::CopySelection, Some("Workspace")),
             KeyBinding::new("up", workspace::PreviousFile, None),
             KeyBinding::new("down", workspace::NextFile, None),
             KeyBinding::new("escape", Back, None),

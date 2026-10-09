@@ -23,6 +23,7 @@
 //! conflict [n|text]   open the nth file with conflicts (or the first whose path has the text) in the resolver
 //! choose <n> current|incoming|both|both2|base|none   a choice for conflict n      key 1 n 2 …   the resolver's keys
 //! safe   resolve the safe ones      useresult      continue   the bar's Continue      base   show or hide the base
+//! mouse X Y [N] [secondary] [right]   press at that point of the window (N clicks)
 //! shot name               save <folder>/name.png
 //! quit
 //! ```
@@ -31,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gitgui_core::Layout;
-use gpui::{App, WindowHandle, px, size};
+use gpui::{App, AppContext as _, WindowHandle, px, size};
 
 use crate::rows::Mode;
 use crate::settings_view::SettingsPage;
@@ -74,6 +75,31 @@ pub fn run(window: WindowHandle<Workspace>, file: String, cx: &mut App) {
                         Ok(Err(err)) => eprintln!("gitgui: no picture for {rest}: {err}"),
                         Err(err) => eprintln!("gitgui: no picture for {rest}: {err}"),
                     }
+                }
+                // mouse X Y [COUNT] [secondary] [right]: a press at that point of the window's contents (below the title bar),
+                // sent through the window's own event handling, so the code under the pointer is found the way a real
+                // click finds it.
+                "mouse" => {
+                    let words: Vec<&str> = rest.split_whitespace().collect();
+                    let numbers: Vec<f32> = words.iter().filter_map(|word| word.parse().ok()).collect();
+                    if let [x, y, ..] = numbers[..] {
+                        let count = numbers.get(2).map_or(1, |count| *count as usize);
+                        let modifiers = if words.contains(&"secondary") { gpui::Modifiers::secondary_key() } else { gpui::Modifiers::default() };
+                        let button = if words.contains(&"right") { gpui::MouseButton::Right } else { gpui::MouseButton::Left };
+                        cx.update_window(window.into(), |_, window, cx| {
+                            let position = gpui::point(px(x), px(y));
+                            let moved = gpui::MouseMoveEvent { position, pressed_button: None, modifiers };
+                            window.dispatch_event(gpui::PlatformInput::MouseMove(moved), cx);
+                            for n in 1..=count {
+                                let down = gpui::MouseDownEvent { button, position, modifiers, click_count: n, first_mouse: false };
+                                window.dispatch_event(gpui::PlatformInput::MouseDown(down), cx);
+                                let up = gpui::MouseUpEvent { button, position, modifiers, click_count: n };
+                                window.dispatch_event(gpui::PlatformInput::MouseUp(up), cx);
+                            }
+                        })
+                        .ok();
+                    }
+                    pause(500).await;
                 }
                 "quit" => {
                     // `cx.quit()` leaves a window behind when it is asked from here; leave for good.
@@ -129,6 +155,12 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         "clear" => workspace.clear_isolate(cx),
         "pointer" => workspace.script_graph_hover(rest.parse().ok(), cx),
         "legend" => workspace.toggle_legend(cx),
+        // usages WORD: where the word is used, in the commit that is open.
+        "usages" => workspace.find_usages(rest.to_owned(), cx),
+        // usage N: opens the Nth match of the list (from 0), read whole.
+        "usage" => workspace.script_open_usage(rest.parse().unwrap_or(0), cx),
+        // pick WORD: picks its first place in the open file, as a double-click would.
+        "pick" => workspace.script_pick(rest, cx),
         "hover" => workspace.script_hover(rest, cx),
         "newbranch" => {
             workspace.open_new_branch(window, cx);

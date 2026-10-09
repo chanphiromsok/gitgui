@@ -16,6 +16,7 @@ pub mod process;
 pub mod squash;
 pub mod sync;
 pub mod tree;
+pub mod usages;
 pub mod workflow;
 pub mod worktree;
 
@@ -44,4 +45,5 @@ pub use rebase::Rebased;
 pub use sync::{BranchSync, Divergence, Upstream, divergence, default_remote, fetch_due, nothing_to_pull};
 pub use worktree::WorkFile;
 pub use workflow::{Detected, MergeStyle, Shape, branch_name, detect, name_problem, slugify};
+pub use usages::{MAX_MATCHES, MIN_WORD, UsageFile, UsageMatch, Usages, declares, is_word_char, occurrences, word_at, word_problem};
 pub use tree::{Layout, TreeRow, file_tree, flat_list, visible_rows};

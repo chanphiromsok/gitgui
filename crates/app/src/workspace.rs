@@ -33,6 +33,7 @@ use crate::icons::{self, IconTheme};
 use crate::preview;
 use crate::syntax;
 use crate::theme::{self, Theme, t};
+use crate::usage_ui::{Selection, UsagesState, Viewing};
 
 const LOAD_LIMIT: usize = 20_000;
 const DIFF_CONTEXT: u32 = 3;
@@ -427,6 +428,12 @@ pub struct FileState {
     pub blame: BlameState,
     /// A file with conflicts opens in the resolver instead of as a diff.
     pub resolver: Option<Box<crate::resolver::Resolver>>,
+    /// Text picked in the code (double-click a word, triple-click a line), to copy or to search for.
+    pub selection: Option<Selection>,
+    /// A word marked wherever it is in the lines shown: the one picked, or the one a usage was asked for.
+    pub word_mark: Option<String>,
+    /// The file is read whole, from a list of usages, not shown as a change.
+    pub viewing: Option<Viewing>,
 }
 
 /// Blame for the open file: not asked for until a line is pointed at, then read in the background.
@@ -466,6 +473,9 @@ impl FileState {
             single_column: false,
             blame: BlameState::NotAsked,
             resolver: None,
+            selection: None,
+            word_mark: None,
+            viewing: None,
         }
     }
 
@@ -511,6 +521,11 @@ impl FileState {
     pub fn rebuild(&mut self, mode: Mode, keep_scroll: bool) {
         let top = self.list.logical_scroll_top();
         self.rows = display_rows(&self.diff, self.mode(mode), &self.comments, self.composing);
+        // A file read whole has no hunks to head; the rows rebuilt are not the ones that were picked.
+        if self.viewing.is_some() {
+            self.rows.retain(|row| !matches!(row, DisplayRow::Hunk(_)));
+        }
+        self.selection = None;
         if self.below.is_some() {
             self.rows.push(DisplayRow::Tail);
         }
@@ -557,6 +572,8 @@ pub struct RepoState {
     /// Which load this is, so a slow answer for an earlier one is ignored.
     pub generation: u64,
     pub graph_filter: GraphFilter,
+    /// Where a word is used, asked for from the code; shown in place of the changed files.
+    pub usages: Option<UsagesState>,
 }
 
 impl RepoState {
@@ -578,6 +595,7 @@ impl RepoState {
             files_visible: true,
             filter: String::new(),
             file_rows: Vec::new(),
+            usages: None,
         }
     }
 
@@ -642,7 +660,7 @@ const OPERATION_BAR_HEIGHT: f32 = 36.;
 /// How often, while fetching on its own is on, the app looks whether the open project is due a fetch.
 pub(crate) const AUTO_FETCH_TICK: Duration = Duration::from_secs(30);
 
-gpui::actions!(workspace, [PreviousFile, NextFile]);
+gpui::actions!(workspace, [PreviousFile, NextFile, CopySelection]);
 
 pub struct Workspace {
     /// The window's own keyboard focus: a click outside a text field comes back here, so keys like
@@ -724,6 +742,8 @@ pub struct Workspace {
     /// longer open stops before doing more work.
     file_ticket: Arc<AtomicU64>,
     commit_ticket: Arc<AtomicU64>,
+    /// The number of the last search for a word's usages, so an answer to an earlier one is ignored.
+    pub(crate) usage_seq: u64,
     last_log: Option<LastLog>,
     /// The pictures the file pane drew last; each is handed back to the window once it is not shown.
     shown_pictures: Vec<Arc<gpui::RenderImage>>,
@@ -1019,6 +1039,7 @@ impl Workspace {
             reread: false,
             file_ticket: Arc::new(AtomicU64::new(0)),
             commit_ticket: Arc::new(AtomicU64::new(0)),
+            usage_seq: 0,
             last_log: None,
             shown_pictures: Vec::new(),
             counts: Arc::default(),
@@ -1816,7 +1837,7 @@ impl Workspace {
         let Some(repo) = self.repo.as_mut() else { return };
         let Some(file) = repo.file.as_mut() else { return };
         let context = step.unwrap_or(DIFF_CONTEXT);
-        if file.context == context || !matches!(file.phase, Phase::Ready(())) {
+        if file.viewing.is_some() || file.context == context || !matches!(file.phase, Phase::Ready(())) {
             return;
         }
         file.context = context;
@@ -1881,6 +1902,9 @@ impl Workspace {
         if repo.expanded {
             repo.expanded = false;
             cx.notify();
+        } else if repo.file.is_none() && repo.usages.is_some() {
+            // The file read from the list is closed (below); then the list itself goes back to the changed files.
+            self.close_usages(cx);
         } else if repo.file.is_none() && repo.graph_filter.isolate.is_some() {
             // Nothing open: the branch picked out of the graph goes back among the others.
             self.clear_isolate(cx);
@@ -2539,6 +2563,7 @@ impl Render for Workspace {
                     this.step_file(1, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| this.copy_selection(cx)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| this.resolver_key(event, window, cx)))
             .bg(rgb(t().bg))
             .text_color(rgb(t().text))

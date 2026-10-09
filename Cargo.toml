@@ -17,9 +17,10 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# GPUI 0.2.2 with one fix (vendor/gpui/src/elements/text.rs, marked "gitgui patch"): text cut short with an
+# GPUI 0.2.2 with two changes (marked "gitgui patch"). vendor/gpui/src/elements/text.rs: text cut short with an
 # ellipsis lost the rest of its style runs for later layout passes and could abort the app on text with
-# non-ASCII characters in it. Drop this when a GPUI release carries the fix.
+# non-ASCII characters in it; drop this when a GPUI release carries the fix. vendor/gpui/src/window.rs: the result of
+# `Window::dispatch_event` is public, so the development script's `mouse` step can call it.
 [patch.crates-io]
 gpui = { path = "vendor/gpui" }
 

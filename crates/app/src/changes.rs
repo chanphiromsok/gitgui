@@ -90,6 +90,10 @@ impl Workspace {
     /// file open (except in the working tree, where Down opens the first).
     pub fn step_file(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(repo) = self.repo.as_ref() else { return };
+        // A file read from a list of usages is not one of the changed files: the arrows leave it alone.
+        if repo.file.as_ref().is_some_and(|file| file.viewing.is_some()) {
+            return;
+        }
         let work = self.work_open();
         let order: Vec<usize> = if work {
             (0..repo.work.len()).collect()

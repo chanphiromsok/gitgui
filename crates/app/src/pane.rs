@@ -22,7 +22,9 @@ impl Workspace {
         let fill = expanded || self.graph_hidden;
         // The working tree's files are listed in the sidebar, under the project.
         let work = commit.id == WORKTREE;
-        let files_visible = repo.files_visible && !work;
+        // The list of where a word is used takes the changed files' place, and is shown whatever the Files switch says.
+        let usages = repo.usages.is_some();
+        let files_visible = (repo.files_visible && !work) || usages;
 
         let (short, summary) = match (&repo.phase, repo.selected) {
             _ if work => {
@@ -87,7 +89,7 @@ impl Workspace {
             Phase::Loading => text_panel("Loading commit…", t().muted),
             Phase::Failed(message) => text_panel(message.clone(), t().removed),
             Phase::Ready(_) => {
-                let files = files_visible.then(|| self.render_files_column(cx));
+                let files = files_visible.then(|| if usages { self.render_usages_column(cx) } else { self.render_files_column(cx) });
                 let files_divider = files_visible.then(|| self.splitter("files-divider", Splitter::Files, cx));
                 // Hidden, the file list can be reached by pointing at the left edge of the code.
                 let files_hidden = !files_visible && !work && repo.file.is_some();

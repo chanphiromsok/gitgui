@@ -1675,3 +1675,56 @@ fn rebased_commits_are_found_beside_the_ones_they_were_copied_from() {
     repo.commit("o.txt", "o");
     assert!(git.twins("other", "main").is_empty());
 }
+
+#[test]
+fn usages_lists_the_lines_of_a_word_at_a_commit_in_files_with_the_declaration_told_apart() {
+    let repo = TempRepo::new("usages");
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    repo.commit_text("src/a.ts", "export function refetch(x) {\n  return x;\n}\n", "a");
+    repo.commit_text("src/b.ts", "import { refetch } from \"./a\";\nconst refetchAll = 1;\nrefetch(1);\n", "b");
+    repo.commit_text("notes.md", "see refetch\n", "notes");
+    let git = GitCli::new(repo.path());
+    let head = String::from_utf8(Command::new("git").arg("-C").arg(repo.path()).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap().trim().to_owned();
+
+    let usages = git.usages(Some(&head), "refetch", false).unwrap();
+    let files: Vec<(&str, Vec<u32>)> = usages.files.iter().map(|f| (f.path.as_str(), f.matches.iter().map(|m| m.line).collect())).collect();
+    // `refetchAll` is another name: whole words only. Files come in path order.
+    assert_eq!(files, [("notes.md", vec![1]), ("src/a.ts", vec![1]), ("src/b.ts", vec![1, 3])]);
+    assert_eq!(usages.matches, 4);
+    assert!(!usages.truncated);
+    let defined: Vec<(&str, u32)> = usages.definitions().map(|(path, m)| (path, m.line)).collect();
+    assert_eq!(defined, [("src/a.ts", 1)]);
+    assert_eq!(usages.files[1].matches[0].text, "export function refetch(x) {");
+
+    // Loose: inside longer names, any case.
+    let loose = git.usages(Some(&head), "REFETCH", true).unwrap();
+    assert_eq!(loose.matches, 5);
+    // Nothing found is an answer.
+    let none = git.usages(Some(&head), "nowhere_to_be_found", false).unwrap();
+    assert_eq!((none.matches, none.files.len(), none.truncated), (0, 0, false));
+    // A word that is too short, or a commit that is not there.
+    assert!(git.usages(Some(&head), "x", false).is_err());
+    assert!(git.usages(Some("--output=/tmp/x"), "refetch", false).is_err());
+}
+
+#[test]
+fn usages_in_the_working_folder_include_new_files_but_not_ignored_ones_and_a_flood_is_cut() {
+    let repo = TempRepo::new("usages-work");
+    repo.commit_text(".gitignore", "ignored.txt\n", "ignore");
+    repo.commit_text("a.txt", "needle one\n", "a");
+    std::fs::write(repo.path().join("new.txt"), "a needle in a new file\n").unwrap();
+    std::fs::write(repo.path().join("ignored.txt"), "needle ignored\n").unwrap();
+    // Changed after the commit: the folder is searched, not the commit.
+    std::fs::write(repo.path().join("a.txt"), "needle one\nneedle two\n").unwrap();
+    let git = GitCli::new(repo.path());
+    let found = git.usages(None, "needle", false).unwrap();
+    let files: Vec<(&str, usize)> = found.files.iter().map(|f| (f.path.as_str(), f.matches.len())).collect();
+    assert_eq!(files, [("a.txt", 2), ("new.txt", 1)]);
+
+    // More than the most that is kept: the first ones, and the word that there were more.
+    let flood: String = (0..gitgui_core::MAX_MATCHES + 50).map(|n| format!("needle {n}\n")).collect();
+    std::fs::write(repo.path().join("flood.txt"), flood).unwrap();
+    let found = git.usages(None, "needle", false).unwrap();
+    assert_eq!(found.matches, gitgui_core::MAX_MATCHES);
+    assert!(found.truncated);
+}

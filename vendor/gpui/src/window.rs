@@ -1270,8 +1270,12 @@ impl Window {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+/// What came of an event sent to the window.
+// gitgui patch: public, so the development script (`mouse` step) can send a press through the window's own event handling.
+pub struct DispatchEventResult {
+    /// The event goes on to the platform's default handling.
     pub propagate: bool,
+    /// Some handler said its default must not happen.
     pub default_prevented: bool,
 }
 

@@ -1,14 +1,15 @@
 //! The file diff: a toolbar, the commit's files on the left, and the diff on the right, unified or
 //! side by side. Comments sit under their lines; a "+" appears on hover to start one.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gitgui_core::{Gap, DiffLine, FileStatus, GitCli, LineKind};
 use gitgui_store::{Comment, Side};
 use gpui::{
-    AnyElement, Context, ElementId, FontWeight, ListOffset, MouseButton, SharedString, StyledText, Window, canvas, div, list,
-    prelude::*, px, relative, rgb, rgba,
+    AnyElement, Context, CursorStyle, ElementId, FontWeight, ListOffset, MouseButton, MouseDownEvent, SharedString, StyledText, TextLayout,
+    Window, canvas, div, list, prelude::*, px, relative, rgb, rgba,
 };
 
 use crate::changes::WORKTREE;
@@ -18,6 +19,7 @@ use crate::rows::{Anchor, DisplayRow, Mode, Notice, anchor_of};
 use crate::preview::{self, Images, Preview};
 use crate::minimap::MarkKind;
 use crate::syntax::{FileColors, Span};
+use crate::usage_ui::Selection;
 use crate::ui::{self, MONO, button, ghost, segment, segmented};
 use crate::workspace::{BlameState, Phase, WHOLE_FILE, Workspace};
 use crate::theme::t;
@@ -56,6 +58,9 @@ impl Workspace {
     pub fn render_diff(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.resolver().is_some() {
             return self.render_resolver(cx);
+        }
+        if self.repo.as_ref().and_then(|repo| repo.file.as_ref()).is_some_and(|file| file.viewing.is_some()) {
+            return self.render_viewer(cx);
         }
         let Some(repo) = self.repo.as_ref() else { return div().into_any_element() };
         let Some(file) = repo.file.as_ref() else { return div().into_any_element() };
@@ -170,12 +175,79 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A file read whole, from a list of usages: its name, where it was read from, and the code with the word marked.
+    fn render_viewer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(file) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()) else { return div().into_any_element() };
+        let Some(viewing) = file.viewing.as_ref() else { return div().into_any_element() };
+        let (folder, name) = viewing.path.rsplit_once('/').map_or(("", viewing.path.as_str()), |(folder, name)| (folder, name));
+        let from = match &viewing.rev {
+            Some(rev) => format!("Read-only · as of {}", rev.chars().take(7).collect::<String>()),
+            None => "Read-only · your working folder".to_owned(),
+        };
+        let changed = self.viewed_change();
+
+        let toolbar = div()
+            .h(px(32.))
+            .flex_none()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(rgb(t().border))
+            .child(ghost("overview", "‹ Overview").on_click(cx.listener(|this, _, _, cx| this.close_file(cx))))
+            .child(ui::file_icon(icons::file(name)))
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(360.))
+                    .overflow_hidden()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(t().text_strong))
+                    .child(SharedString::from(name.to_owned())),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .line_clamp(1)
+                    .text_ellipsis()
+                    .text_xs()
+                    .text_color(rgb(t().muted))
+                    .child(SharedString::from(folder.to_owned())),
+            )
+            .child(div().flex_none().text_xs().text_color(rgb(t().muted)).child(SharedString::from(from)))
+            // The commit changed this file too: its changes are one click away.
+            .when_some(changed, |bar, index| {
+                bar.child(
+                    ghost("view-changes", "View changes")
+                        .debug_selector(|| "view-changes".to_owned())
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_file(index, cx))),
+                )
+            });
+        let body: AnyElement = match &file.phase {
+            Phase::Loading => centered_text("Loading…", t().muted),
+            Phase::Failed(message) => centered_text(message.clone(), t().removed),
+            Phase::Ready(()) => self.diff_body(file, Mode::Unified, cx),
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(toolbar)
+            .child(div().flex_1().min_h_0().bg(rgb(t().editor_bg)).child(body))
+            .into_any_element()
+    }
+
     /// The rows, scrolling sideways when a line is longer than the pane, with the minimap over the right edge.
     fn diff_body(&self, file: &crate::workspace::FileState, mode: Mode, cx: &mut Context<Self>) -> AnyElement {
         // What the longest line needs beside the gutter, in each layout.
         let gutter_cols = match mode {
-            Mode::Unified => 11.,
-            Mode::Split => 5.,
+            Mode::Unified if file.viewing.is_none() => 11.,
+            _ => 5.,
         };
         file.content_w.set((gutter_cols + 3. + file.max_cols as f32) * CHAR_W + 24.);
         let rows = list(file.list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_diff_row(ix, cx))).size_full();
@@ -336,7 +408,7 @@ impl Workspace {
         let mode = file.mode(repo.mode);
         let sx = file.scroll_x.get().clamp(0., max_scroll_x(file, mode));
         // Uncommitted lines have no commit to hang a comment on.
-        let comments = repo.commit.as_ref().is_some_and(|commit| commit.id != WORKTREE);
+        let comments = repo.commit.as_ref().is_some_and(|commit| commit.id != WORKTREE) && file.viewing.is_none();
         // Who last changed the line the pointer is on, said beside that line only.
         let note = self.blame_note(ix);
 
@@ -345,11 +417,11 @@ impl Workspace {
             DisplayRow::Tail => tail_row(file.below, cx),
             DisplayRow::Line { hunk, line } => {
                 let line = &file.diff.hunks[hunk].lines[line];
-                unified_line(ix, line, file.colors.of(line), comments, sx, note.as_ref(), cx)
+                unified_line(ix, line, file.colors.of(line), comments, sx, note.as_ref(), file, cx)
             }
             DisplayRow::Pair { hunk, left, right } => {
                 let lines = &file.diff.hunks[hunk].lines;
-                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, sx, note.as_ref(), cx)
+                split_row(ix, left.map(|l| &lines[l]), right.map(|r| &lines[r]), &file.colors, comments, sx, note.as_ref(), file, cx)
             }
             DisplayRow::Comment(i) => match file.comments.get(i) {
                 Some(comment) => comment_card(ix, comment, mode, cx),
@@ -783,9 +855,38 @@ fn tint(color: u32) -> gpui::HighlightStyle {
     gpui::HighlightStyle { color: Some(rgb(color).into()), ..Default::default() }
 }
 
+/// What shows over the colors of the code: the text picked, and the word marked wherever it is.
+type Marks = [(Range<usize>, u32)];
+
+/// `base` (sorted, not overlapping) with a background from `marks` (also) behind the text they cover, cutting a
+/// color's span where a mark starts or ends. GPUI wants the ranges it is given to be in order and not to overlap.
+fn overlay(base: Vec<(Range<usize>, gpui::HighlightStyle)>, marks: &[(Range<usize>, gpui::Hsla)]) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    if marks.is_empty() {
+        return base;
+    }
+    let mut cuts: Vec<usize> = base.iter().flat_map(|(r, _)| [r.start, r.end]).chain(marks.iter().flat_map(|(r, _)| [r.start, r.end])).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let under = base.iter().find(|(r, _)| r.start <= from && to <= r.end).map(|(_, style)| *style);
+        let mark = marks.iter().find(|(r, _)| r.start <= from && to <= r.end).map(|(_, color)| *color);
+        if under.is_none() && mark.is_none() {
+            continue;
+        }
+        let mut style = under.unwrap_or_default();
+        if mark.is_some() {
+            style.background_color = mark;
+        }
+        out.push((from..to, style));
+    }
+    out
+}
+
 /// One text element for a whole row: `gutter  sign  code`, with the gutter and sign colored. The font is
 /// monospace, so padding the numbers lines the columns up, and a row costs one element, not six.
-fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str, spans: &[Span]) -> StyledText {
+fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str, spans: &[Span], marks: &Marks) -> StyledText {
     let theme = t();
     let text = format!("{gutter} {sign} {}", code.replace('\t', "    "));
     let end = gutter.len();
@@ -803,9 +904,15 @@ fn diff_text(gutter: &str, sign: &str, sign_color: u32, code: &str, spans: &[Spa
             highlights.push((at(from)..at(to), style));
         }
     }
-    StyledText::new(text).with_highlights(highlights)
+    let marks: Vec<(Range<usize>, gpui::Hsla)> = marks
+        .iter()
+        .filter(|(range, _)| range.start < range.end && range.end <= code.len() && code.is_char_boundary(range.start) && code.is_char_boundary(range.end))
+        .map(|(range, color)| (at(range.start)..at(range.end), rgb(*color).into()))
+        .collect();
+    StyledText::new(text).with_highlights(overlay(highlights, &marks))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unified_line(
     ix: usize,
     line: &DiffLine,
@@ -813,27 +920,39 @@ fn unified_line(
     comments: bool,
     sx: f32,
     note: Option<&BlameNote>,
+    file: &crate::workspace::FileState,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let (sign, sign_color) = marker(line.kind);
-    let gutter = format!("{} {}", column(line.old_no, 5), column(line.new_no, 5));
+    // A file read whole has one column of numbers.
+    let gutter = if file.viewing.is_some() { column(line.new_no, 5) } else { format!("{} {}", column(line.old_no, 5), column(line.new_no, 5)) };
+    let marks = file.marks_of(ix, 0, &line.text);
+    let text = diff_text(&gutter, sign, sign_color, &line.text, spans, &marks);
+    // Where in the text a press landed, asked of the text itself once it is drawn.
+    let (left, right) = (text.layout().clone(), text.layout().clone());
+    // The line a usage pointed at, in a file read whole.
+    let target = file.viewing.as_ref().and_then(|viewing| viewing.line).is_some_and(|wanted| line.new_no == Some(wanted));
     div()
         .id(("line", ix))
         .group("diff-line")
         .relative()
         .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_diff_line(ix, 0, *on, cx)))
+        .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| this.press_code(ix, 0, &left, event, cx)))
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| this.press_code(ix, 0, &right, event, cx)))
         .w_full()
         .h(px(LINE_H))
         .flex()
         .items_center()
         .overflow_hidden()
         .whitespace_nowrap()
+        .cursor(CursorStyle::IBeam)
         .when_some(line_bg(line.kind), |row, bg| row.bg(rgb(bg)))
+        .when(target, |row| row.bg(rgb(crate::theme::mix(t().editor_bg, t().accent, 0.10))))
         .font_family(MONO)
         .text_xs()
         .child(plus(("plus", ix), anchor_of(line).filter(|_| comments), "diff-line", cx))
         .text_color(rgb(t().editor_fg))
-        .child(div().flex_none().ml(px(-sx)).child(diff_text(&gutter, sign, sign_color, &line.text, spans)))
+        .child(div().flex_none().ml(px(-sx)).child(text))
         .when_some(note, |row, note| row.child(blame_chip(ix, 0, note, cx)))
         .into_any_element()
 }
@@ -847,6 +966,7 @@ fn split_row(
     comments: bool,
     sx: f32,
     note: Option<&BlameNote>,
+    file: &crate::workspace::FileState,
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let half = |left_side: bool, line: Option<&DiffLine>, cx: &mut Context<Workspace>| -> AnyElement {
@@ -858,15 +978,21 @@ fn split_row(
         let (sign, sign_color) = marker(line.kind);
         let shown = if left_side { line.old_no } else { line.new_no };
         let side = if left_side { 1u8 } else { 2 };
+        let marks = file.marks_of(ix, side, &line.text);
+        let text = diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side), &marks);
+        let (pressed, menu) = (text.layout().clone(), text.layout().clone());
         cell.id(("half", ix * 3 + side as usize))
             .group(group)
             .relative()
             .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_diff_line(ix, side, *on, cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| this.press_code(ix, side, &pressed, event, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| this.press_code(ix, side, &menu, event, cx)))
+            .cursor(CursorStyle::IBeam)
             .flex()
             .items_center()
             .when_some(line_bg(line.kind), |cell, bg| cell.bg(rgb(bg)))
             .child(plus((if left_side { "plus-l" } else { "plus-r" }, ix), anchor_of(line).filter(|_| comments), group, cx))
-            .child(div().flex_none().ml(px(-sx)).child(diff_text(&column(shown, 5), sign, sign_color, &line.text, colors.side(line, left_side))))
+            .child(div().flex_none().ml(px(-sx)).child(text))
             .when_some(note.filter(|note| note.side == side), |cell, note| cell.child(blame_chip(ix, side, note, cx)))
             .into_any_element()
     };
@@ -927,4 +1053,176 @@ fn comment_card(ix: usize, comment: &Comment, mode: Mode, cx: &mut Context<Works
         )
         .hover(|style| style.bg(rgb(t().hover)).opacity(1.))
         .into_any_element()
+}
+
+// ---- picking text, and what it is used for ------------------------------------------------------------
+
+/// The columns before the code in a row's text: the line numbers, a space, the sign, a space.
+const UNIFIED_PREFIX: usize = 11 + 3;
+const SPLIT_PREFIX: usize = 5 + 3;
+
+/// The byte of `code` that the byte `shown` of its drawn text stands for (a tab is drawn as four spaces).
+fn code_offset(code: &str, shown: usize) -> usize {
+    let mut at = 0;
+    for (byte, c) in code.char_indices() {
+        let width = if c == '\t' { 4 } else { c.len_utf8() };
+        if at + width > shown {
+            return byte;
+        }
+        at += width;
+    }
+    code.len()
+}
+
+impl crate::workspace::FileState {
+    /// The code of the line a row shows (`side`: 0 for a unified row, 1 left and 2 right of a split one).
+    pub(crate) fn code_of(&self, row: usize, side: u8) -> Option<&str> {
+        let lines = |hunk: usize| self.diff.hunks.get(hunk).map(|hunk| &hunk.lines);
+        match *self.rows.get(row)? {
+            DisplayRow::Line { hunk, line } if side == 0 => lines(hunk)?.get(line).map(|l| l.text.as_str()),
+            DisplayRow::Pair { hunk, left, .. } if side == 1 => lines(hunk)?.get(left?).map(|l| l.text.as_str()),
+            DisplayRow::Pair { hunk, right, .. } if side == 2 => lines(hunk)?.get(right?).map(|l| l.text.as_str()),
+            _ => None,
+        }
+    }
+
+    /// What is picked, as text.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
+        let code = self.code_of(selection.row, selection.side)?;
+        code.get(selection.range.clone()).map(str::to_owned)
+    }
+
+    /// What to paint behind the code of a row: the word marked wherever it is, softly, and what is picked, stronger.
+    pub(crate) fn marks_of(&self, row: usize, side: u8, code: &str) -> Vec<(Range<usize>, u32)> {
+        let picked = self
+            .selection
+            .as_ref()
+            .filter(|s| s.row == row && s.side == side)
+            .map(|s| s.range.clone())
+            .filter(|r| r.start < r.end && r.end <= code.len() && code.is_char_boundary(r.start) && code.is_char_boundary(r.end));
+        let mut marks = Vec::new();
+        if let Some(word) = &self.word_mark {
+            let soft = crate::theme::mix(t().editor_bg, t().accent, 0.30);
+            for range in gitgui_core::occurrences(code, word) {
+                if picked.as_ref().is_none_or(|p| range.end <= p.start || range.start >= p.end) {
+                    marks.push((range, soft));
+                }
+            }
+        }
+        if let Some(picked) = picked {
+            marks.push((picked, crate::theme::mix(t().editor_bg, t().accent, 0.50)));
+        }
+        marks.sort_by_key(|(range, _)| range.start);
+        marks
+    }
+}
+
+impl Workspace {
+    /// A press on the code of a row, at `event.position` in the text `layout` drew (see `press_at`).
+    pub(crate) fn press_code(&mut self, row: usize, side: u8, layout: &TextLayout, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(file) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()) else { return };
+        let Some(code) = file.code_of(row, side) else { return };
+        let prefix = if side == 0 && file.viewing.is_none() { UNIFIED_PREFIX } else { SPLIT_PREFIX };
+        // Where in the code, if the press was on it at all (the numbers and the room past the line's end are not).
+        let at = layout.index_for_position(event.position).ok().and_then(|shown| shown.checked_sub(prefix)).map(|shown| code_offset(code, shown));
+        self.press_at(row, side, at, event, cx);
+    }
+
+    /// A press at byte `at` of a row's code (`None`: not on the code): a double-click picks the word there, a
+    /// triple-click the line; Cmd or Ctrl with a click asks where the word is used; a click anywhere else puts the pick
+    /// away; a right-click offers what can be done with the word.
+    pub(crate) fn press_at(&mut self, row: usize, side: u8, at: Option<usize>, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(file) = self.repo.as_mut().and_then(|repo| repo.file.as_mut()) else { return };
+        let Some(code) = file.code_of(row, side).map(str::to_owned) else { return };
+        let word = at.and_then(|at| gitgui_core::word_at(&code, at));
+        let picked = |range: Range<usize>| Selection { row, side, range };
+
+        if event.button == MouseButton::Right {
+            let inside = at.zip(file.selection.as_ref()).is_some_and(|(at, s)| s.row == row && s.side == side && s.range.contains(&at));
+            if !inside {
+                match word {
+                    Some(word) => {
+                        file.word_mark = Some(code[word.clone()].to_owned());
+                        file.selection = Some(picked(word));
+                    }
+                    None => return,
+                }
+            }
+            let Some(text) = file.selected_text() else { return };
+            let word = (gitgui_core::word_problem(&text).is_none() && text.chars().all(gitgui_core::is_word_char)).then(|| text.clone());
+            cx.notify();
+            return self.open_menu(event.position, crate::menu::MenuTarget::Code { text, word }, cx);
+        }
+
+        match (event.click_count, word) {
+            (3.., _) if at.is_some() => {
+                file.selection = Some(picked(0..code.len()));
+                file.word_mark = None;
+            }
+            (2, Some(word)) => {
+                file.word_mark = Some(code[word.clone()].to_owned());
+                file.selection = Some(picked(word));
+            }
+            (1, Some(word)) if event.modifiers.secondary() => {
+                let text = code[word.clone()].to_owned();
+                file.word_mark = Some(text.clone());
+                file.selection = Some(picked(word));
+                cx.notify();
+                return self.find_usages(text, cx);
+            }
+            // A click elsewhere puts the pick away; the word a usage was asked for stays marked in a file read from the list.
+            _ => {
+                file.selection = None;
+                if file.viewing.is_none() {
+                    file.word_mark = None;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Cmd or Ctrl and C: puts what is picked in the code on the clipboard. With nothing picked it does nothing.
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()).and_then(|file| file.selected_text()) else { return };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{HighlightStyle, hsla};
+
+    fn color(c: f32) -> HighlightStyle {
+        HighlightStyle { color: Some(hsla(c, 1., 0.5, 1.)), ..Default::default() }
+    }
+
+    #[test]
+    fn a_mark_cuts_the_colors_it_covers_and_leaves_the_rest_alone() {
+        let base = vec![(0..4, color(0.1)), (6..12, color(0.5))];
+        let mark = hsla(0.9, 1., 0.5, 1.);
+        let out = overlay(base.clone(), &[(2..8, mark)]);
+        // Colored text keeps its color under the mark; the mark's own text where nothing was colored gets only the background.
+        assert_eq!(
+            out.iter().map(|(r, s)| (r.clone(), s.color.is_some(), s.background_color.is_some())).collect::<Vec<_>>(),
+            [(0..2, true, false), (2..4, true, true), (4..6, false, true), (6..8, true, true), (8..12, true, false)]
+        );
+        // Sorted, not overlapping: what GPUI needs.
+        assert!(out.windows(2).all(|pair| pair[0].0.end <= pair[1].0.start));
+        // No marks: untouched.
+        assert_eq!(overlay(base.clone(), &[]), base);
+    }
+
+    #[test]
+    fn a_position_in_the_drawn_text_is_a_byte_of_the_code_with_tabs_four_wide() {
+        assert_eq!(code_offset("abc", 1), 1);
+        assert_eq!(code_offset("abc", 99), 3);
+        // A tab is drawn as four spaces: any of the four is the tab, the fifth is what follows it.
+        assert_eq!(code_offset("\tab", 0), 0);
+        assert_eq!(code_offset("\tab", 3), 0);
+        assert_eq!(code_offset("\tab", 4), 1);
+        // Letters outside ASCII are several bytes long.
+        assert_eq!(code_offset("é!", 2), 2);
+    }
 }

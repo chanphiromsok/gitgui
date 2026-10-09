@@ -2844,6 +2844,160 @@ async fn the_graph_can_be_limited_to_an_author_and_to_days_from_the_search_box_a
     assert!(dates.iter().any(|l| l.starts_with('✓') && l.contains("Last 7 days")), "the chosen preset is ticked: {dates:?}");
 }
 
+// ---- picking text in the code, and where a word is used ---------------------------------------------------------
+
+fn press(count: usize, button: MouseButton, secondary: bool) -> gpui::MouseDownEvent {
+    let modifiers = if secondary { Modifiers::secondary_key() } else { Modifiers::default() };
+    gpui::MouseDownEvent { button, position: point(px(300.), px(300.)), modifiers, click_count: count, first_mouse: false }
+}
+
+/// The row of the open file whose code (one column, unified) has `text`.
+fn row_of(ws: &Entity<Workspace>, cx: &mut VisualTestContext, text: &str) -> usize {
+    ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        (0..file.rows.len()).find(|&row| file.code_of(row, 0).is_some_and(|code| code.contains(text))).unwrap_or_else(|| panic!("no row has {text:?}"))
+    })
+}
+
+#[gpui::test]
+async fn a_word_picked_in_the_code_is_marked_copied_asked_about_and_read_where_it_is_used(cx: &mut TestAppContext) {
+    use crate::menu::{Action, MenuTarget};
+    use crate::usage_ui::UsageRow;
+    let fx = bare_fixture("usages-flow");
+    commit_file(&fx, "lib.ts", "export function target(x) {\n  return x;\n}\n", "base");
+    commit_file(&fx, "use.ts", "import { target } from \"./lib\";\ntarget(1);\nconst targetCount = 2;\n", "uses");
+    commit_file(&fx, "lib.ts", "export function target(x) {\n  return x + 1;\n}\n", "change lib");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    ws.update(cx, |ws, cx| ws.set_mode(Mode::Unified, cx));
+    select(&ws, cx, "change lib");
+    ws.update(cx, |ws, cx| ws.open_file(0, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let declared = row_of(&ws, cx, "export function target");
+    let at = "export function target(x) {".find("target").unwrap() + 2;
+    let picked = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().selected_text());
+
+    // A click picks nothing; a double-click picks the word under it, and marks it where else it is.
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(1, MouseButton::Left, false), cx));
+    assert_eq!(picked(cx), None);
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(2, MouseButton::Left, false), cx));
+    assert_eq!(picked(cx).as_deref(), Some("target"));
+    let marks = ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().marks_of(declared, 0, "export function target(x) {"));
+    assert_eq!(marks.len(), 1, "the picked word is painted: {marks:?}");
+    draw(cx, &ws);
+
+    // Copy puts it on the clipboard; a triple-click takes the whole line.
+    ws.update(cx, |ws, cx| ws.copy_selection(cx));
+    assert_eq!(cx.update(|_, app| app.read_from_clipboard().and_then(|item| item.text())).as_deref(), Some("target"));
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(3, MouseButton::Left, false), cx));
+    assert_eq!(picked(cx).as_deref(), Some("export function target(x) {"));
+    // On the numbers (no place in the code) a click puts the pick away.
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, None, &press(1, MouseButton::Left, false), cx));
+    assert_eq!(picked(cx), None);
+
+    // The right-click menu on the word: copy, and the two questions about it.
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(1, MouseButton::Right, false), cx));
+    let menu = ws.read_with(cx, |ws, _| ws.menu.as_ref().map(|m| m.target.clone()));
+    let Some(target @ MenuTarget::Code { .. }) = menu else { panic!("no code menu: {menu:?}") };
+    let labels: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&target).iter().filter(|i| i.action.is_some()).map(|i| i.label.to_string()).collect());
+    assert_eq!(labels, ["Copy", "Find Usages of target", "Find Commits that Changed It"]);
+    ws.update(cx, |ws, cx| ws.close_menu(cx));
+    // A whole line is only copied: it is not a word to search for.
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(3, MouseButton::Left, false), cx));
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(1, MouseButton::Right, false), cx));
+    let labels: Vec<String> = ws.read_with(cx, |ws, _| {
+        let target = ws.menu.as_ref().unwrap().target.clone();
+        ws.menu_items(&target).iter().filter(|i| i.action.is_some()).map(|i| i.label.to_string()).collect()
+    });
+    assert_eq!(labels, ["Copy"]);
+    ws.update(cx, |ws, cx| ws.close_menu(cx));
+
+    // Cmd or Ctrl and a click asks where it is used: in the commit being read, whole words only.
+    ws.update(cx, |ws, cx| ws.press_at(declared, 0, Some(at), &press(1, MouseButton::Left, true), cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let (word, found, rows) = ws.read_with(cx, |ws, _| {
+        let state = ws.repo.as_ref().unwrap().usages.as_ref().expect("the list is asked for");
+        let Phase::Ready(found) = &state.phase else { panic!("not read") };
+        (state.word.clone(), found.clone(), state.rows.clone())
+    });
+    assert_eq!(word, "target");
+    let places: Vec<(&str, Vec<u32>)> = found.files.iter().map(|f| (f.path.as_str(), f.matches.iter().map(|m| m.line).collect())).collect();
+    assert_eq!(places, [("lib.ts", vec![1]), ("use.ts", vec![1, 2])], "targetCount is another name");
+    assert!(matches!(rows[0], UsageRow::Heading("Declared in")));
+    assert!(cx.debug_bounds("usage-2").is_some(), "the lines are in the list");
+
+    // A line of the list opens the whole file, read-only, at that line, with the word marked.
+    ws.update(cx, |ws, cx| ws.script_open_usage(1, cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    let (path, line, lines, mark) = ws.read_with(cx, |ws, _| {
+        let file = ws.repo.as_ref().unwrap().file.as_ref().unwrap();
+        let viewing = file.viewing.clone().expect("a file read whole");
+        (viewing.path, viewing.line, file.diff.hunks[0].lines.len(), file.word_mark.clone())
+    });
+    assert_eq!((path.as_str(), line, lines, mark.as_deref()), ("use.ts", Some(1), 3, Some("target")));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.viewed_change()), None, "the commit did not change use.ts");
+    // The arrows leave it alone: it is not one of the changed files.
+    ws.update(cx, |ws, cx| ws.step_file(1, cx));
+    assert!(ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.as_ref().unwrap().viewing.is_some()));
+    // One that the commit changed has its changes one click away.
+    ws.update(cx, |ws, cx| ws.open_usage("lib.ts".to_owned(), 1, cx));
+    cx.run_until_parked();
+    assert_eq!(ws.read_with(cx, |ws, _| ws.viewed_change()), Some(0));
+
+    // Escape: the file, then the list, then back to the changed files.
+    ws.update(cx, |ws, cx| ws.back(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().file.is_none() && ws.repo.as_ref().unwrap().usages.is_some()));
+    ws.update(cx, |ws, cx| ws.back(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().usages.is_none()));
+
+    // The other question: which commits touched it, asked of the graph's search.
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::FindCommits("target".into()), window, cx));
+    assert_eq!(ws.read_with(cx, |ws, app| ws.search_input.read(app).text().to_owned()), "code:target");
+}
+
+#[gpui::test]
+async fn the_list_of_usages_says_when_there_are_none_and_a_looser_search_finds_more(cx: &mut TestAppContext) {
+    let fx = bare_fixture("usages-loose");
+    commit_file(&fx, "a.ts", "const loadAll = 1;\nload(2);\n", "a");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    select(&ws, cx, "a");
+    let state = |cx: &mut VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            let state = ws.repo.as_ref().unwrap().usages.as_ref().unwrap();
+            match &state.phase {
+                Phase::Ready(found) => Some(found.matches),
+                _ => None,
+            }
+        })
+    };
+    ws.update(cx, |ws, cx| ws.find_usages("load".to_owned(), cx));
+    cx.run_until_parked();
+    assert_eq!(state(cx), Some(1), "whole names only");
+    ws.update(cx, |ws, cx| ws.set_usage_loose(true, cx));
+    cx.run_until_parked();
+    assert_eq!(state(cx), Some(2), "any part of a name");
+    draw(cx, &ws);
+    assert!(cx.debug_bounds("usages-loose").is_some() && cx.debug_bounds("usages-back").is_some());
+
+    // Nothing found: said, with the history question offered next.
+    ws.update(cx, |ws, cx| ws.find_usages("nowhere_at_all".to_owned(), cx));
+    cx.run_until_parked();
+    draw(cx, &ws);
+    assert_eq!(state(cx), Some(0));
+    assert!(cx.debug_bounds("usages-history").is_some());
+    // A word that is too short is refused with a note, and the list stays as it was.
+    ws.update(cx, |ws, cx| ws.find_usages("x".to_owned(), cx));
+    assert_eq!(ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().usages.as_ref().unwrap().word.clone()), "nowhere_at_all");
+    assert!(ws.read_with(cx, |ws, _| ws.notice.is_some()));
+    // Back to the changed files.
+    ws.update(cx, |ws, cx| ws.close_usages(cx));
+    assert!(ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().usages.is_none()));
+}
+
 #[gpui::test]
 async fn one_button_names_which_branches_the_graph_shows_and_its_menu_changes_it(cx: &mut TestAppContext) {
     use crate::menu::{Action, MenuTarget};
