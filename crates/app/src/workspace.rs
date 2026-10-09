@@ -2976,18 +2976,26 @@ impl Workspace {
                         view.timing.clone()
                     }),
             )
-            // The sync group is the one filled thing here; the rest is quiet until the pointer is over it.
+            // One family: New branch, Fetch, Pull, Push and Refresh share a height, a corner and a quiet look, with the
+            // one the branch needs now (Push or Pull) the only one with a fill.
             .child(
-                ui::ghost("new-branch", "New branch…")
-                    .debug_selector(|| "new-branch".to_owned())
-                    .on_click(cx.listener(|this, _, window, cx| this.open_new_branch(window, cx))),
-            )
-            .children((!view.remotes.is_empty()).then(|| self.render_sync_buttons(view.upstream(), cx)))
-            .child(
-                ui::icon_button("refresh", icons::refresh())
-                    .debug_selector(|| "refresh".to_owned())
-                    .tooltip(ui::tip("Refresh", Some(ui::shortcut("R"))))
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        ui::ghost("new-branch", "New branch…")
+                            .debug_selector(|| "new-branch".to_owned())
+                            .on_click(cx.listener(|this, _, window, cx| this.open_new_branch(window, cx))),
+                    )
+                    .children((!view.remotes.is_empty()).then(|| self.render_sync_buttons(view.upstream(), cx)))
+                    .child(
+                        ui::icon_button("refresh", icons::refresh())
+                            .debug_selector(|| "refresh".to_owned())
+                            .tooltip(ui::tip("Refresh", Some(ui::shortcut("R"))))
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
             );
 
         div()
@@ -3009,21 +3017,10 @@ impl Workspace {
     fn render_filter_bar(&self, repo: &RepoState, view: &RepoView, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
         let filter = &repo.graph_filter;
         let scope = filter.scope;
-        let segment = |id: &'static str, label: &'static str, this: Scope| {
-            button(id, label)
-                .rounded_none()
-                .when(scope == this, |b| b.bg(rgb(t().accent)).text_color(rgb(t().on_accent)).font_weight(FontWeight::BOLD))
-                .on_click(cx.listener(move |workspace, _, _, cx| workspace.set_scope(this, cx)))
-        };
-        let scopes = div()
-            .flex()
-            .flex_none()
-            .rounded_sm()
-            .overflow_hidden()
-            .child(segment("scope-focus", if narrow { "Focus" } else { "Branch + base" }, Scope::Focus))
-            .child(segment("scope-current", if narrow { "Branch" } else { "Branch only" }, Scope::Current))
-            .child(segment("scope-local", "Local", Scope::Local))
-            .child(segment("scope-all", "All", Scope::All));
+        // Which branches, as the one button that says it: the menu lists the four ways to look.
+        let scopes = ui::button("scope", format!("{} ▾", crate::menu::scope_name(scope)))
+            .debug_selector(|| "scope".to_owned())
+            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| this.open_menu(event.position(), crate::menu::MenuTarget::Scope, cx)));
 
         // What the graph leaves out, and whose commits and which days it is limited to, behind one button. It says how
         // many of those are set, so a filtered graph is never a surprise.
@@ -3211,14 +3208,11 @@ impl Workspace {
         let (pull, push) = sync_emphasis(upstream);
         // A fetch the app started on its own is running: quietly greyed, not a banner.
         let fetch = sync_button("fetch", "Fetch", if self.auto_fetching { Emphasis::Idle } else { Emphasis::Plain })
-            .rounded_l_sm()
             .on_click(cx.listener(|this, _, _, cx| this.fetch(cx)));
         let pull = sync_button("pull-rebase", "Pull", pull)
             .on_click(cx.listener(|this, _, window, cx| this.choose(crate::menu::Action::PullRebase, window, cx)));
-        let push = sync_button("push", "Push", push)
-            .rounded_r_sm()
-            .on_click(cx.listener(|this, _, window, cx| this.push_current(window, cx)));
-        div().flex().flex_none().gap(px(1.)).child(fetch).child(pull).child(push).into_any_element()
+        let push = sync_button("push", "Push", push).on_click(cx.listener(|this, _, window, cx| this.push_current(window, cx)));
+        div().flex().flex_none().gap_0p5().child(fetch).child(pull).child(push).into_any_element()
     }
 
     /// "2 ahead · 1 behind release/1.0.0": click it to go to the commit the branch was cut from.
@@ -3420,27 +3414,26 @@ pub(crate) fn sync_emphasis(upstream: Option<&Upstream>) -> (Emphasis, Emphasis)
     }
 }
 
-/// One button of the Fetch, Pull and Push group: a `button` whose fill says how much it matters now. The caller rounds
-/// the outer corners.
+/// One button of the Fetch, Pull and Push group, drawn like the other buttons of the header (see `ui::ghost`); only the
+/// one that matters now has a fill. (Built here and not from `ghost`: an element takes one `hover`.)
 fn sync_button(id: &'static str, label: &'static str, look: Emphasis) -> gpui::Stateful<gpui::Div> {
-    let (fill, hover) = match look {
-        Emphasis::Lit => (theme::mix(t().element, t().accent, 0.3), theme::mix(t().element, t().accent, 0.45)),
-        Emphasis::Plain | Emphasis::Idle => (t().element, t().element_hover),
-    };
+    let lit = look == Emphasis::Lit;
+    let hover = if lit { theme::mix(t().element, t().accent, 0.45) } else { t().element_hover };
     div()
         .id(id)
         .debug_selector(move || id.to_owned())
         .flex_none()
         .px_2()
-        .h(px(22.))
+        .h(px(24.))
         .flex()
         .items_center()
-        .bg(rgb(fill))
+        .rounded_sm()
         .text_xs()
         .cursor_pointer()
-        .hover(move |style| style.bg(rgb(hover)))
-        .when(look == Emphasis::Lit, |b| b.text_color(rgb(t().text_strong)).font_weight(FontWeight::SEMIBOLD))
-        .when(look == Emphasis::Idle, |b| b.text_color(rgb(t().muted)))
+        .text_color(rgb(if lit { t().text_strong } else { t().muted }))
+        .when(lit, |b| b.bg(rgb(theme::mix(t().element, t().accent, 0.3))).font_weight(FontWeight::SEMIBOLD))
+        .when(look == Emphasis::Idle, |b| b.opacity(0.6))
+        .hover(move |style| style.bg(rgb(hover)).text_color(rgb(t().text_strong)))
         .child(label)
 }
 

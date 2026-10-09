@@ -39,6 +39,20 @@ pub enum MenuTarget {
     Dates,
     /// What the graph leaves out or shows, and whose commits and which days: the bar's one Filters button.
     Filters,
+    /// Which branches the graph shows.
+    Scope,
+}
+
+/// What the bar and the menu call a choice of which branches the graph shows.
+pub fn scope_name(scope: gitgui_core::Scope) -> &'static str {
+    use gitgui_core::Scope;
+    match scope {
+        Scope::All => "All branches",
+        Scope::Local => "Local branches",
+        Scope::Focus => "Branch + base",
+        Scope::Current => "Branch only",
+        Scope::Only => "One branch",
+    }
 }
 
 /// One of the graph's on/off options, as the Filters menu lists them.
@@ -71,6 +85,8 @@ pub enum Action {
     FilterAuthor(Option<String>),
     /// Limit the graph to these days (a `date:` value like `today` or `7d`), or to any time.
     FilterDate(Option<String>),
+    /// Show these branches in the graph.
+    ShowScope(gitgui_core::Scope),
     /// Switch one of the graph's options (the menu stays open to switch another).
     ToggleOption(GraphOption),
     /// From the Filters menu: pick the author in the same place.
@@ -228,6 +244,17 @@ impl Workspace {
         let copy = |text: &str, what: &'static str| Action::Copy { text: text.to_owned(), what };
 
         match target {
+            MenuTarget::Scope => {
+                use gitgui_core::Scope;
+                let now = self.repo.as_ref().map(|repo| repo.graph_filter.scope);
+                [Scope::All, Scope::Local, Scope::Focus, Scope::Current]
+                    .into_iter()
+                    .map(|scope| {
+                        let name = scope_name(scope);
+                        item(&if now == Some(scope) { format!("✓  {name}") } else { format!("    {name}") }, Action::ShowScope(scope), true)
+                    })
+                    .collect()
+            }
             MenuTarget::Filters => {
                 let Some(repo) = self.repo.as_ref() else { return Vec::new() };
                 let Phase::Ready(view) = &repo.phase else { return Vec::new() };
@@ -360,6 +387,7 @@ impl Workspace {
         match action {
             Action::FilterAuthor(value) => return self.set_search_term("author", value, cx),
             Action::FilterDate(value) => return self.set_search_term("date", value, cx),
+            Action::ShowScope(scope) => return self.set_scope(scope, cx),
             Action::ToggleOption(option) => {
                 return match option {
                     GraphOption::HideMerged => self.toggle_hide_merged(cx),
@@ -578,6 +606,7 @@ impl Workspace {
             | Action::OpenUrl(_)
             | Action::FilterAuthor(_)
             | Action::FilterDate(_)
+            | Action::ShowScope(_)
             | Action::ToggleOption(_)
             | Action::PickAuthor
             | Action::PickDate => return,
@@ -713,6 +742,7 @@ impl Workspace {
             | Action::OpenUrl(_)
             | Action::FilterAuthor(_)
             | Action::FilterDate(_)
+            | Action::ShowScope(_)
             | Action::ToggleOption(_)
             | Action::PickAuthor
             | Action::PickDate => {}

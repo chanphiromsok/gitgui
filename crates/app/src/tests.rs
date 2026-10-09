@@ -2845,6 +2845,34 @@ async fn the_graph_can_be_limited_to_an_author_and_to_days_from_the_search_box_a
 }
 
 #[gpui::test]
+async fn one_button_names_which_branches_the_graph_shows_and_its_menu_changes_it(cx: &mut TestAppContext) {
+    use crate::menu::{Action, MenuTarget};
+    use gitgui_core::Scope;
+    let fx = bare_fixture("scope-menu");
+    commit_file(&fx, "a.txt", "1\n", "base");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    let scope = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.repo.as_ref().unwrap().graph_filter.scope);
+    let labels = |cx: &mut VisualTestContext| -> Vec<String> {
+        ws.read_with(cx, |ws, _| ws.menu_items(&MenuTarget::Scope).iter().map(|i| i.label.to_string()).collect())
+    };
+
+    // All branches is what it starts as, ticked; the other three are there to pick.
+    assert_eq!(scope(cx), Scope::All);
+    assert_eq!(labels(cx), ["✓  All branches", "    Local branches", "    Branch + base", "    Branch only"]);
+
+    // The button opens the menu, and choosing closes it and changes the graph.
+    let button = center_of(cx, "scope".to_owned());
+    click(cx, MouseButton::Left, button);
+    assert!(ws.read_with(cx, |ws, _| matches!(ws.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Scope))));
+    assert!(ws.read_with(cx, |ws, _| ws.menu_items(&MenuTarget::Scope).iter().filter(|i| i.action.is_some()).all(|i| !i.stays)));
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::ShowScope(Scope::Focus), window, cx));
+    assert_eq!(scope(cx), Scope::Focus);
+    assert_eq!(labels(cx)[2], "✓  Branch + base");
+}
+
+#[gpui::test]
 async fn the_filters_button_holds_the_switches_and_its_menu_stays_open_while_they_are_switched(cx: &mut TestAppContext) {
     use crate::menu::{Action, GraphOption, MenuTarget};
     let fx = bare_fixture("filters-menu");
