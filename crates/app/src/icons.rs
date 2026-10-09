@@ -211,6 +211,17 @@ pub fn flag(color: u32) -> Arc<RenderImage> {
     .unwrap_or_else(|| Arc::new(RenderImage::new(Vec::new())))
 }
 
+/// The Refresh button: an arrow turning back on itself.
+pub fn refresh() -> Option<Arc<RenderImage>> {
+    let color = theme::t().muted;
+    cached(format!("refresh:{color:06x}"), || {
+        let c = format!("#{color:06x}");
+        Some(format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M13.3 8A5.3 5.3 0 1 1 11.6 4.1" fill="none" stroke="{c}" stroke-width="1.3" stroke-linecap="round"/><path d="M12.9 1.7V4.6H10" fill="none" stroke="{c}" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>"#
+        ))
+    })
+}
+
 /// The show/hide sidebar button: a window outline, its left panel filled in while the sidebar shows.
 pub fn sidebar(shown: bool) -> Option<Arc<RenderImage>> {
     let color = theme::t().muted;

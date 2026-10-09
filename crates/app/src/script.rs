@@ -161,10 +161,14 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
         "push" => workspace.push_current(window, cx),
         "autofetch" => workspace.set_auto_fetch(rest.parse().unwrap_or(0), cx),
         "menu" => {
-            // menu authors|dates X Y: the menu a click there on that chip would open.
+            // menu filters|authors|dates X Y: the menu a click there on that chip would open.
             let (kind, at) = rest.split_once(' ').unwrap_or((rest, "0 0"));
             if let [x, y] = numbers(at)[..] {
-                let target = if kind == "dates" { crate::menu::MenuTarget::Dates } else { crate::menu::MenuTarget::Authors };
+                let target = match kind {
+                    "dates" => crate::menu::MenuTarget::Dates,
+                    "filters" => crate::menu::MenuTarget::Filters,
+                    _ => crate::menu::MenuTarget::Authors,
+                };
                 workspace.open_menu(gpui::point(px(x), px(y)), target, cx);
             }
         }

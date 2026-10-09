@@ -78,7 +78,7 @@ impl Workspace {
                     .child(summary),
             )
             .child(
-                ghost("expand", if expanded { "Collapse  Esc" } else { "Expand  ⌘E" })
+                ghost("expand", if expanded { "Collapse  Esc".to_owned() } else { format!("Expand  {}", crate::ui::shortcut("E")) })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_expanded(cx))),
             )
             .child(ghost("close-pane", "Close").on_click(cx.listener(|this, _, _, cx| this.close_pane(cx))));

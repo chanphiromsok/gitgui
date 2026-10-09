@@ -2833,13 +2833,65 @@ async fn the_graph_can_be_limited_to_an_author_and_to_days_from_the_search_box_a
     let text = ws.read_with(cx, |ws, app| ws.search_input.read(app).text().to_owned());
     assert_eq!(text, "date:7d", "Anyone takes the author out and leaves the days");
 
-    // The chips are in the filter bar and the menus list the people and the presets.
+    // One Filters button holds them, says how many are set, and the menus list the people and the presets.
     draw(cx, &ws);
-    assert!(cx.debug_bounds("filter-author").is_some() && cx.debug_bounds("filter-date").is_some());
+    assert!(cx.debug_bounds("filters").is_some());
+    let filters: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&crate::menu::MenuTarget::Filters).iter().map(|i| i.label.to_string()).collect());
+    assert!(filters.iter().any(|l| l.contains("Author: Anyone")) && filters.iter().any(|l| l.contains("Date: Last 7 days")), "{filters:?}");
     let people: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&crate::menu::MenuTarget::Authors).iter().map(|i| i.label.to_string()).collect());
     assert!(people.iter().any(|l| l.contains("Ada Lovelace")) && people.iter().any(|l| l.contains("Bob Barker")), "{people:?}");
     let dates: Vec<String> = ws.read_with(cx, |ws, _| ws.menu_items(&crate::menu::MenuTarget::Dates).iter().map(|i| i.label.to_string()).collect());
     assert!(dates.iter().any(|l| l.starts_with('✓') && l.contains("Last 7 days")), "the chosen preset is ticked: {dates:?}");
+}
+
+#[gpui::test]
+async fn the_filters_button_holds_the_switches_and_its_menu_stays_open_while_they_are_switched(cx: &mut TestAppContext) {
+    use crate::menu::{Action, GraphOption, MenuTarget};
+    let fx = bare_fixture("filters-menu");
+    commit_file(&fx, "a.txt", "1\n", "base");
+    let (ws, cx) = cx.add_window_view(|_, cx| Workspace::with_store(Ok(Store::at(fx.data())), cx));
+    open_project(&ws, cx, &fx.repo());
+    draw(cx, &ws);
+    let items = |cx: &mut VisualTestContext| ws.read_with(cx, |ws, _| ws.menu_items(&MenuTarget::Filters));
+    let set = |cx: &mut VisualTestContext| {
+        ws.read_with(cx, |ws, _| {
+            let repo = ws.repo.as_ref().unwrap();
+            match &repo.phase {
+                Phase::Ready(view) => crate::workspace::limits_set(&repo.graph_filter, view),
+                _ => panic!("not ready"),
+            }
+        })
+    };
+
+    // Nothing is set to begin with: merged branches shown, stashes shown.
+    let labels: Vec<String> = items(cx).iter().map(|i| i.label.to_string()).collect();
+    assert!(labels[0].trim_start().starts_with("Hide merged branches") && !labels[0].starts_with('✓'), "{labels:?}");
+    assert!(labels[1].starts_with("✓  Show stashes"), "{labels:?}");
+    assert_eq!(set(cx), 0);
+    // A switch, and a step into the author's list, keep the menu open; they do not close it.
+    assert!(items(cx).iter().filter(|i| i.action.is_some()).all(|i| i.stays));
+
+    // The button opens the menu where it was pressed.
+    let button = center_of(cx, "filters".to_owned());
+    click(cx, MouseButton::Left, button);
+    assert!(ws.read_with(cx, |ws, _| matches!(ws.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Filters))));
+
+    // Switching an option changes the graph and the menu, and leaves the menu there.
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::ToggleOption(GraphOption::HideMerged), window, cx));
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::ToggleOption(GraphOption::Stashes), window, cx));
+    assert!(ws.read_with(cx, |ws, _| ws.menu.is_some()));
+    let labels: Vec<String> = items(cx).iter().map(|i| i.label.to_string()).collect();
+    assert!(labels[0].starts_with("✓  Hide merged branches"), "{labels:?}");
+    assert!(!labels[1].starts_with('✓'), "stashes are hidden now: {labels:?}");
+    assert_eq!(set(cx), 2, "the button says how many are set");
+
+    // Picking an author goes on in the same place; choosing someone sets it and counts too.
+    with_window(&ws, cx, |ws, window, cx| ws.choose(Action::PickAuthor, window, cx));
+    assert!(ws.read_with(cx, |ws, _| matches!(ws.menu.as_ref().map(|m| &m.target), Some(MenuTarget::Authors))));
+    ws.update(cx, |ws, cx| ws.set_search_term("author", Some("ada@example.com".into()), cx));
+    assert_eq!(set(cx), 3);
+    ws.update(cx, |ws, cx| ws.set_search_term("author", None, cx));
+    assert_eq!(set(cx), 2);
 }
 
 // ---- the remote: ahead and behind, Push, fetching on its own -------------------------------------------

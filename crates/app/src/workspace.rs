@@ -2601,18 +2601,9 @@ impl Workspace {
     /// The button that shows or hides the sidebar: a window with its left panel filled in while shown.
     pub(crate) fn sidebar_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let shown = self.sidebar_shown();
-        div()
-            .id("toggle-sidebar")
-            .flex_none()
-            .size(px(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_sm()
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(t().hover)))
+        ui::icon_button("toggle-sidebar", icons::sidebar(shown))
+            .tooltip(ui::tip(if shown { "Hide sidebar" } else { "Show sidebar" }, Some(ui::shortcut("B"))))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-            .child(ui::file_icon(icons::sidebar(shown)))
     }
 
     /// A thin draggable line between two panes.
@@ -2985,13 +2976,19 @@ impl Workspace {
                         view.timing.clone()
                     }),
             )
+            // The sync group is the one filled thing here; the rest is quiet until the pointer is over it.
             .child(
-                button("new-branch", "New branch…")
+                ui::ghost("new-branch", "New branch…")
                     .debug_selector(|| "new-branch".to_owned())
                     .on_click(cx.listener(|this, _, window, cx| this.open_new_branch(window, cx))),
             )
             .children((!view.remotes.is_empty()).then(|| self.render_sync_buttons(view.upstream(), cx)))
-            .child(button("refresh", "Refresh").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
+            .child(
+                ui::icon_button("refresh", icons::refresh())
+                    .debug_selector(|| "refresh".to_owned())
+                    .tooltip(ui::tip("Refresh", Some(ui::shortcut("R"))))
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+            );
 
         div()
             .relative()
@@ -3028,55 +3025,12 @@ impl Workspace {
             .child(segment("scope-local", "Local", Scope::Local))
             .child(segment("scope-all", "All", Scope::All));
 
-        let merged = view.clues.len();
-        let hide = filter.hide_merged;
-        let hide_merged = bar_checkbox(
-            "hide-merged",
-            hide,
-            match (view.scanning, narrow) {
-                (true, true) => "Merged…".to_owned(),
-                (true, false) => "Hide merged (checking…)".to_owned(),
-                (false, true) => format!("Merged ({merged})"),
-                (false, false) => format!("Hide merged ({merged})"),
-            },
-            cx.listener(|this, _, _, cx| this.toggle_hide_merged(cx)),
-        );
-        let stashes = bar_checkbox(
-            "show-stashes",
-            !filter.hide_stashes,
-            if narrow { format!("Stash ({})", view.stashes) } else { format!("Stashes ({})", view.stashes) },
-            cx.listener(|this, _, _, cx| this.toggle_stashes(cx)),
-        );
-
-        // The author and the days the graph is limited to, as chips that open a menu to change them.
-        let author_term = gitgui_core::term(&filter.search, "author");
-        let date_term = gitgui_core::term(&filter.search, "date")
-            .or_else(|| gitgui_core::term(&filter.search, "since").map(|d| format!("from {d}")))
-            .or_else(|| gitgui_core::term(&filter.search, "until").map(|d| format!("until {d}")));
-        let author_label = match &author_term {
-            Some(asked) => {
-                // An email or a name that belongs to someone in the history is shown as their name.
-                let name = view.people.of(asked).map(|person| person.name.clone());
-                format!("Author: {} ▾", name.unwrap_or_else(|| asked.clone()))
-            }
-            None => "Author ▾".to_owned(),
-        };
-        let date_label = match date_term.as_deref() {
-            Some("today") => "Date: Today ▾".to_owned(),
-            Some("yesterday") => "Date: Yesterday ▾".to_owned(),
-            Some("7d") => "Date: Last 7 days ▾".to_owned(),
-            Some("30d") => "Date: Last 30 days ▾".to_owned(),
-            Some("month") => "Date: This month ▾".to_owned(),
-            Some(other) => format!("Date: {other} ▾"),
-            None => "Date ▾".to_owned(),
-        };
-        let chip = |id: &'static str, label: String, active: bool, target: crate::menu::MenuTarget| {
-            ui::toggle(id, label, active)
-                .debug_selector(move || id.to_owned())
-                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| this.open_menu(event.position(), target.clone(), cx)))
-        };
-        let author_chip = chip("filter-author", author_label, author_term.is_some(), crate::menu::MenuTarget::Authors);
-        let date_chip = chip("filter-date", date_label, date_term.is_some(), crate::menu::MenuTarget::Dates);
+        // What the graph leaves out, and whose commits and which days it is limited to, behind one button. It says how
+        // many of those are set, so a filtered graph is never a surprise.
+        let set = limits_set(filter, view);
+        let filters = ui::toggle("filters", if set > 0 { format!("Filters · {set} ▾") } else { "Filters ▾".to_owned() }, set > 0)
+            .debug_selector(|| "filters".to_owned())
+            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| this.open_menu(event.position(), crate::menu::MenuTarget::Filters, cx)));
 
         let query = filter.query();
         let asks_git = matches!(query, Query::Path(_) | Query::Code(_));
@@ -3117,18 +3071,7 @@ impl Workspace {
                     .debug_selector(|| "isolated".to_owned())
                     .on_click(cx.listener(|this, _, _, cx| this.clear_isolate(cx)))
             }))
-            .child(hide_merged)
-            .child(stashes)
-            .children((view.sync_count > 0).then(|| {
-                bar_checkbox(
-                    "show-sync",
-                    filter.show_sync,
-                    if narrow { format!("Sync ({})", view.sync_count) } else { format!("Sync merges ({})", view.sync_count) },
-                    cx.listener(|this, _, _, cx| this.toggle_sync_merges(cx)),
-                )
-            }))
-            .child(author_chip)
-            .child(date_chip)
+            .child(filters)
             .child(search)
             .children(status.map(|text| div().flex_none().text_xs().text_color(rgb(t().muted)).child(text)))
             .child(
@@ -3402,41 +3345,6 @@ impl Workspace {
     }
 }
 
-/// A small checkbox and its label, for the filter bar.
-fn bar_checkbox(
-    id: &'static str,
-    on: bool,
-    label: String,
-    toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap_1()
-        .text_xs()
-        .cursor_pointer()
-        .text_color(rgb(if on { t().text } else { t().muted }))
-        .hover(|style| style.text_color(rgb(t().text_strong)))
-        .on_click(toggle)
-        .child(
-            div()
-                .size(px(13.))
-                .rounded_sm()
-                .border_1()
-                .border_color(rgb(if on { t().accent } else { t().muted }))
-                .when(on, |b| b.bg(rgb(t().accent)))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(t().on_accent))
-                .text_size(px(10.))
-                .when(on, |b| b.child("✓")),
-        )
-        .child(label)
-}
-
 fn layout_of(saved: FileLayout) -> Layout {
     match saved {
         FileLayout::Tree => Layout::Tree,
@@ -3463,6 +3371,31 @@ fn diff_mode_of(mode: Mode) -> DiffMode {
         Mode::Unified => DiffMode::Unified,
         Mode::Split => DiffMode::Split,
     }
+}
+
+/// The author and the days the graph is limited to, in words (`None` for anyone, any time): the author as the person's
+/// name when the history knows them, the days as the menu names them.
+pub(crate) fn limits(filter: &GraphFilter, view: &RepoView) -> (Option<String>, Option<String>) {
+    let author = gitgui_core::term(&filter.search, "author").map(|asked| view.people.of(&asked).map(|person| person.name.clone()).unwrap_or(asked));
+    let days = gitgui_core::term(&filter.search, "date")
+        .or_else(|| gitgui_core::term(&filter.search, "since").map(|d| format!("from {d}")))
+        .or_else(|| gitgui_core::term(&filter.search, "until").map(|d| format!("until {d}")))
+        .map(|days| match days.as_str() {
+            "today" => "Today".to_owned(),
+            "yesterday" => "Yesterday".to_owned(),
+            "7d" => "Last 7 days".to_owned(),
+            "30d" => "Last 30 days".to_owned(),
+            "month" => "This month".to_owned(),
+            _ => days,
+        });
+    (author, days)
+}
+
+/// How many of the Filters menu's choices are not what the graph starts with: merged branches hidden, stashes hidden,
+/// sync merges shown, an author, days.
+pub(crate) fn limits_set(filter: &GraphFilter, view: &RepoView) -> usize {
+    let (author, days) = limits(filter, view);
+    [filter.hide_merged, filter.hide_stashes, filter.show_sync, author.is_some(), days.is_some()].into_iter().filter(|on| *on).count()
 }
 
 /// How a button of the Fetch, Pull and Push group looks.

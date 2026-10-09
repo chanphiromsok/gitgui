@@ -37,6 +37,16 @@ pub enum MenuTarget {
     Authors,
     /// The days to limit the graph to.
     Dates,
+    /// What the graph leaves out or shows, and whose commits and which days: the bar's one Filters button.
+    Filters,
+}
+
+/// One of the graph's on/off options, as the Filters menu lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphOption {
+    HideMerged,
+    Stashes,
+    SyncMerges,
 }
 
 /// Something a menu item does.
@@ -61,6 +71,12 @@ pub enum Action {
     FilterAuthor(Option<String>),
     /// Limit the graph to these days (a `date:` value like `today` or `7d`), or to any time.
     FilterDate(Option<String>),
+    /// Switch one of the graph's options (the menu stays open to switch another).
+    ToggleOption(GraphOption),
+    /// From the Filters menu: pick the author in the same place.
+    PickAuthor,
+    /// From the Filters menu: pick the days in the same place.
+    PickDate,
     /// Clone a repository by address (typed in the dialog) into the dialog's folder.
     Clone,
     Copy { text: String, what: &'static str },
@@ -96,6 +112,8 @@ pub struct MenuItem {
     /// `None` makes this a separator.
     pub action: Option<Action>,
     pub enabled: bool,
+    /// The menu stays open after this one is chosen (a switch, or a step into another list), instead of closing.
+    pub stays: bool,
 }
 
 /// A question the user answers before something that cannot be undone with one click.
@@ -205,11 +223,31 @@ impl Workspace {
 
     pub fn menu_items(&self, target: &MenuTarget) -> Vec<MenuItem> {
         let current = self.current_branch_name();
-        let item = |label: &str, action: Action, enabled: bool| MenuItem { label: label.to_owned().into(), action: Some(action), enabled };
-        let separator = || MenuItem { label: SharedString::default(), action: None, enabled: false };
+        let item = |label: &str, action: Action, enabled: bool| MenuItem { label: label.to_owned().into(), action: Some(action), enabled, stays: false };
+        let separator = || MenuItem { label: SharedString::default(), action: None, enabled: false, stays: false };
         let copy = |text: &str, what: &'static str| Action::Copy { text: text.to_owned(), what };
 
         match target {
+            MenuTarget::Filters => {
+                let Some(repo) = self.repo.as_ref() else { return Vec::new() };
+                let Phase::Ready(view) = &repo.phase else { return Vec::new() };
+                let filter = &repo.graph_filter;
+                let tick = |on: bool, label: String| if on { format!("✓  {label}") } else { format!("    {label}") };
+                let stays = |label: String, action: Action| MenuItem { label: label.into(), action: Some(action), enabled: true, stays: true };
+                let merged = if view.scanning { "Hide merged branches (checking…)".to_owned() } else { format!("Hide merged branches ({})", view.clues.len()) };
+                let mut out = vec![
+                    stays(tick(filter.hide_merged, merged), Action::ToggleOption(GraphOption::HideMerged)),
+                    stays(tick(!filter.hide_stashes, format!("Show stashes ({})", view.stashes)), Action::ToggleOption(GraphOption::Stashes)),
+                ];
+                if view.sync_count > 0 || filter.show_sync {
+                    out.push(stays(tick(filter.show_sync, format!("Show sync merges ({})", view.sync_count)), Action::ToggleOption(GraphOption::SyncMerges)));
+                }
+                out.push(separator());
+                let (author, days) = crate::workspace::limits(filter, view);
+                out.push(stays(format!("    Author: {}  ›", author.unwrap_or_else(|| "Anyone".to_owned())), Action::PickAuthor));
+                out.push(stays(format!("    Date: {}  ›", days.unwrap_or_else(|| "Any time".to_owned())), Action::PickDate));
+                out
+            }
             MenuTarget::Authors => {
                 let (search, people, commits) = match self.repo.as_ref().map(|repo| (&repo.graph_filter.search, &repo.phase)) {
                     Some((search, Phase::Ready(view))) => (search.clone(), Some(view.people.clone()), Some(view.commits.clone())),
@@ -322,6 +360,21 @@ impl Workspace {
         match action {
             Action::FilterAuthor(value) => return self.set_search_term("author", value, cx),
             Action::FilterDate(value) => return self.set_search_term("date", value, cx),
+            Action::ToggleOption(option) => {
+                return match option {
+                    GraphOption::HideMerged => self.toggle_hide_merged(cx),
+                    GraphOption::Stashes => self.toggle_stashes(cx),
+                    GraphOption::SyncMerges => self.toggle_sync_merges(cx),
+                };
+            }
+            // The Filters menu goes on in the same place as the list it stepped into.
+            Action::PickAuthor | Action::PickDate => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.target = if action == Action::PickAuthor { MenuTarget::Authors } else { MenuTarget::Dates };
+                    cx.notify();
+                }
+                return;
+            }
             _ => {}
         }
         if self.busy.is_some() {
@@ -519,7 +572,15 @@ impl Workspace {
                 true,
                 None,
             ),
-            Action::Checkout(_) | Action::Clone | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => return,
+            Action::Checkout(_)
+            | Action::Clone
+            | Action::Copy { .. }
+            | Action::OpenUrl(_)
+            | Action::FilterAuthor(_)
+            | Action::FilterDate(_)
+            | Action::ToggleOption(_)
+            | Action::PickAuthor
+            | Action::PickDate => return,
         };
         if let Some(initial) = &prompt {
             let initial = initial.clone();
@@ -647,7 +708,14 @@ impl Workspace {
             ),
             Action::StartOver(path) => self.restart_conflict(path, cx),
             Action::DeleteConflicted(path) => self.delete_conflicted(path, cx),
-            Action::Checkout(_) | Action::Copy { .. } | Action::OpenUrl(_) | Action::FilterAuthor(_) | Action::FilterDate(_) => {}
+            Action::Checkout(_)
+            | Action::Copy { .. }
+            | Action::OpenUrl(_)
+            | Action::FilterAuthor(_)
+            | Action::FilterDate(_)
+            | Action::ToggleOption(_)
+            | Action::PickAuthor
+            | Action::PickDate => {}
             Action::Clone => {
                 let folder = dialog.folder.unwrap_or_else(|| self.clone_folder());
                 self.clone_repo(typed, folder, cx);
@@ -889,6 +957,7 @@ impl Workspace {
                 None => div().h(px(SEPARATOR_HEIGHT)).flex().items_center().child(div().w_full().h(px(1.)).bg(rgb(t().border))).into_any_element(),
                 Some(action) => {
                     let enabled = item.enabled;
+                    let stays = item.stays;
                     div()
                         .id(("menu-item", i))
                         .h(px(ITEM_HEIGHT))
@@ -901,7 +970,9 @@ impl Workspace {
                             row.cursor_pointer()
                                 .hover(|style| style.bg(rgb(t().selected)).text_color(rgb(t().text_strong)))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_menu(cx);
+                                    if !stays {
+                                        this.close_menu(cx);
+                                    }
                                     this.choose(action.clone(), window, cx);
                                 }))
                         })

@@ -2,8 +2,8 @@
 
 use gitgui_core::CommitKind;
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ElementId, FontWeight, PathBuilder, Pixels, Point, Rgba, SharedString, Stateful, Window, canvas, div, point,
-    prelude::*, px, quad, rgb, size,
+    AnyElement, AnyView, App, BorderStyle, Bounds, Context, ElementId, FontWeight, PathBuilder, Pixels, Point, Render, Rgba, SharedString, Stateful, Window,
+    canvas, div, point, prelude::*, px, quad, rgb, size,
 };
 use crate::theme::t;
 
@@ -140,6 +140,63 @@ pub fn tidy_parent(path: &std::path::Path, home: Option<&std::path::Path>) -> St
         Some(rest) => format!("~/{}", rest.display()),
         None => parent.display().to_string(),
     }
+}
+
+/// A key combination as this system writes it: ⌘B on a Mac, Ctrl+B elsewhere (the bindings use `secondary`, which is
+/// Command on a Mac and Control on the others).
+pub fn shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") { format!("⌘{key}") } else { format!("Ctrl+{key}") }
+}
+
+/// What shows when the pointer rests on a control with no words of its own: its name, and the keys that do the same.
+struct Tip {
+    name: SharedString,
+    keys: Option<SharedString>,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .bg(rgb(t().card))
+            .border_1()
+            .border_color(rgb(t().border))
+            .shadow_md()
+            .text_xs()
+            .text_color(rgb(t().text_strong))
+            .child(self.name.clone())
+            .children(self.keys.clone().map(|keys| div().text_color(rgb(t().muted)).child(keys)))
+    }
+}
+
+/// A tooltip for `.tooltip(...)`: `name`, and the `keys` that do the same when there are some.
+pub fn tip(name: impl Into<SharedString>, keys: Option<String>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    let name = name.into();
+    let keys = keys.map(SharedString::from);
+    move |_, cx| {
+        let (name, keys) = (name.clone(), keys.clone());
+        cx.new(|_| Tip { name, keys }).into()
+    }
+}
+
+/// A square button that is only a picture (so it has a tooltip to say what it does); the caller adds the click.
+pub fn icon_button(id: impl Into<ElementId>, icon: Option<std::sync::Arc<gpui::RenderImage>>) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(t().element_hover)))
+        .child(file_icon(icon))
 }
 
 /// A quiet button for the toolbars: no fill until the pointer is over it, so a row of them does not shout.
