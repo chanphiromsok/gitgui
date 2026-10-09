@@ -13,7 +13,6 @@
 //! mode split|unified      layout tree|flat      expand      back      more
 //! search <text>   fill the search box (author:… date:… words)      menu authors|dates X Y   open that chip's menu
 //! scope focus|current|local|all   which branches the graph shows      lanes   fold or unfold the lanes past the sixth      sync   show or hide sync merges      isolate <branch>   pick that branch out of the graph (clear   put it back)      pointer <row>   as if the pointer were on that graph row      legend   the key to the marks
-//! tab graph|pulls|issues   the middle of the window      ghfilter open|mine|review|closed      ghselect <number>   open that pull request or issue
 //! review below|beside    where the file pane goes      theme <name>   e.g. theme One Light      style <id>   graph style, e.g. style neon
 //! sidebar | graph | files   hide or show that panel      peek sidebar|graph|files   as if the pointer were at its edge;
 //! nopeek   as if it had left
@@ -125,25 +124,6 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
             cx,
         ),
         "lanes" => workspace.toggle_all_lanes(cx),
-        "tab" => workspace.github_set_tab(
-            match rest {
-                "pulls" => crate::github_ui::MainTab::Pulls,
-                "issues" => crate::github_ui::MainTab::Issues,
-                _ => crate::github_ui::MainTab::Graph,
-            },
-            cx,
-        ),
-        "ghfilter" => workspace.github_set_filter(
-            match rest {
-                "mine" => crate::github_ui::ListFilter::Mine,
-                "review" => crate::github_ui::ListFilter::Review,
-                "closed" => crate::github_ui::ListFilter::Closed,
-                _ => crate::github_ui::ListFilter::Open,
-            },
-            cx,
-        ),
-        "ghselect" => workspace.github_select(rest.parse().ok(), cx),
-        "ghwidth" => workspace.github_set_detail_width(rest.parse().unwrap_or(crate::github_ui::DETAIL_WIDTH), cx),
         "sync" => workspace.toggle_sync_merges(cx),
         "isolate" => workspace.isolate_branch(rest, false, cx),
         "clear" => workspace.clear_isolate(cx),
@@ -259,7 +239,6 @@ fn step(workspace: &mut Workspace, window: &mut gpui::Window, word: &str, rest: 
                 "workflow" => SettingsPage::Workflow,
                 "appearance" => SettingsPage::Appearance,
                 "projects" => SettingsPage::Projects,
-                "github" => SettingsPage::GitHub,
                 _ => SettingsPage::Graph,
             };
             workspace.set_settings_page(page, cx);

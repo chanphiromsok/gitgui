@@ -617,8 +617,6 @@ pub enum Splitter {
     Files,
     /// Between the graph and the file pane below it.
     PaneHeight,
-    /// Between a list of pull requests or issues and the panel that shows one.
-    GithubDetail,
 }
 
 /// A panel that can be hidden and still reached: pointing at its edge slides it back over the content.
@@ -703,8 +701,6 @@ pub struct Workspace {
     pub busy: Option<SharedString>,
     /// The key to the graph's marks is open.
     pub legend_open: bool,
-    /// The signed-in GitHub account, and the pull requests and issues read with it.
-    pub github: crate::github_ui::GithubState,
     /// The branch line the pointer is on in the graph.
     pub graph_hover: Option<usize>,
     /// The commit that is a copy of the one the pointer is on, to light.
@@ -1009,7 +1005,6 @@ impl Workspace {
             dialog: None,
             busy: None,
             legend_open: false,
-            github: crate::github_ui::GithubState::new(),
             graph_hover: None,
             twin_hover: None,
             opening: 0,
@@ -1091,12 +1086,6 @@ impl Workspace {
             }
             Splitter::Files => {
                 self.files_width = (x - self.files_left.get()).clamp(FILES_MIN, FILES_MAX);
-            }
-            Splitter::GithubDetail => {
-                // The panel runs from the pointer to the right edge of the lists; the list keeps room to be read.
-                let (left, right) = self.github.edges.get();
-                let most = (right - left - crate::github_ui::LIST_MIN).clamp(crate::github_ui::DETAIL_MIN, crate::github_ui::DETAIL_MAX);
-                self.github.detail_width = (right - x).clamp(crate::github_ui::DETAIL_MIN, most);
             }
             Splitter::PaneHeight => {
                 // The pane runs from the pointer down to the bottom of the area (above the banner, if showing).
@@ -1393,7 +1382,6 @@ impl Workspace {
                         if std::mem::take(&mut this.open_next_conflict) {
                             this.open_first_conflict(cx);
                         }
-                        this.github_after_read(cx);
                     }
                     Err(err) => repo.phase = Phase::Failed(err.into()),
                 }
@@ -2652,7 +2640,6 @@ impl Workspace {
         }
         div()
             .id(id)
-            .debug_selector(move || id.to_owned())
             .w(px(5.))
             .h_full()
             .flex_none()
@@ -2768,10 +2755,6 @@ impl Workspace {
             // The open project's changes sit under its name.
             if selected && let Some(changes) = self.render_changes(cx) {
                 rows.push(changes);
-            }
-            // And, for a project on GitHub, its pull requests and issues.
-            if selected && let Some(github) = self.render_github_sidebar(cx) {
-                rows.push(github);
             }
         }
 
@@ -3020,16 +3003,9 @@ impl Workspace {
             .flex()
             .flex_col()
             .child(header)
-            .children(self.render_main_tabs(cx))
-            .when(self.github.tab == crate::github_ui::MainTab::Graph || self.github_repo().is_none(), |center| {
-                center
-                    .child(self.render_filter_bar(repo, view, area < 640., cx))
-                    .children(self.render_rebased_bar(view, cx))
-                    .child(self.render_graph(area, cx))
-            })
-            .when(self.github.tab != crate::github_ui::MainTab::Graph && self.github_repo().is_some(), |center| {
-                center.child(self.render_github_main(cx))
-            })
+            .child(self.render_filter_bar(repo, view, area < 640., cx))
+            .children(self.render_rebased_bar(view, cx))
+            .child(self.render_graph(area, cx))
             .when(self.legend_open, |center| center.child(self.render_legend(cx)))
             .into_any_element()
     }
