@@ -423,7 +423,7 @@ impl Workspace {
                                 .flex_1()
                                 .text_xs()
                                 .text_color(rgb(if length > 72 { t().warning } else { t().muted }))
-                                .child(if length > 72 { format!("{length}/72 · keep the summary short") } else { format!("{length}/72") }),
+                                .child(if length > 72 { format!("{length}/72 · keep the summary short") } else { format!("{length}/72 · Enter commits") }),
                         )
                         .child(
                             button("commit", label)

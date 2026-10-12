@@ -917,7 +917,7 @@ impl Workspace {
         })
         .detach();
 
-        let commit_input = cx.new(|cx| TextInput::new("Commit message (Enter to commit)", cx));
+        let commit_input = cx.new(|cx| TextInput::new("Commit message", cx));
         cx.subscribe(&commit_input, |this, _input, event: &TextInputEvent, cx| match event {
             TextInputEvent::Submit => this.commit_work(cx),
             TextInputEvent::Changed => cx.notify(),
