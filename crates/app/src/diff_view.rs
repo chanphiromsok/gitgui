@@ -262,7 +262,23 @@ impl Workspace {
             .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
             .child(div().debug_selector(|| "diff-list".to_owned()).size_full().child(rows))
             .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| this.scroll_diff_sideways(event, cx)));
-        div().size_full().relative().child(scrolling).child(self.minimap(file, cx)).into_any_element()
+        // A line longer than the pane is cut off: a thin bar along the bottom says there is more, and how far along
+        // the code is. Nothing shows when every line fits.
+        let most = max_scroll_x(file, mode);
+        let bar = (most > 0.).then(|| {
+            let track = (f32::from(file.diff_bounds.get().size.width) - MINIMAP_W).max(40.);
+            let share = (track / (track + most)).clamp(0.08, 1.);
+            let thumb = track * share;
+            let left = (file.scroll_x.get().clamp(0., most) / most) * (track - thumb);
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .w(px(track))
+                .h(px(5.))
+                .child(div().absolute().left(px(left)).w(px(thumb)).h_full().rounded_full().bg(rgb(t().muted)).opacity(0.55))
+        });
+        div().size_full().relative().child(scrolling).children(bar).child(self.minimap(file, cx)).into_any_element()
     }
 
     /// A wheel or trackpad event over the code: sideways when it is mostly sideways (or shift is held).
