@@ -376,6 +376,8 @@ impl GraphFilter {
 
 pub struct CommitView {
     pub detail: CommitDetail,
+    /// The files a merge settled by hand (empty for a clean merge and for any other commit).
+    pub resolved: Vec<String>,
     pub files: Vec<FileChange>,
     pub additions: u32,
     pub deletions: u32,
@@ -874,7 +876,9 @@ fn read_commit(path: &Path, id: &str, wanted: impl Fn() -> bool) -> Option<Resul
     };
     let additions = files.iter().filter_map(|f| f.additions).sum();
     let deletions = files.iter().filter_map(|f| f.deletions).sum();
-    Some(Ok(CommitView { detail, files, additions, deletions }))
+    // Nice to know, not worth failing the read over.
+    let resolved = if detail.parents.len() > 1 { git.merge_resolved(id).unwrap_or_default() } else { Vec::new() };
+    Some(Ok(CommitView { detail, resolved, files, additions, deletions }))
 }
 
 impl Workspace {

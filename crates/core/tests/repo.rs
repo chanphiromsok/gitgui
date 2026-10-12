@@ -1728,3 +1728,29 @@ fn usages_in_the_working_folder_include_new_files_but_not_ignored_ones_and_a_flo
     assert_eq!(found.matches, gitgui_core::MAX_MATCHES);
     assert!(found.truncated);
 }
+
+#[test]
+fn a_merge_that_settled_a_conflict_by_hand_names_the_file_and_a_clean_one_names_none() {
+    // A conflict on line 5, settled with a line neither side wrote.
+    let repo = conflicting();
+    let _ = Command::new("git").arg("-C").arg(repo.path()).args(["merge", "other"]).output().unwrap();
+    edit_line(&repo, 5, "FIVE settled by hand");
+    repo.git(&["add", "app.txt"]);
+    repo.git(&["commit", "-q", "-m", "merge other"]);
+    let git = GitCli::new(repo.path());
+    assert_eq!(git.merge_resolved("HEAD").unwrap(), vec!["app.txt".to_owned()]);
+    // Not a merge: nothing to say.
+    assert!(git.merge_resolved("HEAD~1").unwrap().is_empty());
+    assert!(git.merge_resolved("not a rev; rm").is_err());
+
+    // Two sides that changed different places: a clean merge, no hand in it.
+    let clean = trunk();
+    clean.git(&["checkout", "-q", "-b", "side"]);
+    edit_line(&clean, 3, "THREE on side");
+    clean.git(&["commit", "-q", "-am", "feat: three"]);
+    clean.git(&["checkout", "-q", "main"]);
+    edit_line(&clean, 15, "FIFTEEN on main");
+    clean.git(&["commit", "-q", "-am", "feat: fifteen"]);
+    clean.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
+    assert!(GitCli::new(clean.path()).merge_resolved("HEAD").unwrap().is_empty());
+}

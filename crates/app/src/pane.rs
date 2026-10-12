@@ -104,7 +104,7 @@ impl Workspace {
                     self.render_work_overview(cx)
                 } else {
                     match self.commit_view() {
-                        Some(view) => self.render_info(&view.detail, cx),
+                        Some(view) => self.render_info(&view.detail, &view.resolved.clone(), cx),
                         None => div().into_any_element(),
                     }
                 };

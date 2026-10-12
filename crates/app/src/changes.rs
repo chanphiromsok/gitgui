@@ -47,6 +47,7 @@ fn letter(file: &WorkFile) -> (&'static str, u32) {
 /// The working tree as a commit for the file pane: its files are the changes, staged first.
 fn work_view(files: &[WorkFile]) -> CommitView {
     CommitView {
+        resolved: Vec::new(),
         detail: CommitDetail {
             id: WORKTREE.to_owned(),
             parents: Vec::new(),

@@ -80,6 +80,24 @@ pub struct GitCli {
 }
 
 impl GitCli {
+    /// The files of a merge commit whose result is neither parent's version in some place: where the merge had a
+    /// conflict somebody settled by hand (or edited the result). A clean merge, and any commit that is not a merge,
+    /// has none. Git's combined diff leaves out a hunk that came whole from one parent, so two sides that changed
+    /// different places of a file do not make it show.
+    pub fn merge_resolved(&self, id: &str) -> Result<Vec<String>, Error> {
+        check_rev(id)?;
+        let second = format!("{id}^2");
+        let is_merge = self.command(&["rev-parse", "--verify", "--quiet", &second]).output().map_err(Error::Spawn)?.status.success();
+        if !is_merge {
+            return Ok(Vec::new());
+        }
+        // The patch, not the names: the names are every file that differs from both parents, a clean merge of two
+        // changes to one file among them. In the patch git drops a file with no hunk of the kind.
+        let out = self.run(&["diff-tree", "--cc", "--no-commit-id", "-r", "-p", "-U0", "--no-ext-diff", "--no-color", id])?;
+        let text = String::from_utf8_lossy(&out);
+        Ok(text.lines().filter_map(|line| line.strip_prefix("diff --cc ")).map(|name| name.trim_matches('"').to_owned()).collect())
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into(), low_priority: false }
     }

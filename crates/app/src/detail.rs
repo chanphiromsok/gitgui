@@ -103,7 +103,7 @@ impl Workspace {
     }
 
     /// The commit overview: ids, people, date and the full message.
-    pub fn render_info(&self, detail: &CommitDetail, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_info(&self, detail: &CommitDetail, resolved: &[String], cx: &mut Context<Self>) -> AnyElement {
         let field = |label: &'static str, value: AnyElement| {
             div()
                 .flex()
@@ -133,6 +133,30 @@ impl Workspace {
             })
             .collect();
 
+        // A merge that had a conflict somebody settled: which files, one click from each.
+        let settled: Vec<AnyElement> = resolved
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let target = path.clone();
+                div()
+                    .id(("settled", i))
+                    .font_family(MONO)
+                    .text_xs()
+                    .text_color(rgb(t().link))
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let index = this.commit_view().and_then(|view| view.files.iter().position(|f| f.path == target));
+                        if let Some(index) = index {
+                            this.open_file(index, cx);
+                        }
+                    }))
+                    .child(SharedString::from(path.clone()))
+                    .into_any_element()
+            })
+            .collect();
+
         div()
             .id("commit-info")
             .size_full()
@@ -145,6 +169,21 @@ impl Workspace {
             .child(field("Commit:", text(detail.id.clone())))
             .when(!detail.parents.is_empty(), |panel| {
                 panel.child(field("Parents:", div().flex().flex_col().children(parents).into_any_element()))
+            })
+            .when(!settled.is_empty(), |panel| {
+                panel.child(field(
+                    "Conflicts:",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(div().text_xs().text_color(rgb(t().warning)).child(if settled.len() == 1 {
+                            "Settled by hand in 1 file".to_owned()
+                        } else {
+                            format!("Settled by hand in {} files", settled.len())
+                        }))
+                        .children(settled)
+                        .into_any_element(),
+                ))
             })
             .child(field(
                 "Author:",
