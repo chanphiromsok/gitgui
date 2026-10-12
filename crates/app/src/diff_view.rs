@@ -267,18 +267,37 @@ impl Workspace {
         let most = max_scroll_x(file, mode);
         let bar = (most > 0.).then(|| {
             let track = (f32::from(file.diff_bounds.get().size.width) - MINIMAP_W).max(40.);
-            let share = (track / (track + most)).clamp(0.08, 1.);
-            let thumb = track * share;
-            let left = (file.scroll_x.get().clamp(0., most) / most) * (track - thumb);
+            let (thumb, left) = bar_thumb(track, most, file.scroll_x.get());
+            // A taller strip to grab than the bar drawn in it: click or drag to go there.
             div()
+                .id("diff-x-bar")
                 .absolute()
                 .bottom_0()
                 .left_0()
                 .w(px(track))
-                .h(px(5.))
-                .child(div().absolute().left(px(left)).w(px(thumb)).h_full().rounded_full().bg(rgb(t().muted)).opacity(0.55))
+                .h(px(12.))
+                .cursor_pointer()
+                .child(div().absolute().bottom_0().left(px(left)).w(px(thumb)).h(px(5.)).rounded_full().bg(rgb(t().muted)).opacity(0.55))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| this.scroll_bar_jump(event.position.x, cx)))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if event.dragging() {
+                        this.scroll_bar_jump(event.position.x, cx);
+                    }
+                }))
         });
         div().size_full().relative().child(scrolling).children(bar).child(self.minimap(file, cx)).into_any_element()
+    }
+
+    /// Scrolls the code sideways so the bar's thumb is centered on window position `x`.
+    fn scroll_bar_jump(&mut self, x: gpui::Pixels, cx: &mut Context<Self>) {
+        let mode = self.repo.as_ref().map_or(Mode::Unified, |repo| repo.mode);
+        let Some(file) = self.repo.as_ref().and_then(|repo| repo.file.as_ref()) else { return };
+        let mode = file.mode(mode);
+        let most = max_scroll_x(file, mode);
+        let bounds = file.diff_bounds.get();
+        let track = (f32::from(bounds.size.width) - MINIMAP_W).max(40.);
+        file.scroll_x.set(bar_scroll_at(track, most, f32::from(x - bounds.origin.x)));
+        cx.notify();
     }
 
     /// A wheel or trackpad event over the code: sideways when it is mostly sideways (or shift is held).
@@ -488,6 +507,19 @@ impl Workspace {
             )
             .into_any_element()
     }
+}
+
+/// The sideways bar's thumb for a `track` this wide when the code can move `most` pixels and has moved `scrolled`:
+/// how wide it is and where it starts.
+fn bar_thumb(track: f32, most: f32, scrolled: f32) -> (f32, f32) {
+    let thumb = track * (track / (track + most)).clamp(0.08, 1.);
+    (thumb, (scrolled.clamp(0., most) / most.max(1.)) * (track - thumb))
+}
+
+/// How far to scroll sideways so the thumb is centered `x` pixels along the track.
+fn bar_scroll_at(track: f32, most: f32, x: f32) -> f32 {
+    let (thumb, _) = bar_thumb(track, most, 0.);
+    ((x - thumb / 2.) / (track - thumb).max(1.)).clamp(0., 1.) * most
 }
 
 /// How far the code can be scrolled sideways: what the longest line needs, less the room there is for code
@@ -1240,5 +1272,28 @@ mod tests {
         assert_eq!(code_offset("\tab", 4), 1);
         // Letters outside ASCII are several bytes long.
         assert_eq!(code_offset("é!", 2), 2);
+    }
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::{bar_scroll_at, bar_thumb};
+
+    #[test]
+    fn the_sideways_bar_and_a_click_on_it_agree() {
+        let (track, most) = (800., 1200.);
+        let (thumb, left) = bar_thumb(track, most, 0.);
+        assert_eq!(left, 0.);
+        assert!((thumb - 320.).abs() < 0.01, "{thumb}");
+        // Scrolled all the way: the thumb ends at the end of the track.
+        let (thumb, left) = bar_thumb(track, most, most);
+        assert!((left + thumb - track).abs() < 0.01);
+        // A click in the middle of the track goes about half way; at the ends, to the ends.
+        assert!((bar_scroll_at(track, most, 400.) - 600.).abs() < 1.);
+        assert_eq!(bar_scroll_at(track, most, 0.), 0.);
+        assert_eq!(bar_scroll_at(track, most, 5000.), most);
+        // Clicking where the thumb is centered leaves the code where it is.
+        let (thumb, left) = bar_thumb(track, most, 300.);
+        assert!((bar_scroll_at(track, most, left + thumb / 2.) - 300.).abs() < 1.);
     }
 }
