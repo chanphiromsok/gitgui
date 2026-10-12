@@ -2730,6 +2730,8 @@ impl Workspace {
                 .when(selected, |row| row.bg(rgb(t().selected)))
                 .hover(|style| style.bg(rgb(if selected { t().selected } else { t().hover })))
                 .on_click(cx.listener(move |this, _, _, cx| this.select_project(open_path.clone(), cx)))
+                // The line under the name is cut short in a narrow sidebar: resting on the row says where it is.
+                .tooltip(ui::tip(project.path.display().to_string(), None))
                 .child(tile)
                 .child(
                     div()
@@ -3232,11 +3234,11 @@ impl Workspace {
     fn render_sync_buttons(&self, upstream: Option<&Upstream>, cx: &mut Context<Self>) -> AnyElement {
         let (pull, push) = sync_emphasis(upstream);
         // A fetch the app started on its own is running: quietly greyed, not a banner.
-        let fetch = sync_button("fetch", "Fetch", if self.auto_fetching { Emphasis::Idle } else { Emphasis::Plain })
+        let fetch = sync_button("fetch", "fetch", "Fetch", if self.auto_fetching { Emphasis::Idle } else { Emphasis::Plain })
             .on_click(cx.listener(|this, _, _, cx| this.fetch(cx)));
-        let pull = sync_button("pull-rebase", "Pull", pull)
+        let pull = sync_button("pull-rebase", "pull", "Pull", pull)
             .on_click(cx.listener(|this, _, window, cx| this.choose(crate::menu::Action::PullRebase, window, cx)));
-        let push = sync_button("push", "Push", push).on_click(cx.listener(|this, _, window, cx| this.push_current(window, cx)));
+        let push = sync_button("push", "push", "Push", push).on_click(cx.listener(|this, _, window, cx| this.push_current(window, cx)));
         div().flex().flex_none().gap_0p5().child(fetch).child(pull).child(push).into_any_element()
     }
 
@@ -3441,7 +3443,7 @@ pub(crate) fn sync_emphasis(upstream: Option<&Upstream>) -> (Emphasis, Emphasis)
 
 /// One button of the Fetch, Pull and Push group, drawn like the other buttons of the header (see `ui::ghost`); only the
 /// one that matters now has a fill. (Built here and not from `ghost`: an element takes one `hover`.)
-fn sync_button(id: &'static str, label: &'static str, look: Emphasis) -> gpui::Stateful<gpui::Div> {
+fn sync_button(id: &'static str, glyph: &'static str, label: &'static str, look: Emphasis) -> gpui::Stateful<gpui::Div> {
     let lit = look == Emphasis::Lit;
     let hover = if lit { theme::mix(t().element, t().accent, 0.45) } else { t().element_hover };
     div()
@@ -3459,6 +3461,8 @@ fn sync_button(id: &'static str, label: &'static str, look: Emphasis) -> gpui::S
         .when(lit, |b| b.bg(rgb(theme::mix(t().element, t().accent, 0.3))).font_weight(FontWeight::SEMIBOLD))
         .when(look == Emphasis::Idle, |b| b.opacity(0.6))
         .hover(move |style| style.bg(rgb(hover)).text_color(rgb(t().text_strong)))
+        .gap_1()
+        .child(crate::ui::file_icon(crate::icons::sync(glyph, if lit { t().text_strong } else { t().muted })))
         .child(label)
 }
 
@@ -3475,8 +3479,8 @@ pub(crate) struct HeaderRoom {
 
 /// About what the header's other parts take: the sidebar button, New branch, Fetch Pull Push, Refresh, gaps, padding;
 /// and of that, Fetch Pull Push, which a repository with no remote does not show.
-const HEADER_FIXED: f32 = 420.;
-const SYNC_BUTTONS: f32 = 110.;
+const HEADER_FIXED: f32 = 470.;
+const SYNC_BUTTONS: f32 = 160.;
 
 /// What fits in a header `area` wide, by a rough measure of the text (about 7.6 px a bold character, 6.4 a small
 /// one): `upstream` is the length of the ↑↓ part and of the remote's name, `base` the length of the base's words.

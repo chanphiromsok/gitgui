@@ -3356,7 +3356,7 @@ fn the_header_gives_up_its_words_before_the_counts_as_it_narrows() {
     assert_eq!(room(720.), HeaderRoom { label: false, base: false, remote: true }, "then what it was cut from");
     assert_eq!(room(560.), HeaderRoom { label: false, base: false, remote: false }, "then the remote's name; the counts stay");
     // A short name leaves room for more.
-    assert!(header_room(780., "main", upstream, base).base && !room(780.).base);
+    assert!(header_room(830., "main", upstream, base).base && !room(830.).base);
     // Nothing to show is never shown.
     assert!(!header_room(2000., name, None, None).base);
 }

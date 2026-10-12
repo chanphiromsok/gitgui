@@ -211,6 +211,23 @@ pub fn flag(color: u32) -> Arc<RenderImage> {
     .unwrap_or_else(|| Arc::new(RenderImage::new(Vec::new())))
 }
 
+/// The glyph of a Fetch, Pull or Push button in `color`: a cloud with an arrow down (fetch), an arrow down to a line
+/// (pull), an arrow up from a line (push).
+pub fn sync(kind: &str, color: u32) -> Option<Arc<RenderImage>> {
+    cached(format!("sync:{kind}:{color:06x}"), || {
+        let c = format!("#{color:06x}");
+        let stroke = format!(r#"fill="none" stroke="{c}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round""#);
+        let body = match kind {
+            "fetch" => format!(
+                r#"<path d="M4.6 10.8H11.6Q14 10.8 14 8.6Q14 6.5 11.8 6.3Q11.3 3.5 8.2 3.5Q5.8 3.5 5.1 5.8Q2.2 6 2.2 8.4Q2.2 10.8 4.6 10.8Z" {stroke}/><path d="M8 8.2V13.4M6.2 11.7L8 13.5L9.8 11.7" {stroke}/>"#
+            ),
+            "pull" => format!(r#"<path d="M8 2.5V10.5M4.6 7.4L8 10.8L11.4 7.4M3 13.5H13" {stroke}/>"#),
+            _ => format!(r#"<path d="M8 13.5V5.5M4.6 8.6L8 5.2L11.4 8.6M3 2.5H13" {stroke}/>"#),
+        };
+        Some(format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">{body}</svg>"#))
+    })
+}
+
 /// The Refresh button: an arrow turning back on itself.
 pub fn refresh() -> Option<Arc<RenderImage>> {
     let color = theme::t().muted;

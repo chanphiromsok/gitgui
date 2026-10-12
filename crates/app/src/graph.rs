@@ -900,8 +900,13 @@ pub fn render_entry(
                 }))
                 .child(
                     div()
+                        .id(("summary", ix))
                         .min_w_0()
                         .flex_1()
+                        // A long summary is cut with an ellipsis: resting on it says the rest.
+                        .when(commit && entry.summary.chars().count() > 60, |text| {
+                            text.tooltip(ui::tip(entry.summary.clone(), None))
+                        })
                         // One line with an ellipsis. Not `whitespace_nowrap`: GPUI only re-measures a text that can
                         // wrap, so a no-wrap one keeps the width it first had and is cut off with no ellipsis.
                         .line_clamp(1)

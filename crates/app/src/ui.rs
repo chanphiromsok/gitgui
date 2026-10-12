@@ -157,6 +157,7 @@ struct Tip {
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
+            .max_w(px(560.))
             .px_2()
             .py_1()
             .flex()
