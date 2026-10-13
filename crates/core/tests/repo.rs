@@ -1739,6 +1739,8 @@ fn a_merge_that_settled_a_conflict_by_hand_names_the_file_and_a_clean_one_names_
     repo.git(&["commit", "-q", "-m", "merge other"]);
     let git = GitCli::new(repo.path());
     assert_eq!(git.merge_resolved("HEAD").unwrap(), vec!["app.txt".to_owned()]);
+    // The same answer for the whole history in one go.
+    assert_eq!(git.merges_resolved(100).unwrap(), std::collections::HashSet::from([rev(&repo, "HEAD")]));
     // Not a merge: nothing to say.
     assert!(git.merge_resolved("HEAD~1").unwrap().is_empty());
     assert!(git.merge_resolved("not a rev; rm").is_err());
@@ -1753,4 +1755,5 @@ fn a_merge_that_settled_a_conflict_by_hand_names_the_file_and_a_clean_one_names_
     clean.git(&["commit", "-q", "-am", "feat: fifteen"]);
     clean.git(&["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
     assert!(GitCli::new(clean.path()).merge_resolved("HEAD").unwrap().is_empty());
+    assert!(GitCli::new(clean.path()).merges_resolved(100).unwrap().is_empty());
 }

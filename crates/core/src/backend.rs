@@ -80,6 +80,28 @@ pub struct GitCli {
 }
 
 impl GitCli {
+    /// The merge commits among the first `limit` of the branches, remotes, tags and HEAD in which a conflict was settled
+    /// by hand (see [`GitCli::merge_resolved`]), from one `git log`: a clean merge prints nothing, so this costs about
+    /// what the log does. An empty set when git cannot say.
+    pub fn merges_resolved(&self, limit: usize) -> Result<std::collections::HashSet<String>, Error> {
+        let max = format!("--max-count={limit}");
+        let mut args = vec!["log", "--merges", "--cc", "-p", "-U0", "--no-ext-diff", "--no-color", "--format=%x00%H", max.as_str()];
+        args.extend(["--branches", "--remotes", "--tags"]);
+        if self.has_head() {
+            args.push("HEAD");
+        }
+        let out = self.run(&args)?;
+        let text = String::from_utf8_lossy(&out);
+        // "\0<id>\n<patch>" for each merge that printed one; the patch has a "diff --cc <file>" line for each file.
+        Ok(text
+            .split('\0')
+            .filter_map(|section| {
+                let (id, patch) = section.split_once('\n')?;
+                patch.lines().any(|line| line.starts_with("diff --cc ")).then(|| id.trim().to_owned())
+            })
+            .collect())
+    }
+
     /// The files of a merge commit whose result is neither parent's version in some place: where the merge had a
     /// conflict somebody settled by hand (or edited the result). A clean merge, and any commit that is not a merge,
     /// has none. Git's combined diff leaves out a hunk that came whole from one parent, so two sides that changed

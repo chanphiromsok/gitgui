@@ -169,6 +169,8 @@ pub struct Entry {
     pub mark: Option<Mark>,
     /// The commit that makes the same changes (a rebased or cherry-picked copy, or what this one was copied from).
     pub twin: Option<String>,
+    /// A merge in which a conflict was settled by hand: drawn with a mark.
+    pub conflicted: bool,
 }
 
 /// Where the current branch stands against the branch it was cut from.
@@ -301,6 +303,7 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             search_miss: false,
             mark: None,
             twin: None,
+            conflicted: false,
         });
     }
     for ((commit, row), (placed, size)) in ordered.iter().zip(rows).zip(&shown) {
@@ -342,6 +345,7 @@ pub fn build_entries(commits: &[Commit], options: &Options) -> Built {
             search_miss: false,
             mark: None,
             twin: None,
+            conflicted: false,
         });
     }
 
@@ -895,6 +899,19 @@ pub fn render_entry(
                     div().flex_none().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(color)).debug_selector(move || format!("mark-{ix}-{says}")).child(glyph)
                 }))
                 // "≈ 3f2a1b9": the same changes as that commit (a rebase or a cherry-pick copied one from the other).
+                // "conflict": the merge had a conflict and somebody settled it (its overview names the files).
+                .when(entry.conflicted, |row| {
+                    row.child(
+                        div()
+                            .id(("conflicted", ix))
+                            .flex_none()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(t().warning))
+                            .tooltip(ui::tip("A conflict in this merge was settled by hand", None))
+                            .child("conflict"),
+                    )
+                })
                 .children(twin_label.map(|short| {
                     div().flex_none().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(t().accent)).child(format!("≈ {short}"))
                 }))

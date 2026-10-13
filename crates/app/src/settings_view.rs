@@ -245,6 +245,13 @@ impl Workspace {
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_group_by_parent(cx))),
                             ),
                             row(
+                                "Mark merges that had a conflict",
+                                "A merge in which somebody settled a conflict by hand says \"conflict\" beside its message; the commit's overview \
+                                 names the files. Off draws merges alike.",
+                                switch("setting-conflicts", s.mark_conflicts)
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mark_conflicts(cx))),
+                            ),
+                            row(
                                 "Pictures in the graph",
                                 "Which commits are drawn with their author's picture. The rest are plain dots.",
                                 segmented(vec![

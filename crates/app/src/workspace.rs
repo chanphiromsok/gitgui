@@ -49,6 +49,8 @@ pub enum Phase<T> {
 }
 
 pub struct RepoView {
+    /// The merges among the commits that had a conflict settled by hand (from one `git log --cc`).
+    pub conflicted: Arc<HashSet<String>>,
     /// The commits as read, newest first. The rows are made from these, and made again when the
     /// grouping, a fold, or the merge scan changes what to show. Shared with the last read, which a
     /// refresh that finds nothing new reuses.
@@ -266,6 +268,9 @@ impl RepoView {
         self.shown = commits.len();
         self.entries = built.entries;
         graph::apply_clues(&mut self.entries, &self.clues, &self.tips, &merged_in);
+        for entry in &mut self.entries {
+            entry.conflicted = settings.mark_conflicts && entry.commit.as_ref().is_some_and(|id| self.conflicted.contains(id));
+        }
         let divergence = self.divergence();
         graph::apply_divergence(&mut self.entries, &divergence);
         graph::apply_twins(&mut self.entries, &self.twins);
@@ -795,12 +800,15 @@ struct LastLog {
     fingerprint: u64,
     commits: Arc<Vec<Commit>>,
     people: Arc<People>,
+    conflicted: Arc<HashSet<String>>,
 }
 
 struct RepoData {
     /// The log's fingerprint, and the commits: `None` when they are the same as last time.
     fingerprint: u64,
     commits: Option<Vec<Commit>>,
+    /// The merges among them with a conflict settled by hand; `None` when `commits` is.
+    conflicted: Option<HashSet<String>>,
     current_branch: Option<String>,
     changed: usize,
     read: Duration,
@@ -853,7 +861,9 @@ fn read_repo(path: &Path, unchanged: Option<u64>) -> Result<RepoData, gitgui_cor
     let upstreams = git.branch_sync().unwrap_or_default().into_iter().map(|b| (b.branch, b.upstream)).collect();
     let remotes = git.remotes().unwrap_or_default();
     let rebased = current_branch.as_deref().and_then(|branch| git.last_rebase(branch));
-    Ok(RepoData { fingerprint, commits, current_branch, changed, read: started.elapsed(), operation, web, work, today, upstreams, remotes, rebased })
+    // Nice to know, not worth failing the read over; only asked when there are new commits to look at.
+    let conflicted = commits.is_some().then(|| git.merges_resolved(LOAD_LIMIT).unwrap_or_default());
+    Ok(RepoData { fingerprint, commits, conflicted, current_branch, changed, read: started.elapsed(), operation, web, work, today, upstreams, remotes, rebased })
 }
 
 /// A commit's record and the files it changed; `None` when it stopped early because `wanted` said the
@@ -1324,19 +1334,19 @@ impl Workspace {
                 // last read is still the one the fingerprint was taken from.)
                 let last = this.last_log.take().filter(|last| last.path == path);
                 let result = result.map_err(|err| err.to_string()).and_then(|mut data| {
-                    let (commits, everyone) = match (data.commits.take(), last) {
+                    let (commits, everyone, conflicted) = match (data.commits.take(), last) {
                         (Some(commits), _) => {
                             let everyone = Arc::new(people(&commits));
-                            (Arc::new(commits), everyone)
+                            (Arc::new(commits), everyone, Arc::new(data.conflicted.take().unwrap_or_default()))
                         }
-                        (None, Some(last)) => (last.commits, last.people),
+                        (None, Some(last)) => (last.commits, last.people, last.conflicted),
                         (None, None) => return Err("The history could not be read; try again.".to_owned()),
                     };
-                    Ok((data, commits, everyone))
+                    Ok((data, commits, everyone, conflicted))
                 });
                 let Some(repo) = this.repo.as_mut() else { return };
                 match result {
-                    Ok((data, commits, everyone)) => {
+                    Ok((data, commits, everyone, conflicted)) => {
                         repo.work = data.work;
                         repo.graph_filter.today = data.today;
                         this.last_log = Some(LastLog {
@@ -1344,11 +1354,13 @@ impl Workspace {
                             fingerprint: data.fingerprint,
                             commits: commits.clone(),
                             people: everyone.clone(),
+                            conflicted: conflicted.clone(),
                         });
                         note_avatar_hints(&this.avatar_hints, &commits, data.web.as_ref());
                         let (branches, targets) = scan_inputs(&commits);
                         let mut view = RepoView {
                             commits,
+                            conflicted,
                             changed: data.changed,
                             entries: Vec::new(),
                             graph_width: 0.,
@@ -2182,6 +2194,21 @@ impl Workspace {
             self.settings_open = false;
             cx.notify();
         }
+    }
+
+    /// Turns the graph's "conflict" mark on or off, keeps the choice, and redraws the graph.
+    pub fn toggle_mark_conflicts(&mut self, cx: &mut Context<Self>) {
+        self.settings.mark_conflicts = !self.settings.mark_conflicts;
+        if let Some(store) = &self.store
+            && let Err(err) = store.save_settings(&self.settings)
+        {
+            self.notice = Some(Notice::warn(format!("The choice could not be saved: {err}")));
+        }
+        let settings = self.settings.clone();
+        if let Some(repo) = self.repo.as_mut() {
+            repo.rebuild(&settings);
+        }
+        cx.notify();
     }
 
     /// Turns "group commits under their pull request" on or off, keeps the choice, and redraws the graph.

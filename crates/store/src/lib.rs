@@ -88,6 +88,8 @@ pub enum GraphFaces {
 pub struct Settings {
     /// List a pull request's commits under it, one level in, instead of in date order among the rest.
     pub group_by_parent: bool,
+    /// Mark a merge in which a conflict was settled by hand with "conflict" in the graph.
+    pub mark_conflicts: bool,
     /// The color theme, by name; `None` for the default one.
     pub theme: Option<String>,
     /// The file icon theme, by name; `None` for the built-in icons.
@@ -137,6 +139,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             group_by_parent: true,
+            mark_conflicts: true,
             theme: None,
             icon_theme: None,
             sidebar_hidden: false,
